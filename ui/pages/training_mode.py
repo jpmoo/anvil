@@ -1595,14 +1595,14 @@ def render():
                                         st.session_state[phase_key] = 4
                                         # Clear terminal for next phase
                                         st.session_state[terminal_output_key] = []
-                                st.rerun()
+                                        st.rerun()
                                 elif status_val == "training":
                                     terminal_output.append(f"[INFO] Training is actively running...")
                                 elif status_val == "failed":
                                     terminal_output.append(f"[ERROR] Training failed!")
                                     failure_reason = training_status.get("failure_reason", "Unknown error")
                                     terminal_output.append(f"[ERROR] {failure_reason}")
-                            else:
+                                else:
                                     terminal_output.append(f"[INFO] Training status unclear.")
                                     terminal_output.append(f"[INFO] Press 'Check Training Status' button again to refresh.")
                                 
@@ -1847,11 +1847,11 @@ def render():
                     if not st.session_state[cancel_confirm_key]:
                         if st.button("❌ Cancel Job", key="cancel_job_phase_3", type="secondary"):
                             st.session_state[cancel_confirm_key] = True
-                                st.rerun()
-                        else:
+                            st.rerun()
+                    else:
                         st.warning("⚠️ Are you sure you want to cancel this job? This will destroy the Vast.ai instance and cannot be undone.")
                         col_confirm, col_cancel = st.columns([1, 1])
-                            with col_confirm:
+                        with col_confirm:
                             if st.button("✅ Confirm Cancel", key="confirm_cancel_phase_3", type="primary"):
                                 try:
                                     # Ensure datetime is available
@@ -1875,8 +1875,8 @@ def render():
                                             st.session_state[terminal_output_key] = terminal_output
                                             st.session_state[cancel_confirm_key] = False
                                             st.success("✅ Job cancelled and instance destroyed.")
-                                        st.rerun()
-                                    else:
+                                            st.rerun()
+                                        else:
                                             terminal_output.append(f"[WARNING] Instance destruction returned False")
                                             st.session_state[terminal_output_key] = terminal_output
                                             st.warning("Instance destruction may have failed. Please check Vast.ai dashboard.")
@@ -1887,10 +1887,10 @@ def render():
                                     st.error(f"Error cancelling job: {error_msg}")
                                 finally:
                                     st.session_state[cancel_confirm_key] = False
-                            with col_cancel:
+                        with col_cancel:
                             if st.button("❌ Cancel", key="cancel_confirm_phase_3"):
                                 st.session_state[cancel_confirm_key] = False
-                                    st.rerun()
+                                st.rerun()
                 
                 # Phase 4: Finalize
                 elif current_phase == 4:
@@ -1934,7 +1934,7 @@ def render():
                                 terminal_output.append(f"[LOCAL] Moving files from queue to version folder...")
                                 from utils.config import get_model_queue_dir
                                 from pathlib import Path
-                    import shutil
+                                import shutil
                                 queue_dir = get_model_queue_dir(model_name)
                                 training_dir = version_dir / "training"
                                 training_dir.mkdir(parents=True, exist_ok=True)
@@ -2095,7 +2095,7 @@ def render():
                                 if not ssh_host:
                                     terminal_output.append(f"[ERROR] SSH host not available. Cannot download weights.")
                                     st.error("SSH host not available. Cannot download weights automatically.")
-        else:
+                                else:
                                     terminal_output.append(f"[SSH] Connecting to {ssh_host}:{ssh_port}")
                                     
                                     # Step 4: Check for weight files on remote instance
@@ -2183,7 +2183,7 @@ def render():
                                 
                                 st.session_state[terminal_output_key] = terminal_output
                                 st.success("✅ All training jobs finalized successfully!")
-                        st.rerun()
+                                st.rerun()
                             except Exception as e:
                                 error_msg = str(e)
                                 terminal_output.append(f"[ERROR] {error_msg}")
@@ -2381,7 +2381,7 @@ def render():
                 col1, col2 = st.columns([3, 1])
                 with col1:
                     st.write(f"📋 {yaml_filename}")
-        with col2:
+                with col2:
                     yaml_delete_key = f"delete_yaml_{idx}_{yaml_filename}"
                     yaml_confirm_key = f"confirm_delete_yaml_{idx}_{yaml_filename}"
                     yaml_cancel_key = f"cancel_delete_yaml_{idx}_{yaml_filename}"
@@ -2547,7 +2547,7 @@ def render():
                         del st.session_state["training_file_uploader"]
                     if "yaml_selector" in st.session_state:
                         st.session_state["yaml_selector"] = "None"  # Reset to "None" option
-                st.rerun()
+                    st.rerun()
                 except Exception as e:
                     st.error(f"Error processing file: {str(e)}")
         
@@ -2619,7 +2619,7 @@ def render():
                         if attached_yaml:
                             st.write(f"**Attached YAML:** 📋 {attached_yaml}")
                             st.info(f"✅ This file will be grouped with other files using '{attached_yaml}' in one training job")
-            else:
+                        else:
                             st.info("✅ This file will be grouped with other files without YAML in one training job")
                     
                     with col2:
@@ -2784,13 +2784,13 @@ def render():
         
         # Check all statuses (for validation and inline display)
         if not use_fine_tuned:
-        ollama_running = False
-        try:
-            import subprocess
-            result = subprocess.run(['ollama', 'list'], capture_output=True, timeout=5)
-            ollama_running = result.returncode == 0
-        except:
             ollama_running = False
+            try:
+                import subprocess
+                result = subprocess.run(['ollama', 'list'], capture_output=True, timeout=5)
+                ollama_running = result.returncode == 0
+            except:
+                ollama_running = False
         
         available_models = ollama_client.get_available_models()
         model_exists = ollama_client.model_exists()
@@ -2821,7 +2821,7 @@ def render():
         if use_fine_tuned:
             status_icons_html.append(f'<span title="Fine-Tuned Model: Loaded" style="font-size: 0.7em; cursor: help; margin: 0 1px;">🟢</span>')
         else:
-        status_icons_html.append(f'<span title="Ollama Server: {"Running" if ollama_running else "Not Running"}" style="font-size: 0.7em; cursor: help; margin: 0 1px;">{"🟢" if ollama_running else "🔴"}</span>')
+            status_icons_html.append(f'<span title="Ollama Server: {"Running" if ollama_running else "Not Running"}" style="font-size: 0.7em; cursor: help; margin: 0 1px;">{"🟢" if ollama_running else "🔴"}</span>')
         status_icons_html.append(f'<span title="Model {base_model}: {"Available" if model_exists else "Missing"}" style="font-size: 0.7em; cursor: help; margin: 0 1px;">{"🟢" if model_exists else "🔴"}</span>')
         status_html = " ".join(status_icons_html)
         
@@ -3057,16 +3057,35 @@ def render():
                     # Ollama models
                     try:
                         response = client.chat(messages, stream=False, timeout=120)
-                except Exception as chat_error:
-                    if "timeout" in str(chat_error).lower():
-                        st.error("⏱️ **Request timed out after 120 seconds.**")
-                        st.warning("**Ollama is responding very slowly.** Suggestions:")
+                        
+                        # Check if response is valid
+                        if response and not (isinstance(response, str) and response.startswith("Error:")):
+                            # Strip summary section if present
+                            if "###SUMMARY###" in response:
+                                parts = response.split("###SUMMARY###")
+                                main_response = parts[0].strip()
+                                # Store the summary separately if needed (for future use)
+                                summary = parts[1].strip() if len(parts) > 1 else ""
+                                response = main_response
+                            
+                            st.session_state.chat_history.append({"role": "assistant", "content": response})
+                            data_manager.log_conversation_turn(user_input, response)
+                        else:
+                            st.error(response if response else "Error: Received empty response from model.")
+                            # Remove the user message since we failed
+                            if st.session_state.chat_history and st.session_state.chat_history[-1]["role"] == "user":
+                                st.session_state.chat_history.pop()
+                        st.rerun()
+                    except Exception as chat_error:
+                        if "timeout" in str(chat_error).lower():
+                            st.error("⏱️ **Request timed out after 120 seconds.**")
+                            st.warning("**Ollama is responding very slowly.** Suggestions:")
                             st.markdown(f"""
                             - **Pre-load the model:** Run `ollama run {base_model}` in terminal first
                             - **Use a smaller/faster model:** Consider using a smaller model
-                        - **Check system resources:** Make sure you have enough RAM/CPU
-                        - **Restart Ollama:** Sometimes restarting helps: `pkill ollama && ollama serve`
-                        """)
+                            - **Check system resources:** Make sure you have enough RAM/CPU
+                            - **Restart Ollama:** Sometimes restarting helps: `pkill ollama && ollama serve`
+                            """)
                         else:
                             st.error(f"Error: {str(chat_error)}")
                         # Remove the user message since we failed
@@ -3074,25 +3093,6 @@ def render():
                             st.session_state.chat_history.pop()
                         st.rerun()
                         return
-                    
-                    # Check if response is valid
-                    if response and not (isinstance(response, str) and response.startswith("Error:")):
-                        # Strip summary section if present
-                        if "###SUMMARY###" in response:
-                            parts = response.split("###SUMMARY###")
-                            main_response = parts[0].strip()
-                            # Store the summary separately if needed (for future use)
-                            summary = parts[1].strip() if len(parts) > 1 else ""
-                            response = main_response
-                        
-                        st.session_state.chat_history.append({"role": "assistant", "content": response})
-                        data_manager.log_conversation_turn(user_input, response)
-                    else:
-                        st.error(response if response else "Error: Received empty response from model.")
-                        # Remove the user message since we failed
-                        if st.session_state.chat_history and st.session_state.chat_history[-1]["role"] == "user":
-                            st.session_state.chat_history.pop()
-                    st.rerun()
                     
             except Exception as e:
                 st.error(f"Error: {str(e)}")
