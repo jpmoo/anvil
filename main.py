@@ -23,7 +23,14 @@ st.markdown("""
 <style>
     /* Sidebar base styling */
     section[data-testid="stSidebar"] {
-        padding-top: 1rem !important;
+        padding-top: 0 !important;
+        margin-top: 0 !important;
+    }
+    
+    /* Remove top spacing from sidebar content */
+    section[data-testid="stSidebar"] > div {
+        padding-top: 0 !important;
+        margin-top: 0 !important;
     }
     
     /* Logo container styling */
@@ -31,7 +38,7 @@ st.markdown("""
         display: flex !important;
         justify-content: center !important;
         align-items: center !important;
-        margin: 0.5rem 0 !important;
+        margin: 0 !important;
         padding: 0 !important;
     }
     
@@ -48,10 +55,18 @@ st.markdown("""
         margin-bottom: 0.5rem !important;
     }
     
-    /* First markdown (logo) - minimal top margin */
+    /* First markdown (logo) - zero top margin and padding */
     section[data-testid="stSidebar"] .stMarkdown:first-of-type {
-        margin-top: 0.5rem !important;
-        margin-bottom: 0.5rem !important;
+        margin-top: 0 !important;
+        margin-bottom: 0.1rem !important;
+        padding-top: 0 !important;
+        padding-bottom: 0 !important;
+    }
+    
+    /* Override any Streamlit default spacing on first element */
+    section[data-testid="stSidebar"] > div > div:first-child {
+        margin-top: 0 !important;
+        padding-top: 0 !important;
     }
     
     /* Horizontal rule spacing */
@@ -118,7 +133,7 @@ def main():
             )
         else:
             st.title("🔨 Anvil")
-        st.markdown("<hr style='margin-top: 0.25rem; margin-bottom: 0.5rem;'>", unsafe_allow_html=True)
+        st.markdown("<hr style='margin-top: 0.1rem; margin-bottom: 0.5rem;'>", unsafe_allow_html=True)
         
         # Model Profile Selection
         st.subheader("Model Profile Selection")

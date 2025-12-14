@@ -29,6 +29,167 @@ def filter_malloc_warnings(text):
     return '\n'.join(filtered_lines)
 
 
+def kill_all_training_processes(ssh_host: str, ssh_port: int, terminal_output: list, max_retries: int = 5) -> bool:
+    """
+    Kill all training-related processes on the remote instance.
+    This function is comprehensive and verifies processes are actually killed.
+    Uses aggressive killing including process groups to handle child processes.
+    
+    Args:
+        ssh_host: SSH hostname
+        ssh_port: SSH port
+        terminal_output: List to append output messages to
+        max_retries: Maximum number of retry attempts
+        
+    Returns:
+        True if all processes were killed, False otherwise
+    """
+    import subprocess
+    import time
+    
+    for attempt in range(max_retries):
+        if attempt > 0:
+            terminal_output.append(f"[SSH] Retry {attempt + 1}/{max_retries}: Killing remaining training processes...")
+            time.sleep(3)  # Longer wait between retries
+        
+        # Comprehensive kill command that handles multiple scenarios
+        # This kills processes AND their entire process groups to catch child processes
+        kill_command = (
+            # First, get all PIDs and kill process groups (more aggressive)
+            "PIDS=$(ps aux | grep -E 'accelerate|axolotl|axolotl.cli.train' | grep -v grep | awk '{print $2}' | tr '\\n' ' '); "
+            "if [ -n \"$PIDS\" ]; then "
+            "  for pid in $PIDS; do "
+            "    kill -9 -$pid 2>/dev/null || kill -9 $pid 2>/dev/null || true; "  # Kill process group with -PID
+            "  done; "
+            "fi; "
+            # Kill by process name patterns (pkill kills process groups automatically)
+            "pkill -9 -f 'accelerate' 2>/dev/null || true; "
+            "pkill -9 -f 'axolotl' 2>/dev/null || true; "
+            "pkill -9 -f 'axolotl.cli.train' 2>/dev/null || true; "
+            "pkill -9 -f 'axolotl.cli' 2>/dev/null || true; "
+            # Kill Python processes running training-related commands (handle both xargs -r and without)
+            "ps aux | grep -E 'python.*train|python.*axolotl|python.*accelerate' | grep -v grep | awk '{print $2}' | "
+            "  (xargs -r kill -9 2>/dev/null || xargs kill -9 2>/dev/null || true); "
+            # Kill processes in /workspace/axolotl directory
+            "ps aux | grep '/workspace/axolotl' | grep -v grep | awk '{print $2}' | "
+            "  (xargs -r kill -9 2>/dev/null || xargs kill -9 2>/dev/null || true); "
+            # Kill any process with axolotl_config.yaml in command
+            "ps aux | grep 'axolotl_config.yaml' | grep -v grep | awk '{print $2}' | "
+            "  (xargs -r kill -9 2>/dev/null || xargs kill -9 2>/dev/null || true); "
+            # Kill any process with /workspace/data/axolotl_config.yaml
+            "ps aux | grep '/workspace/data/axolotl_config.yaml' | grep -v grep | awk '{print $2}' | "
+            "  (xargs -r kill -9 2>/dev/null || xargs kill -9 2>/dev/null || true); "
+            # Wait longer for processes to die and their children
+            "sleep 5; "
+            # Count remaining processes
+            "remaining=$(ps aux | grep -E 'accelerate|axolotl|axolotl.cli.train' | grep -v grep | wc -l); "
+            "echo 'Kill attempt $((attempt+1)): Remaining processes: '$remaining"
+        )
+        
+        kill_cmd = [
+            "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
+            f"root@{ssh_host}",
+            kill_command
+        ]
+        
+        try:
+            kill_result = subprocess.run(kill_cmd, capture_output=True, text=True, timeout=30)
+            stdout_filtered = filter_malloc_warnings(kill_result.stdout)
+            stderr_filtered = filter_malloc_warnings(kill_result.stderr)
+            
+            if kill_result.returncode == 0:
+                if stdout_filtered.strip():
+                    terminal_output.append(f"[SSH] {stdout_filtered.strip()}")
+                
+                # Extract remaining count from output
+                import re
+                remaining_match = re.search(r'Remaining processes:\s*(\d+)', stdout_filtered)
+                if remaining_match:
+                    remaining = int(remaining_match.group(1))
+                    if remaining == 0:
+                        terminal_output.append(f"[SSH] ✓ All training processes killed successfully")
+                        return True
+                    else:
+                        terminal_output.append(f"[SSH] ⚠️ {remaining} process(es) still running after kill attempt")
+                else:
+                    # If we can't parse, assume success if no error
+                    terminal_output.append(f"[SSH] ✓ Kill command completed")
+                    # Verify by checking processes again
+                    verify_cmd = [
+                        "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
+                        f"root@{ssh_host}",
+                        "ps aux | grep -E 'accelerate|axolotl|axolotl.cli.train' | grep -v grep | wc -l"
+                    ]
+                    verify_result = subprocess.run(verify_cmd, capture_output=True, text=True, timeout=15)
+                    if verify_result.returncode == 0:
+                        remaining = int(verify_result.stdout.strip())
+                        if remaining == 0:
+                            terminal_output.append(f"[SSH] ✓ Verified: All training processes killed")
+                            return True
+                        else:
+                            terminal_output.append(f"[SSH] ⚠️ Verification shows {remaining} process(es) still running")
+            else:
+                if stderr_filtered.strip():
+                    terminal_output.append(f"[SSH] Warning: {stderr_filtered.strip()}")
+        except subprocess.TimeoutExpired:
+            terminal_output.append(f"[SSH] ⚠️ Kill command timed out (attempt {attempt + 1})")
+        except Exception as e:
+            terminal_output.append(f"[SSH] ⚠️ Error killing processes: {str(e)}")
+    
+    # Final verification with multiple checks
+    terminal_output.append(f"[SSH] Performing final verification (waiting for processes to fully terminate)...")
+    time.sleep(2)  # Extra wait before final check
+    
+    # Check multiple times to ensure processes are really gone
+    all_clear = False
+    for verify_attempt in range(3):
+        verify_cmd = [
+            "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
+            f"root@{ssh_host}",
+            "ps aux | grep -E 'accelerate|axolotl|axolotl.cli.train' | grep -v grep"
+        ]
+        try:
+            verify_result = subprocess.run(verify_cmd, capture_output=True, text=True, timeout=15)
+            if verify_result.returncode == 0 and verify_result.stdout.strip():
+                # There are still processes
+                process_lines = verify_result.stdout.strip().split('\n')
+                if verify_attempt < 2:  # Not the last attempt
+                    terminal_output.append(f"[SSH] ⚠️ Verification {verify_attempt + 1}: {len(process_lines)} process(es) still running, waiting...")
+                    time.sleep(3)
+                    # Try one more aggressive kill
+                    final_kill_cmd = [
+                        "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
+                        f"root@{ssh_host}",
+                        "pkill -9 -f 'accelerate' 2>/dev/null || true; "
+                        "pkill -9 -f 'axolotl' 2>/dev/null || true; "
+                        "ps aux | grep -E 'accelerate|axolotl' | grep -v grep | awk '{print $2}' | "
+                        "  (xargs -r kill -9 2>/dev/null || xargs kill -9 2>/dev/null || true); "
+                        "sleep 2"
+                    ]
+                    subprocess.run(final_kill_cmd, capture_output=True, text=True, timeout=20)
+                else:
+                    # Last attempt - show details
+                    terminal_output.append(f"[SSH] ⚠️ WARNING: {len(process_lines)} training process(es) still running after all kill attempts:")
+                    for line in process_lines[:10]:  # Show first 10
+                        terminal_output.append(f"[SSH]   {line.strip()}")
+                    terminal_output.append(f"[SSH] ⚠️ These processes may need manual intervention")
+                    return False
+            else:
+                all_clear = True
+                break
+        except Exception as e:
+            if verify_attempt == 2:  # Last attempt
+                terminal_output.append(f"[SSH] ⚠️ Could not verify process status: {str(e)}")
+                return False
+            time.sleep(2)
+    
+    if all_clear:
+        terminal_output.append(f"[SSH] ✓ Final verification: No training processes running - safe to proceed")
+        return True
+    else:
+        return False
+
+
 def extract_dataset_stats(log_content: str) -> dict:
     """
     Extract dataset statistics from Axolotl training logs
@@ -434,11 +595,7 @@ def render():
                         st.write(f"  - {df['file']} -> {df['filename']} (model: {df['model']})")
         
         # Display summary
-        st.markdown("#### 📄 Queued Context Files")
         if len(queued_files) > 0:
-            st.metric("Files Queued", len(queued_files))
-            st.caption(f"Total size: {total_queue_size:,} bytes ({total_queue_size / 1024 / 1024:.2f} MB)")
-            
             # Group files by YAML config
             files_by_yaml = {}
             for file_meta in queued_files:
@@ -453,19 +610,32 @@ def render():
                     files_by_yaml[yaml_key] = []
                 files_by_yaml[yaml_key].append(file_meta)
             
-            # Show file list grouped by YAML
-            with st.expander(f"View {len(queued_files)} file(s)", expanded=False):
-                # Sort YAML groups: "No YAML" last, others alphabetically
-                sorted_yaml_keys = sorted([k for k in files_by_yaml.keys() if k != 'No YAML']) + (['No YAML'] if 'No YAML' in files_by_yaml else [])
+            # Build jobs list with sizes for display
+            jobs_list = []
+            for yaml_key, files_in_group in files_by_yaml.items():
+                # Calculate total size for this job
+                job_size = sum(f.get('size', 0) for f in files_in_group)
+                yaml_filename = yaml_key if yaml_key != 'No YAML' else None
+                jobs_list.append({
+                    "yaml_filename": yaml_filename,
+                    "file_count": len(files_in_group),
+                    "job_size": job_size,
+                    "files": files_in_group
+                })
+            
+            # Sort jobs by size (descending)
+            jobs_list.sort(key=lambda x: x["job_size"], reverse=True)
+            
+            # Display jobs in order of size
+            st.markdown("#### 📋 Queued Jobs (sorted by size, largest first)")
+            for idx, job in enumerate(jobs_list, 1):
+                job_size_mb = job["job_size"] / (1024 * 1024)
+                yaml_desc = f"YAML: {job['yaml_filename']}" if job['yaml_filename'] else "No YAML (stock config)"
+                job_title = f"Job {idx}: {job['file_count']} file(s), {job_size_mb:.2f} MB - {yaml_desc}"
                 
-                for yaml_key in sorted_yaml_keys:
-                    files_in_group = files_by_yaml[yaml_key]
-                    if yaml_key == 'No YAML':
-                        st.markdown(f"**📦 No YAML Config ({len(files_in_group)} file(s)):**")
-                    else:
-                        st.markdown(f"**📋 YAML: {yaml_key} ({len(files_in_group)} file(s)):**")
-                    
-                    for file_meta in files_in_group:
+                with st.expander(job_title, expanded=False):
+                    # Show files for this job beneath the job header
+                    for file_meta in job['files']:
                         file_type = file_meta.get('file_type', 'unknown').upper()
                         st.write(f"  • **{file_meta['filename']}** ({file_type}, {file_meta.get('size', 0):,} bytes)")
         else:
@@ -474,9 +644,7 @@ def render():
         
         # Overall status
         has_training_data = len(queued_files) > 0
-        if has_training_data:
-            st.success(f"✅ Ready to train with {len(queued_files)} file(s)")
-        else:
+        if not has_training_data:
             st.warning("⚠️ No training data available. Add files in Tab 2 before training.")
         
         st.markdown("")  # Break between sections
@@ -542,10 +710,8 @@ def render():
         if len(queued_files) > 0 and not has_active_jobs:
             st.markdown("### 🚀 Launch Training")
             
-            # Instance selection: Only allow existing instances
-            st.info("ℹ️ **Note:** You must have an existing Vast.ai instance running. The program will validate the instance before starting training.")
-            
             selected_existing_instance = None
+            instances_detected = False
             
             # List existing instances
             if vast_api_key:
@@ -598,6 +764,7 @@ def render():
                             instance_options.append((label, inst_id, status))
                         
                         if instance_options:
+                            instances_detected = True
                             selected_label = st.selectbox(
                                 "Select Existing Instance",
                                 options=[opt[0] for opt in instance_options],
@@ -634,6 +801,10 @@ def render():
                     st.error(f"❌ Error listing instances: {str(e)}")
             else:
                 st.warning("⚠️ Vast.ai API key required to list existing instances")
+            
+            # Show note only when no instances are detected
+            if not instances_detected:
+                st.info("ℹ️ **Note:** You must have an existing Vast.ai instance running. The program will validate the instance before starting training.")
             
             # Show current base model and allow override
             from utils.model_manager import ModelManager
@@ -730,9 +901,8 @@ def render():
                         if not training_file_groups:
                             st.warning("⚠️ No training files found in queue. Please upload files in Tab 2 first.")
                         else:
-                            # Build job queue - serialize all groups through one instance
-                            job_queue = []
-                            total_files = 0
+                            # Build all jobs and calculate sizes - select largest to run
+                            all_jobs = []
                             
                             for yaml_key, file_group in training_file_groups.items():
                                 yaml_filename = yaml_key if yaml_key else None
@@ -749,18 +919,39 @@ def render():
                                 # If no YAML attached, yaml_filename and yaml_path remain None
                                 # This will cause prepare_training_package to create a stock/default Axolotl config
                                 
-                                # Add to job queue
-                                job_queue.append({
+                                # Calculate total size of files in this job
+                                job_size = 0
+                                for file_meta in file_group:
+                                    filename = file_meta.get("filename")
+                                    if filename:
+                                        file_path = queue_dir / filename
+                                        if file_path.exists():
+                                            job_size += file_path.stat().st_size
+                                
+                                # Add to all jobs list
+                                all_jobs.append({
                                     "yaml_filename": yaml_filename,
                                     "yaml_path": yaml_path,
                                     "file_group": file_group,
-                                    "file_count": len(file_group)
+                                    "file_count": len(file_group),
+                                    "job_size": job_size  # Total size in bytes
                                 })
-                                total_files += len(file_group)
                             
-                            if job_queue:
-                                # Launch single instance with job queue
-                                with st.spinner(f"Launching training instance with {len(job_queue)} job(s) queued ({total_files} total files)..."):
+                            if all_jobs:
+                                # Sort jobs by size (descending) and select largest
+                                all_jobs.sort(key=lambda x: x["job_size"], reverse=True)
+                                selected_job = all_jobs[0]
+                                remaining_jobs = all_jobs[1:]  # Keep others queued for next time
+                                
+                                # Display job selection info
+                                job_size_mb = selected_job["job_size"] / (1024 * 1024)
+                                st.info(f"📊 Selected largest job ({job_size_mb:.2f} MB, {selected_job['file_count']} file(s)) to run. {len(remaining_jobs)} job(s) will remain queued.")
+                                
+                                # Create single-item job list for the selected job
+                                job_queue = [selected_job]
+                                
+                                # Launch single instance with only the selected job
+                                with st.spinner(f"Launching training instance with selected job ({selected_job['file_count']} file(s), {job_size_mb:.2f} MB)..."):
                                     try:
                                         # Get HF token from session state or config
                                         from utils.config import get_hf_token
@@ -790,11 +981,15 @@ def render():
                                                 ssh_port_override=ssh_port_override_value
                                             )
                                             
-                                            success_msg = f"✅ Launched training job with {len(job_queue)} job(s) queued:\n"
-                                            for idx, queue_item in enumerate(job_queue, 1):
+                                            if len(job_queue) > 0:
+                                                queue_item = job_queue[0]
                                                 job_yaml = queue_item.get('yaml_filename')
                                                 yaml_desc = f" (YAML: {job_yaml})" if job_yaml else " (stock/default config)"
-                                                success_msg += f"  • Job {idx}/{len(job_queue)}: {queue_item['file_count']} file(s){yaml_desc}\n"
+                                                job_size_mb = queue_item.get('job_size', 0) / (1024 * 1024)
+                                                success_msg = f"✅ Launched training job:\n"
+                                                success_msg += f"  • {queue_item['file_count']} file(s), {job_size_mb:.2f} MB{yaml_desc}\n"
+                                                if len(all_jobs) > 1:
+                                                    success_msg += f"  • {len(remaining_jobs)} job(s) remain queued for next time\n"
                                             st.success(success_msg)
                                             
                                             # Clear terminal output for new job
@@ -827,14 +1022,15 @@ def render():
                     # Convert to string if it's an integer
                     instance_id_str = str(instance_id) if instance_id != "unknown" else "unknown"
                     job_queue = job.get("job_queue")
-                    current_job_index = job.get("current_job_index")
                     
-                    # Show queue info if available
-                    if job_queue and current_job_index is not None:
-                        queue_display = f"Job {current_job_index + 1}/{len(job_queue)} in queue"
+                    # Show job info
+                    yaml_info = job.get("package_info", {}).get("yaml_config")
+                    if yaml_info:
+                        queue_display = f"YAML: {yaml_info}"
+                    elif job_queue and len(job_queue) > 0:
+                        queue_display = "Job queued"
                     else:
-                        yaml_info = job.get("package_info", {}).get("yaml_config")
-                        queue_display = f"YAML: {yaml_info}" if yaml_info else "No YAML"
+                        queue_display = "No YAML"
                     
                     created = job.get("created_at", "Unknown")
                     # Create display name
@@ -882,12 +1078,27 @@ def render():
                                 # Mark job as dismissed (do NOT stop or destroy instance)
                                 instance_id = active_job.get("instance_id")
                                 
-                                # Mark job as dismissed
-                                active_job["dismissed"] = True
-                                active_job["dismissed_at"] = datetime.now().isoformat()
-                                training_manager._save_job(active_job)
+                                # Reset phase to 1 and clear session state BEFORE deleting job
+                                phase_key = f"training_phase_{instance_id}"
+                                terminal_output_key = f"terminal_output_{instance_id}"
+                                
+                                # Clear session state for this job first (clears phase and terminal output)
+                                if phase_key in st.session_state:
+                                    del st.session_state[phase_key]
+                                if terminal_output_key in st.session_state:
+                                    del st.session_state[terminal_output_key]
+                                
+                                # Delete the job entirely from the jobs list (as if it never existed)
+                                jobs = training_manager._load_jobs()
+                                jobs = [j for j in jobs if j.get("instance_id") != instance_id]
+                                # Save the updated jobs list using the same method as _save_job
+                                import json
+                                training_manager.training_dir.mkdir(parents=True, exist_ok=True)
+                                with open(training_manager.jobs_file, 'w') as f:
+                                    json.dump(jobs, f, indent=2)
+                                
                                 st.session_state[dismiss_confirm_key] = False
-                                st.success("✅ Job dismissed. You can now launch a new training job.")
+                                st.success("✅ Job dismissed and deleted. You can now launch a new training job.")
                                 if instance_id:
                                     st.warning(f"⚠️ **Important:** The Vast.ai instance ({instance_id[:8]}...) is still running. You must stop or destroy it manually in Vast.ai to stop charges.")
                                 st.rerun()
@@ -913,12 +1124,19 @@ def render():
                 current_phase = st.session_state.get(phase_key)
                 
                 # Determine what phase should be based on current job status
+                # But respect manual phase navigation - don't force phase changes if user is already in a phase
                 if job_status == 'launching':
                     target_phase = 1  # Validate instance
                 elif job_status == 'validated' and not active_job.get('files_uploaded'):
+                    # Go to Phase 2 when validated but files not uploaded yet
                     target_phase = 2  # Upload file
                 elif job_status == 'validated' and active_job.get('files_uploaded'):
-                    target_phase = 3  # Do training
+                    # Files uploaded but status still 'validated' - allow Phase 3 to proceed
+                    # But if user is currently in Phase 2, let them stay there (they might want to verify/re-upload)
+                    if current_phase == 2:
+                        target_phase = 2  # Stay in Phase 2 if already there
+                    else:
+                        target_phase = 3  # Otherwise go to Phase 3
                 elif job_status == 'running' and not active_job.get('files_uploaded'):
                     # If status is 'running' but not validated, go to Phase 1 to validate
                     target_phase = 1  # Validate instance
@@ -927,15 +1145,61 @@ def render():
                 elif job_status == 'completed':
                     target_phase = 4  # Finalize
                 else:
-                    target_phase = 1  # Default to phase 1 (validate instance)
+                    # Also check training_status for completion (more reliable than job_status)
+                    training_status_check = active_job.get("training_status", {})
+                    if training_status_check.get("status") == "completed":
+                        target_phase = 4  # Finalize
+                    else:
+                        target_phase = 1  # Default to phase 1 (validate instance)
                 
                 # Set phase if not set, or if it needs to be updated based on status
+                # But only change phase if it's not already set (to respect manual navigation)
+                # EXCEPTION: Always allow transition to Phase 4 if training is completed
                 phase_changed = False
-                if phase_key not in st.session_state or current_phase != target_phase:
-                    # Phase is changing - clear terminal output
-                    if phase_key in st.session_state and current_phase != target_phase:
-                        phase_changed = True
+                
+                # Check if phase was manually set to 4 (e.g., by button click) - preserve it
+                current_phase_in_state = st.session_state.get(phase_key)
+                if current_phase_in_state == 4:
+                    # Phase 4 was manually set - check if we should keep it
+                    training_status_check = active_job.get("training_status", {})
+                    if training_status_check.get("status") == "completed":
+                        # Keep Phase 4 - training is completed
+                        current_phase = 4
+                        phase_changed = False
+                    else:
+                        # Phase 4 was set but training not completed - might be premature, but respect it
+                        current_phase = 4
+                        phase_changed = False
+                elif phase_key not in st.session_state:
+                    # Phase not set yet - use target phase
                     st.session_state[phase_key] = target_phase
+                    current_phase = target_phase
+                    phase_changed = (target_phase != current_phase_in_state) if current_phase_in_state else False
+                elif current_phase != target_phase:
+                    # If target is Phase 4 and training is completed, always allow the transition
+                    if target_phase == 4:
+                        training_status_check = active_job.get("training_status", {})
+                        if training_status_check.get("status") == "completed":
+                            phase_changed = True
+                            st.session_state[phase_key] = 4
+                            current_phase = 4
+                        elif current_phase == 3:
+                            # If we're in Phase 3 and target is 4, but status isn't "completed" yet,
+                            # don't force the change (let user or button trigger it)
+                            current_phase = current_phase_in_state
+                        else:
+                            # Normal phase change
+                            phase_changed = True
+                            st.session_state[phase_key] = target_phase
+                            current_phase = target_phase
+                    else:
+                        # Phase is changing - clear terminal output
+                        phase_changed = True
+                        st.session_state[phase_key] = target_phase
+                        current_phase = target_phase
+                else:
+                    # Phase matches target
+                    current_phase = current_phase_in_state
                 
                 if terminal_output_key not in st.session_state:
                     st.session_state[terminal_output_key] = []
@@ -977,6 +1241,93 @@ def render():
                     st.markdown(f"### {phases[1]['icon']} Phase 1: {phases[1]['name']}")
                     st.caption("Validate that the existing instance is running and meets all requirements for training.")
                     
+                    # Initialize Phase 1: Reset flags and clean up old files on instance
+                    phase1_init_key = f"phase1_init_{active_job.get('instance_id')}"
+                    if phase1_init_key not in st.session_state:
+                        try:
+                            instance_id = active_job.get("instance_id")
+                            if instance_id:
+                                terminal_output.append(f"[{datetime.now().strftime('%H:%M:%S')}] Initializing Phase 1 - resetting flags and cleaning up old files...")
+                                
+                                # Reset all flags to false
+                                active_job["files_uploaded"] = False
+                                # No current_job_index needed - single job mode
+                                # Reset any other training-related flags
+                                if "training_started" in active_job:
+                                    active_job["training_started"] = False
+                                if "training_completed" in active_job:
+                                    active_job["training_completed"] = False
+                                training_manager._save_job(active_job)
+                                terminal_output.append(f"[INFO] Reset all flags to false")
+                                
+                                # Get SSH info for cleanup
+                                ssh_host = active_job.get("ssh_host")
+                                ssh_port_override = active_job.get("ssh_port_override")
+                                if ssh_port_override:
+                                    ssh_port = ssh_port_override
+                                else:
+                                    ssh_port = active_job.get("ssh_port", 22)
+                                
+                                # If SSH info not available, try to get it
+                                if not ssh_host:
+                                    try:
+                                        ssh_info = training_manager.get_instance_ssh_info(instance_id)
+                                        ssh_host = ssh_info.get("host")
+                                        api_ssh_port = ssh_info.get("port", 22)
+                                        if ssh_port_override:
+                                            ssh_port = ssh_port_override
+                                        else:
+                                            ssh_port = api_ssh_port
+                                        if ssh_host:
+                                            active_job["ssh_host"] = ssh_host
+                                            active_job["ssh_port"] = ssh_port
+                                            training_manager._save_job(active_job)
+                                    except Exception as e:
+                                        terminal_output.append(f"[WARNING] Could not get SSH info for cleanup: {str(e)[:200]}")
+                                
+                                # Clean up old files on instance if SSH info is available
+                                if ssh_host:
+                                    terminal_output.append(f"[SSH] Cleaning up old training files on instance...")
+                                    cleanup_cmd = [
+                                        "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
+                                        f"root@{ssh_host}",
+                                        "cd /workspace/data && "
+                                        "echo 'Cleaning up all old training files...' && "
+                                        "# Remove all training files (numbered and active) "
+                                        "rm -f axolotl_config_0.yaml training_data_0.jsonl && "
+                                        "rm -f axolotl_config_*.yaml training_data_*.jsonl && "
+                                        "rm -f axolotl_config.yaml training_data.jsonl && "
+                                        "# Also clean up any output directories "
+                                        "rm -rf /workspace/output/training/* 2>/dev/null || true && "
+                                        "rm -rf /workspace/axolotl/prepared_data/* 2>/dev/null || true && "
+                                        "echo 'Cleanup complete' && "
+                                        "ls -la /workspace/data/ 2>/dev/null | grep -E '(training_data|axolotl_config)' || echo 'No training files found (clean)'"
+                                    ]
+                                    cleanup_result = subprocess.run(cleanup_cmd, capture_output=True, text=True, timeout=30)
+                                    if cleanup_result.returncode == 0:
+                                        terminal_output.append(f"[SUCCESS] Old files cleaned up on instance")
+                                        if cleanup_result.stdout:
+                                            for line in cleanup_result.stdout.strip().split("\n"):
+                                                if line.strip() and "Cleaning up" not in line and "complete" not in line and "No training files" not in line:
+                                                    terminal_output.append(f"[SSH]   {line}")
+                                    else:
+                                        stderr_filtered = filter_malloc_warnings(cleanup_result.stderr)
+                                        terminal_output.append(f"[WARNING] Cleanup had issues (this is okay if instance is new): {stderr_filtered[:200]}")
+                                else:
+                                    terminal_output.append(f"[INFO] SSH info not available yet - cleanup will happen after SSH connection is established")
+                                
+                                st.session_state[phase1_init_key] = True
+                                st.session_state[terminal_output_key] = terminal_output
+                                st.rerun()
+                            else:
+                                terminal_output.append(f"[WARNING] No instance ID found - skipping cleanup")
+                                st.session_state[phase1_init_key] = True
+                        except Exception as e:
+                            error_msg = str(e)
+                            terminal_output.append(f"[WARNING] Phase 1 initialization error (non-critical): {error_msg[:200]}")
+                            st.session_state[phase1_init_key] = True
+                            st.session_state[terminal_output_key] = terminal_output
+                    
                     # Automatically fetch and display SSH info when entering Phase 1
                     instance_id = active_job.get("instance_id")
                     ssh_host = active_job.get("ssh_host")
@@ -1014,7 +1365,15 @@ def render():
                     # Display SSH info if available
                     if ssh_host:
                         port_note = " (override)" if ssh_port_override else ""
-                        st.success(f"🔐 **SSH Connection Info:** `ssh -p {ssh_port} root@{ssh_host}`{port_note}")
+                        ssh_command = f"ssh -p {ssh_port} root@{ssh_host}"
+                        st.success(f"🔐 **SSH Connection Info:** `{ssh_command}`{port_note}")
+                        
+                        # Show workspace folder path
+                        st.info(f"📁 **Workspace Folder:** `/workspace` (training files: `/workspace/data`, output: `/workspace/output/training`)")
+                        
+                        # Show example commands
+                        with st.expander("📋 SSH Commands & Examples"):
+                            st.code(f"# Connect to instance\n{ssh_command}\n\n# Once connected, navigate to workspace:\ncd /workspace\n\n# View training files:\nls -lh /workspace/data/\n\n# View training output:\nls -lh /workspace/output/training/\n\n# View training logs:\ntail -f /workspace/output/training/training.log\n\n# View debug logs:\ntail -f /workspace/output/training/debug.log", language="bash")
                     
                     st.info("💡 **Click 'Check Instance'** to validate the instance. Phase 2 will only start when all checks pass.")
                     
@@ -1208,6 +1567,12 @@ def render():
                                     active_job["status"] = "validated"
                                     training_manager._save_job(active_job)
                                     
+                                    # Reload job to get updated status
+                                    updated_job_status = training_manager.get_job_status(instance_id)
+                                    if updated_job_status and not updated_job_status.get("error"):
+                                        # Update active_job with fresh data
+                                        active_job.update(updated_job_status)
+                                    
                                     # Advance to Phase 2
                                     st.session_state[phase_key] = 2
                                     st.session_state[terminal_output_key] = terminal_output
@@ -1240,6 +1605,12 @@ def render():
                                             active_job["status"] = "validated"
                                             training_manager._save_job(active_job)
                                             
+                                            # Reload job to get updated status
+                                            updated_job_status = training_manager.get_job_status(instance_id)
+                                            if updated_job_status and not updated_job_status.get("error"):
+                                                # Update active_job with fresh data
+                                                active_job.update(updated_job_status)
+                                            
                                             # Advance to Phase 2
                                             st.session_state[phase_key] = 2
                                             st.session_state[terminal_output_key] = terminal_output
@@ -1256,33 +1627,46 @@ def render():
                                 st.error(f"Error during validation: {error_msg}")
                     
                     with col2:
-                        if st.button("🔄 Redo Phase", key="retry_phase_1"):
-                            try:
-                                # Clear terminal before redoing phase
-                                st.session_state[terminal_output_key] = []
-                                terminal_output = []
-                                
-                                instance_id = active_job.get("instance_id")
-                                if instance_id:
-                                    terminal_output.append(f"[{datetime.now().strftime('%H:%M:%S')}] Resetting Phase 1 validation...")
-                                    terminal_output.append(f"[INFO] You can now click 'Check Instance' again to re-validate the instance.")
+                        confirm_key_phase1 = f"confirm_redo_phase_1_{active_job.get('instance_id')}"
+                        if confirm_key_phase1 not in st.session_state:
+                            st.session_state[confirm_key_phase1] = False
+                        
+                        if st.session_state[confirm_key_phase1]:
+                            if st.button("✅ Confirm Redo Phase 1", key="confirm_redo_phase_1_btn", type="primary"):
+                                try:
+                                    # Clear terminal before redoing phase
+                                    st.session_state[terminal_output_key] = []
+                                    terminal_output = []
                                     
-                                    # Reset job status
-                                    active_job["status"] = "launching"
-                                    training_manager._save_job(active_job)
-                                    
+                                    instance_id = active_job.get("instance_id")
+                                    if instance_id:
+                                        terminal_output.append(f"[{datetime.now().strftime('%H:%M:%S')}] Resetting Phase 1 validation...")
+                                        terminal_output.append(f"[INFO] You can now click 'Check Instance' again to re-validate the instance.")
+                                        
+                                        # Reset job status
+                                        active_job["status"] = "launching"
+                                        training_manager._save_job(active_job)
+                                        
+                                        st.session_state[terminal_output_key] = terminal_output
+                                        st.session_state[confirm_key_phase1] = False
+                                        st.info("ℹ️ Phase 1 reset. Click 'Check Instance' to validate the instance again.")
+                                        st.rerun()
+                                    else:
+                                        terminal_output.append(f"[ERROR] No instance ID found in job")
+                                        st.error("No instance ID found")
                                     st.session_state[terminal_output_key] = terminal_output
-                                    st.info("ℹ️ Phase 1 reset. Click 'Check Instance' to validate the instance again.")
-                                    st.rerun()
-                                else:
-                                    terminal_output.append(f"[ERROR] No instance ID found in job")
-                                    st.error("No instance ID found")
-                                st.session_state[terminal_output_key] = terminal_output
-                            except Exception as e:
-                                error_msg = str(e)
-                                terminal_output.append(f"[ERROR] Failed to redo phase: {error_msg}")
-                                st.session_state[terminal_output_key] = terminal_output
-                                st.error(f"Error: {error_msg}")
+                                except Exception as e:
+                                    error_msg = str(e)
+                                    terminal_output.append(f"[ERROR] Failed to redo phase: {error_msg}")
+                                    st.session_state[terminal_output_key] = terminal_output
+                                    st.error(f"Error: {error_msg}")
+                            if st.button("❌ Cancel", key="cancel_redo_phase_1"):
+                                st.session_state[confirm_key_phase1] = False
+                                st.rerun()
+                        else:
+                            if st.button("🔄 Redo Phase", key="retry_phase_1", type="secondary", help="Reset Phase 1 validation and clear terminal output"):
+                                st.session_state[confirm_key_phase1] = True
+                                st.rerun()
                 
                 # Phase 2: Upload File
                 elif current_phase == 2:
@@ -1295,14 +1679,12 @@ def render():
                     # Initialize Phase 2: Check SSH and create directories (show in terminal, don't auto-upload)
                     phase2_init_key = f"phase2_init_{active_job.get('instance_id')}"
                     
-                    # For jobs with a queue, verify files are actually uploaded
-                    # Reset files_uploaded flag if all_package_infos doesn't match job queue
+                    # Verify files are actually uploaded (single job mode)
                     job_queue = active_job.get("job_queue")
                     if job_queue and len(job_queue) > 0:
                         all_package_infos = active_job.get("all_package_infos", [])
-                        # If we have a job queue but all_package_infos doesn't match, files haven't been uploaded
-                        # Also check if all_package_infos is empty or None
-                        if not all_package_infos or len(all_package_infos) != len(job_queue):
+                        # If we have a job but all_package_infos is missing or empty, files haven't been uploaded
+                        if not all_package_infos or len(all_package_infos) == 0:
                             if active_job.get("files_uploaded", False):
                                 active_job["files_uploaded"] = False
                                 training_manager._save_job(active_job)
@@ -1313,9 +1695,56 @@ def render():
                             if instance_id:
                                 # Get SSH info - prefer saved SSH details from job over API
                                 ssh_host = active_job.get("ssh_host")
-                                ssh_port = active_job.get("ssh_port", 22)
+                                
+                                # Check for SSH port override first (user-specified port takes precedence)
+                                ssh_port_override = active_job.get("ssh_port_override")
+                                if ssh_port_override:
+                                    ssh_port = ssh_port_override
+                                else:
+                                    ssh_port = active_job.get("ssh_port", 22)
                                 
                                 # If not in job, get from API
+                                if not ssh_host:
+                                    job_status = training_manager.get_job_status(instance_id)
+                                    ssh_host = job_status.get("ssh_host")
+                                    api_ssh_port = job_status.get("ssh_port", 22)
+                                    
+                                    # Use override port if set, otherwise use API port
+                                    if ssh_port_override:
+                                        ssh_port = ssh_port_override
+                                    else:
+                                        ssh_port = api_ssh_port
+                                    
+                                    if ssh_host:
+                                        active_job["ssh_host"] = ssh_host
+                                        active_job["ssh_port"] = ssh_port
+                                        training_manager._save_job(active_job)
+                                
+                                if ssh_host:
+                                    # Clean up old files before starting Phase 2
+                                    terminal_output.append(f"[SSH] Phase 2: Cleaning up old training files...")
+                                    cleanup_cmd = [
+                                        "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
+                                        f"root@{ssh_host}",
+                                        "cd /workspace/data && "
+                                        "echo 'Cleaning up old training files...' && "
+                                        "# Remove old numbered files (from old naming scheme) and any stale active files "
+                                        "# Explicitly remove _0 files (old naming scheme) and all other numbered files "
+                                        "rm -f axolotl_config_0.yaml training_data_0.jsonl && "
+                                        "rm -f axolotl_config_*.yaml training_data_*.jsonl axolotl_config.yaml training_data.jsonl && "
+                                        "echo 'Old files cleaned up' && "
+                                        "ls -la /workspace/data/ 2>/dev/null | grep -E '(training_data|axolotl_config)' || echo 'No training files found (clean)'"
+                                    ]
+                                    cleanup_result = subprocess.run(cleanup_cmd, capture_output=True, text=True, timeout=30)
+                                    if cleanup_result.returncode == 0:
+                                        terminal_output.append(f"[SSH] Old files cleaned up successfully")
+                                        if cleanup_result.stdout:
+                                            for line in cleanup_result.stdout.strip().split("\n"):
+                                                if line.strip() and "Cleaning up" not in line and "cleaned up" not in line:
+                                                    terminal_output.append(f"[SSH]   {line}")
+                                    else:
+                                        terminal_output.append(f"[WARNING] Cleanup had issues, but continuing...")
+                                
                                 if not ssh_host:
                                     job_status = training_manager.get_job_status(instance_id)
                                     ssh_host = job_status.get("ssh_host")
@@ -1332,6 +1761,30 @@ def render():
                                         terminal_output = []
                                     terminal_output.append(f"[{datetime.now().strftime('%H:%M:%S')}] Initializing Phase 2...")
                                     terminal_output.append(f"[SSH] Connecting to {ssh_host}:{ssh_port}")
+                                    
+                                    # Clean up old files before starting Phase 2
+                                    terminal_output.append(f"[SSH] Cleaning up old training files...")
+                                    cleanup_cmd = [
+                                        "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
+                                        f"root@{ssh_host}",
+                                        "cd /workspace/data && "
+                                        "echo 'Cleaning up old training files...' && "
+                                        "# Remove old numbered files (from old naming scheme) and any stale active files "
+                                        "# Explicitly remove _0 files (old naming scheme) and all other numbered files "
+                                        "rm -f axolotl_config_0.yaml training_data_0.jsonl && "
+                                        "rm -f axolotl_config_*.yaml training_data_*.jsonl axolotl_config.yaml training_data.jsonl && "
+                                        "echo 'Old files cleaned up' && "
+                                        "ls -la /workspace/data/ 2>/dev/null | grep -E '(training_data|axolotl_config)' || echo 'No training files found (clean)'"
+                                    ]
+                                    cleanup_result = subprocess.run(cleanup_cmd, capture_output=True, text=True, timeout=30)
+                                    if cleanup_result.returncode == 0:
+                                        terminal_output.append(f"[SSH] Old files cleaned up successfully")
+                                        if cleanup_result.stdout:
+                                            for line in cleanup_result.stdout.strip().split("\n"):
+                                                if line.strip() and "Cleaning up" not in line and "cleaned up" not in line and "No training files" not in line:
+                                                    terminal_output.append(f"[SSH]   {line}")
+                                    else:
+                                        terminal_output.append(f"[WARNING] Cleanup had issues, but continuing...")
                                     
                                     # Test SSH connection
                                     import subprocess
@@ -1363,11 +1816,16 @@ def render():
                                             "-o", "ConnectTimeout=30",
                                             "-o", "UserKnownHostsFile=/dev/null",
                                             f"root@{ssh_host}",
-                                            "mkdir -p /workspace/data && mkdir -p /workspace/output/training && echo 'Directories ready'"
+                                            "echo 'Deleting output directory...' && rm -rf /workspace/output 2>&1 && echo 'Output directory deleted' && mkdir -p /workspace/data && mkdir -p /workspace/output/training && echo 'Directories recreated' && ls -la /workspace/output/ 2>&1 && echo 'Output directories forcefully deleted and recreated'"
                                         ]
                                         mkdir_result = subprocess.run(mkdir_cmd, capture_output=True, text=True, timeout=30)
                                         if mkdir_result.returncode == 0:
-                                            terminal_output.append(f"[SSH] Directories created successfully")
+                                            terminal_output.append(f"[SSH] ✓ Output directories forcefully deleted and recreated")
+                                            stdout_filtered = filter_malloc_warnings(mkdir_result.stdout)
+                                            if stdout_filtered.strip():
+                                                for line in stdout_filtered.strip().split("\n"):
+                                                    if line.strip() and "forcefully" not in line.lower() and "Deleting" not in line:
+                                                        terminal_output.append(f"[SSH]   {line}")
                                             
                                             # Check for onstart errors in Phase 2
                                             try:
@@ -1394,10 +1852,16 @@ def render():
                                             break
                                         else:
                                             stderr_filtered = filter_malloc_warnings(mkdir_result.stderr)
+                                            stdout_filtered = filter_malloc_warnings(mkdir_result.stdout)
+                                            terminal_output.append(f"[ERROR] Directory deletion/creation failed (return code: {mkdir_result.returncode})")
+                                            if stderr_filtered.strip():
+                                                terminal_output.append(f"[ERROR] stderr: {stderr_filtered[:300]}")
+                                            if stdout_filtered.strip():
+                                                terminal_output.append(f"[ERROR] stdout: {stdout_filtered[:300]}")
                                             if retry < 2:
-                                                terminal_output.append(f"[SSH] Directory creation failed (attempt {retry + 1}/3): {stderr_filtered[:200]}")
+                                                terminal_output.append(f"[SSH] Retrying directory creation (attempt {retry + 1}/3)...")
                                             else:
-                                                terminal_output.append(f"[SSH] Directory creation failed after 3 attempts: {stderr_filtered[:200]}")
+                                                terminal_output.append(f"[SSH] Directory creation failed after 3 attempts")
                                     if not mkdir_success:
                                         terminal_output.append(f"[WARNING] Directory creation failed. SSH may need more time to initialize. You can retry the upload.")
                                     
@@ -1473,11 +1937,13 @@ def render():
                                         from utils.vast_training_manager import VastTrainingManager
                                         all_package_infos = active_job.get("all_package_infos", [])
                                         
-                                        if len(all_package_infos) != len(job_queue):
-                                            terminal_output.append(f"[INFO] Preparing training packages for all {len(job_queue)} job(s)...")
+                                        if not all_package_infos or len(all_package_infos) == 0:
+                                            terminal_output.append(f"[INFO] Preparing training package...")
                                             all_package_infos = []
                                             
-                                            for job_idx, job_item in enumerate(job_queue):
+                                            # Only one job now
+                                            if len(job_queue) > 0:
+                                                job_item = job_queue[0]
                                                 yaml_path = job_item.get("yaml_path")
                                                 file_group = job_item.get("file_group", [])
                                                 
@@ -1491,19 +1957,18 @@ def render():
                                                 )
                                                 all_package_infos.append(job_package)
                                             
-                                            # Save all package infos to job
+                                            # Save package info to job
                                             active_job["all_package_infos"] = all_package_infos
                                             training_manager._save_job(active_job)
-                                            terminal_output.append(f"[INFO] Prepared {len(all_package_infos)} training package(s)")
+                                            terminal_output.append(f"[INFO] Prepared training package")
                                         
-                                        # Log what will be uploaded for all jobs
-                                        terminal_output.append(f"[PRE-UPLOAD] Files to be uploaded for {len(job_queue)} job(s):")
-                                        
-                                        for job_idx, job_item in enumerate(job_queue):
+                                        # Log what will be uploaded (single job)
+                                        if len(job_queue) > 0:
+                                            job_item = job_queue[0]  # Only one job now
                                             job_yaml = job_item.get("yaml_filename")
                                             file_group = job_item.get("file_group", [])
                                             
-                                            terminal_output.append(f"[PRE-UPLOAD] --- Job {job_idx + 1}/{len(job_queue)} ---")
+                                            terminal_output.append(f"[PRE-UPLOAD] Files to be uploaded:")
                                             if job_yaml:
                                                 terminal_output.append(f"[PRE-UPLOAD] YAML Config: {job_yaml}")
                                             else:
@@ -1515,16 +1980,14 @@ def render():
                                                 file_type = file_meta.get("file_type", "unknown").upper()
                                                 file_size = file_meta.get("size", 0)
                                                 attached_yaml = file_meta.get("attached_yaml")
-                                                # Files without attached_yaml should always show as using stock/default config
-                                                # Files with attached_yaml show their specific YAML
                                                 if attached_yaml:
                                                     yaml_info = f" (YAML: {attached_yaml})"
                                                 else:
                                                     yaml_info = " (using stock/default config)"
                                                 terminal_output.append(f"[PRE-UPLOAD]   • {filename} ({file_type}, {file_size:,} bytes){yaml_info}")
                                             
-                                            # Show what will be uploaded for this job
-                                            job_package = all_package_infos[job_idx]
+                                            # Show what will be uploaded
+                                            job_package = all_package_infos[0]  # Only one job
                                             job_config_path = job_package.get('config_path')
                                             job_dataset_path = job_package.get('dataset_path')
                                             
@@ -1534,26 +1997,39 @@ def render():
                                                 if job_config_file.exists():
                                                     config_size = job_config_file.stat().st_size
                                                     terminal_output.append(f"[PRE-UPLOAD]   • Config: {job_config_file.name} ({config_size:,} bytes)")
-                                                    terminal_output.append(f"[PRE-UPLOAD]     → /workspace/data/axolotl_config_{job_idx}.yaml")
+                                                    terminal_output.append(f"[PRE-UPLOAD]     → /workspace/data/axolotl_config.yaml")
                                             
                                             if job_dataset_path:
                                                 job_dataset_file = Path(job_dataset_path)
                                                 if job_dataset_file.exists():
                                                     dataset_size = job_dataset_file.stat().st_size
                                                     terminal_output.append(f"[PRE-UPLOAD]   • Training Data: {job_dataset_file.name} ({dataset_size:,} bytes)")
-                                                    terminal_output.append(f"[PRE-UPLOAD]     → /workspace/data/training_data_{job_idx}.jsonl")
+                                                    terminal_output.append(f"[PRE-UPLOAD]     → /workspace/data/training_data.jsonl")
                                         
                                         terminal_output.append(f"[PRE-UPLOAD] ========================================")
                                         
                                         # Get SSH info - prefer saved SSH details from job over API
                                         ssh_host = active_job.get("ssh_host")
-                                        ssh_port = active_job.get("ssh_port", 22)
+                                        
+                                        # Check for SSH port override first (user-specified port takes precedence)
+                                        ssh_port_override = active_job.get("ssh_port_override")
+                                        if ssh_port_override:
+                                            ssh_port = ssh_port_override
+                                        else:
+                                            ssh_port = active_job.get("ssh_port", 22)
                                         
                                         # If not in job, get from API
                                         if not ssh_host:
                                             job_status = training_manager.get_job_status(instance_id)
                                             ssh_host = job_status.get("ssh_host")
-                                            ssh_port = job_status.get("ssh_port", 22)
+                                            api_ssh_port = job_status.get("ssh_port", 22)
+                                            
+                                            # Use override port if set, otherwise use API port
+                                            if ssh_port_override:
+                                                ssh_port = ssh_port_override
+                                            else:
+                                                ssh_port = api_ssh_port
+                                            
                                             # Save to job for future use
                                             if ssh_host:
                                                 active_job["ssh_host"] = ssh_host
@@ -1592,55 +2068,69 @@ def render():
                                                         "-o", "ConnectTimeout=30",
                                                         "-o", "UserKnownHostsFile=/dev/null",
                                                         f"root@{ssh_host}",
-                                                        "mkdir -p /workspace/data && mkdir -p /workspace/output/training && echo 'Directories ready'"
+                                                        "echo 'Deleting output directory...' && rm -rf /workspace/output 2>&1 && echo 'Output directory deleted' && mkdir -p /workspace/data && mkdir -p /workspace/output/training && echo 'Directories recreated' && ls -la /workspace/output/ 2>&1 && echo 'Output directories forcefully deleted and recreated'"
                                                     ]
                                                     mkdir_result = subprocess.run(mkdir_cmd, capture_output=True, text=True, timeout=30)
                                                     if mkdir_result.returncode == 0:
-                                                        terminal_output.append(f"[SSH] Directories created successfully")
+                                                        terminal_output.append(f"[SSH] ✓ Output directories forcefully deleted and recreated")
+                                                        stdout_filtered = filter_malloc_warnings(mkdir_result.stdout)
+                                                        if stdout_filtered.strip():
+                                                            for line in stdout_filtered.strip().split("\n"):
+                                                                if line.strip() and "forcefully" not in line.lower() and "Deleting" not in line:
+                                                                    terminal_output.append(f"[SSH]   {line}")
                                                         mkdir_success = True
                                                         break
                                                     else:
                                                         stderr_filtered = filter_malloc_warnings(mkdir_result.stderr)
+                                                        stdout_filtered = filter_malloc_warnings(mkdir_result.stdout)
+                                                        terminal_output.append(f"[ERROR] Directory deletion/creation failed (return code: {mkdir_result.returncode})")
+                                                        if stderr_filtered.strip():
+                                                            terminal_output.append(f"[ERROR] stderr: {stderr_filtered[:300]}")
+                                                        if stdout_filtered.strip():
+                                                            terminal_output.append(f"[ERROR] stdout: {stdout_filtered[:300]}")
                                                         if retry < 2:
-                                                            terminal_output.append(f"[SSH] Directory creation failed (attempt {retry + 1}/3): {stderr_filtered[:200]}")
+                                                            terminal_output.append(f"[SSH] Retrying directory creation (attempt {retry + 1}/3)...")
                                                         else:
-                                                            terminal_output.append(f"[SSH] Directory creation failed after 3 attempts: {stderr_filtered[:200]}")
+                                                            terminal_output.append(f"[SSH] Directory creation failed after 3 attempts")
                                                 if not mkdir_success:
                                                     terminal_output.append(f"[WARNING] Directory creation failed. Uploads may fail.")
                                             else:
                                                 # Directories already exist
                                                 terminal_output.append(f"[SSH] Directories already exist, proceeding with upload...")
                                             
-                                            # Upload all jobs with numbered filenames
+                                            # Upload single job (no numbered filenames needed)
                                             all_uploads_successful = True
                                             
-                                            for job_idx, job_item in enumerate(job_queue):
-                                                job_package = all_package_infos[job_idx]
+                                            if len(job_queue) > 0 and len(all_package_infos) > 0:
+                                                job_item = job_queue[0]  # Only one job
+                                                job_package = all_package_infos[0]  # Only one package
                                                 job_yaml = job_item.get("yaml_filename")
                                                 file_group = job_item.get("file_group", [])
                                                 
-                                                terminal_output.append(f"[UPLOAD] --- Uploading Job {job_idx + 1}/{len(job_queue)} ---")
+                                                terminal_output.append(f"[UPLOAD] --- Uploading Job ---")
                                                 
-                                                # Upload config file for this job
+                                                # Upload config file
                                                 job_config_path = job_package.get('config_path')
                                                 job_config_uploaded = False
                                                 
                                                 if job_config_path:
                                                     job_config_file = Path(job_config_path)
                                                     if job_config_file.exists():
-                                                        # Safety check: Fix YAML adapter issue if present (redundant but safe)
+                                                        # Safety check: Fix YAML adapter issue if present
                                                         import yaml
                                                         try:
                                                             with open(job_config_file, 'r') as f:
                                                                 config = yaml.safe_load(f) or {}
                                                             
-                                                            # Fix adapter issue: if adapter is set to "lora" as a string (not a path), remove it
+                                                            # Fix adapter issue: Always remove adapter: 'lora' as it causes path interpretation issues
                                                             if config.get("adapter") == "lora" and not Path(str(config.get("adapter", ""))).exists():
                                                                 del config["adapter"]
-                                                                terminal_output.append(f"[FIX] Removed 'adapter: lora' from config before upload")
+                                                                terminal_output.append(f"[FIX] Removed 'adapter: lora' from config before upload (LoRA will be inferred from lora_* parameters)")
+                                                                # Save the config back with adapter removed
+                                                                with open(job_config_file, 'w') as f:
+                                                                    yaml.dump(config, f, default_flow_style=False, sort_keys=False)
                                                             
                                                             # Auto-adjust for small datasets to prevent empty batch errors
-                                                            # Count training examples from the dataset file
                                                             dataset_path = job_package.get('dataset_path')
                                                             if dataset_path and Path(dataset_path).exists():
                                                                 try:
@@ -1651,41 +2141,34 @@ def render():
                                                                         min_eval_examples = 2
                                                                         val_set_size = config.get("val_set_size", 0.1)
                                                                         
-                                                                        # If validation set would be too small, adjust it
                                                                         if total_examples * val_set_size < min_eval_examples:
                                                                             if total_examples < 50:
-                                                                                # Very small dataset: disable validation entirely
                                                                                 config["val_set_size"] = 0.0
                                                                                 terminal_output.append(f"[FIX] Dataset has only {total_examples} examples. Disabled validation set.")
                                                                             elif total_examples < 200:
-                                                                                # Small dataset: disable sample packing for stability
                                                                                 if config.get("sample_packing", False):
                                                                                     config["sample_packing"] = False
                                                                                     terminal_output.append(f"[FIX] Dataset has {total_examples} examples. Disabled sample_packing.")
-                                                                                # Ensure val_set_size results in at least min_eval_examples
                                                                                 min_val_size = min_eval_examples / total_examples
                                                                                 if val_set_size < min_val_size:
                                                                                     config["val_set_size"] = min_val_size
                                                                                     terminal_output.append(f"[FIX] Adjusted val_set_size to {min_val_size:.3f} to ensure at least {min_eval_examples} eval examples.")
                                                                             else:
-                                                                                # Medium dataset: just ensure val_set_size is reasonable
                                                                                 min_val_size = min_eval_examples / total_examples
                                                                                 if val_set_size < min_val_size:
                                                                                     config["val_set_size"] = min_val_size
                                                                                     terminal_output.append(f"[FIX] Adjusted val_set_size to {min_val_size:.3f} to ensure at least {min_eval_examples} eval examples.")
                                                                 except Exception as e:
-                                                                    # If we can't count examples, continue without adjustment
                                                                     pass
                                                             
                                                             # Write fixed config back if any changes were made
                                                             with open(job_config_file, 'w') as f:
                                                                 yaml.dump(config, f, default_flow_style=False, sort_keys=False)
                                                         except Exception as e:
-                                                            # If YAML parsing fails, log but continue (config might already be fixed)
                                                             terminal_output.append(f"[WARNING] Could not verify YAML config: {str(e)[:100]}")
                                                         
                                                         config_size = job_config_file.stat().st_size
-                                                        remote_config_name = f"axolotl_config_{job_idx}.yaml"
+                                                        remote_config_name = "axolotl_config.yaml"  # Single job, no suffix
                                                         terminal_output.append(f"[SCP] Uploading config: {job_config_file.name} ({config_size:,} bytes)")
                                                         terminal_output.append(f"[SCP]   → /workspace/data/{remote_config_name}")
                                                         
@@ -1734,7 +2217,7 @@ def render():
                                                     terminal_output.append(f"[WARNING] No config path specified for job {job_idx + 1}")
                                                     all_uploads_successful = False
                                                 
-                                                # Upload dataset file for this job
+                                                # Upload dataset file
                                                 job_dataset_path = job_package.get('dataset_path')
                                                 job_dataset_uploaded = False
                                                 
@@ -1742,7 +2225,7 @@ def render():
                                                     job_dataset_file = Path(job_dataset_path)
                                                     if job_dataset_file.exists():
                                                         dataset_size = job_dataset_file.stat().st_size
-                                                        remote_dataset_name = f"training_data_{job_idx}.jsonl"
+                                                        remote_dataset_name = "training_data.jsonl"  # Single job, no suffix
                                                         terminal_output.append(f"[SCP] Uploading training data: {job_dataset_file.name} ({dataset_size:,} bytes)")
                                                         terminal_output.append(f"[SCP]   → /workspace/data/{remote_dataset_name}")
                                                         
@@ -1755,11 +2238,11 @@ def render():
                                                             f"root@{ssh_host}:/workspace/data/{remote_dataset_name}"
                                                         ]
                                                         
-                                                        # Retry logic for SCP uploads (Vast.ai connections can be flaky)
+                                                        # Retry logic for SCP uploads
                                                         dataset_upload_success = False
                                                         for retry in range(3):
                                                             if retry > 0:
-                                                                wait_time = 2 ** retry  # Exponential backoff: 2, 4 seconds
+                                                                wait_time = 2 ** retry
                                                                 terminal_output.append(f"[SCP] Retry {retry}/3 after {wait_time}s wait...")
                                                                 time.sleep(wait_time)
                                                             
@@ -1787,28 +2270,32 @@ def render():
                                                         terminal_output.append(f"[ERROR] Training data file not found: {job_dataset_path}")
                                                         all_uploads_successful = False
                                                 else:
-                                                    terminal_output.append(f"[WARNING] No dataset path specified for job {job_idx + 1}")
+                                                    terminal_output.append(f"[WARNING] No dataset path specified")
                                                     all_uploads_successful = False
                                                 
                                                 if not (job_config_uploaded and job_dataset_uploaded):
                                                     all_uploads_successful = False
+                                            else:
+                                                terminal_output.append(f"[ERROR] Job queue or package info missing")
+                                                all_uploads_successful = False
                                             
-                                            # Check if all uploads succeeded
+                                            # Check if upload succeeded
                                             if all_uploads_successful:
                                                 terminal_output.append(f"[{datetime.now().strftime('%H:%M:%S')}] ===== Upload Summary =====")
-                                                terminal_output.append(f"[SUCCESS] All {len(job_queue)} job(s) uploaded successfully!")
+                                                terminal_output.append(f"[SUCCESS] Job uploaded successfully!")
                                                 
-                                                for job_idx, job_item in enumerate(job_queue):
-                                                    job_yaml = job_item.get("yaml_filename")
-                                                    file_group = job_item.get("file_group", [])
-                                                    yaml_desc = job_yaml if job_yaml else "stock/default config"
-                                                    terminal_output.append(f"[SUCCESS] Job {job_idx + 1}: {len(file_group)} file(s), YAML: {yaml_desc}")
-                                                    terminal_output.append(f"[SUCCESS]   Config: axolotl_config_{job_idx}.yaml")
-                                                    terminal_output.append(f"[SUCCESS]   Data: training_data_{job_idx}.jsonl")
+                                                job_yaml = job_item.get("yaml_filename")
+                                                file_group = job_item.get("file_group", [])
+                                                yaml_desc = job_yaml if job_yaml else "stock/default config"
+                                                terminal_output.append(f"[SUCCESS] {len(file_group)} file(s), YAML: {yaml_desc}")
+                                                terminal_output.append(f"[SUCCESS]   Config: axolotl_config.yaml")
+                                                terminal_output.append(f"[SUCCESS]   Data: training_data.jsonl")
                                                 
                                                 terminal_output.append(f"[SUCCESS] ========================================")
                                                 terminal_output.append(f"[INFO] Phase 2 complete! Ready to proceed to training.")
                                                 active_job["files_uploaded"] = True
+                                                # Keep status as 'validated' - don't change to 'running' until training actually starts
+                                                # Phase determination logic will advance to Phase 3 when status is 'validated' and files_uploaded is True
                                                 training_manager._save_job(active_job)
                                                 
                                                 # Save terminal output before rerun
@@ -1822,130 +2309,149 @@ def render():
                                                 terminal_output.append(f"[ERROR] File upload failed - check errors above")
                                                 terminal_output.append(f"[INFO] Please check the errors above and retry if needed.")
                                     
-                                    st.session_state[terminal_output_key] = terminal_output
+                                    # Final save and rerun - ensure terminal is updated
+                                    st.session_state[terminal_output_key] = list(terminal_output)  # Ensure it's a fresh copy
                                     st.rerun()
                                 except Exception as e:
                                     error_msg = str(e)
+                                    # Ensure terminal_output is available in exception handler
+                                    if terminal_output_key not in st.session_state:
+                                        st.session_state[terminal_output_key] = []
+                                    terminal_output = list(st.session_state[terminal_output_key])
                                     terminal_output.append(f"[ERROR] {error_msg}")
-                                    st.session_state[terminal_output_key] = terminal_output
+                                    st.session_state[terminal_output_key] = list(terminal_output)  # Save fresh copy
                                     st.error(f"Error: {error_msg}")
+                                    st.rerun()  # Rerun even on error to show the error message
                         else:
                             # Files uploaded - show status
                             st.info("✅ Files uploaded")
                     
                     with col2:
-                        if st.button("🔄 Redo Phase", key="retry_phase_2"):
-                            try:
-                                # Clear terminal before redoing phase
-                                st.session_state[terminal_output_key] = []
-                                terminal_output = []
-                                
-                                instance_id = active_job.get("instance_id")
-                                if instance_id:
-                                    terminal_output.append(f"[{datetime.now().strftime('%H:%M:%S')}] Redoing Phase 2 - cleaning up uploaded files...")
+                        confirm_key_phase2 = f"confirm_redo_phase_2_{active_job.get('instance_id')}"
+                        if confirm_key_phase2 not in st.session_state:
+                            st.session_state[confirm_key_phase2] = False
+                        
+                        if st.session_state[confirm_key_phase2]:
+                            if st.button("✅ Confirm Redo Phase 2", key="confirm_redo_phase_2_btn", type="primary"):
+                                try:
+                                    # Clear terminal before redoing phase
+                                    st.session_state[terminal_output_key] = []
+                                    terminal_output = []
                                     
-                                    # Get SSH info - prefer saved SSH details from job over API
-                                    ssh_host = active_job.get("ssh_host")
-                                    ssh_port = active_job.get("ssh_port", 22)
-                                    
-                                    # If not in job, get from API
-                                    if not ssh_host:
-                                        job_status = training_manager.get_job_status(instance_id)
-                                        ssh_host = job_status.get("ssh_host")
-                                        ssh_port = job_status.get("ssh_port", 22)
-                                        # Save to job for future use
+                                    instance_id = active_job.get("instance_id")
+                                    if instance_id:
+                                        terminal_output.append(f"[{datetime.now().strftime('%H:%M:%S')}] Redoing Phase 2 - cleaning up uploaded files...")
+                                        
+                                        # Get SSH info - prefer saved SSH details from job over API
+                                        ssh_host = active_job.get("ssh_host")
+                                        ssh_port = active_job.get("ssh_port", 22)
+                                        
+                                        # If not in job, get from API
+                                        if not ssh_host:
+                                            job_status = training_manager.get_job_status(instance_id)
+                                            ssh_host = job_status.get("ssh_host")
+                                            ssh_port = job_status.get("ssh_port", 22)
+                                            # Save to job for future use
+                                            if ssh_host:
+                                                active_job["ssh_host"] = ssh_host
+                                                active_job["ssh_port"] = ssh_port
+                                                training_manager._save_job(active_job)
+                                        
                                         if ssh_host:
-                                            active_job["ssh_host"] = ssh_host
-                                            active_job["ssh_port"] = ssh_port
-                                            training_manager._save_job(active_job)
-                                    
-                                    if ssh_host:
-                                        terminal_output.append(f"[SSH] Connecting to {ssh_host}:{ssh_port}")
-                                        import subprocess
-                                        import time
-                                        
-                                        # Delete uploaded files and directories with retry logic
-                                        cleanup_success = False
-                                        for retry in range(3):
-                                            if retry > 0:
-                                                wait_time = 2 ** retry  # Exponential backoff: 2, 4 seconds
-                                                terminal_output.append(f"[SSH] Retry {retry}/3 after {wait_time}s wait...")
-                                                time.sleep(wait_time)
+                                            terminal_output.append(f"[SSH] Connecting to {ssh_host}:{ssh_port}")
+                                            import subprocess
+                                            import time
                                             
-                                            cleanup_cmd = [
-                                                "ssh", "-p", str(ssh_port), 
-                                                "-o", "StrictHostKeyChecking=no", 
-                                                "-o", "ConnectTimeout=30",
-                                                "-o", "UserKnownHostsFile=/dev/null",
-                                                f"root@{ssh_host}",
-                                                "rm -rf /workspace/data/* /workspace/output/training/* && echo 'Cleanup complete'"
-                                            ]
-                                            cleanup_result = subprocess.run(cleanup_cmd, capture_output=True, text=True, timeout=30)
-                                            if cleanup_result.returncode == 0:
-                                                terminal_output.append(f"[SSH] Files and directories deleted successfully")
-                                                cleanup_success = True
-                                                break
-                                            else:
-                                                stderr_filtered = filter_malloc_warnings(cleanup_result.stderr)
-                                                if retry < 2:
-                                                    terminal_output.append(f"[SSH] Cleanup failed (attempt {retry + 1}/3): {stderr_filtered[:200]}")
+                                            # Delete uploaded files and directories with retry logic
+                                            cleanup_success = False
+                                            for retry in range(3):
+                                                if retry > 0:
+                                                    wait_time = 2 ** retry  # Exponential backoff: 2, 4 seconds
+                                                    terminal_output.append(f"[SSH] Retry {retry}/3 after {wait_time}s wait...")
+                                                    time.sleep(wait_time)
+                                                
+                                                cleanup_cmd = [
+                                                    "ssh", "-p", str(ssh_port), 
+                                                    "-o", "StrictHostKeyChecking=no", 
+                                                    "-o", "ConnectTimeout=30",
+                                                    "-o", "UserKnownHostsFile=/dev/null",
+                                                    f"root@{ssh_host}",
+                                                    "rm -rf /workspace/data/* /workspace/output/training/* && echo 'Cleanup complete'"
+                                                ]
+                                                cleanup_result = subprocess.run(cleanup_cmd, capture_output=True, text=True, timeout=30)
+                                                if cleanup_result.returncode == 0:
+                                                    terminal_output.append(f"[SSH] Files and directories deleted successfully")
+                                                    cleanup_success = True
+                                                    break
                                                 else:
-                                                    terminal_output.append(f"[SSH] Cleanup failed after 3 attempts: {stderr_filtered[:200]}")
-                                        
-                                        # Recreate directories with retry logic
-                                        mkdir_success = False
-                                        for retry in range(3):
-                                            if retry > 0:
-                                                wait_time = 2 ** retry  # Exponential backoff: 2, 4 seconds
-                                                terminal_output.append(f"[SSH] Retry {retry}/3 after {wait_time}s wait...")
-                                                time.sleep(wait_time)
+                                                    stderr_filtered = filter_malloc_warnings(cleanup_result.stderr)
+                                                    if retry < 2:
+                                                        terminal_output.append(f"[SSH] Cleanup failed (attempt {retry + 1}/3): {stderr_filtered[:200]}")
+                                                    else:
+                                                        terminal_output.append(f"[SSH] Cleanup failed after 3 attempts: {stderr_filtered[:200]}")
                                             
-                                            mkdir_cmd = [
-                                                "ssh", "-p", str(ssh_port), 
-                                                "-o", "StrictHostKeyChecking=no", 
-                                                "-o", "ConnectTimeout=30",
-                                                "-o", "UserKnownHostsFile=/dev/null",
-                                                f"root@{ssh_host}",
-                                                "mkdir -p /workspace/data && mkdir -p /workspace/output/training && echo 'Directories recreated'"
-                                            ]
-                                            mkdir_result = subprocess.run(mkdir_cmd, capture_output=True, text=True, timeout=30)
-                                            if mkdir_result.returncode == 0:
-                                                terminal_output.append(f"[SSH] Directories recreated successfully")
-                                                mkdir_success = True
-                                                break
-                                            else:
-                                                stderr_filtered = filter_malloc_warnings(mkdir_result.stderr)
-                                                if retry < 2:
-                                                    terminal_output.append(f"[SSH] Directory recreation failed (attempt {retry + 1}/3): {stderr_filtered[:200]}")
+                                            # Recreate directories with retry logic
+                                            mkdir_success = False
+                                            for retry in range(3):
+                                                if retry > 0:
+                                                    wait_time = 2 ** retry  # Exponential backoff: 2, 4 seconds
+                                                    terminal_output.append(f"[SSH] Retry {retry}/3 after {wait_time}s wait...")
+                                                    time.sleep(wait_time)
+                                                
+                                                mkdir_cmd = [
+                                                    "ssh", "-p", str(ssh_port), 
+                                                    "-o", "StrictHostKeyChecking=no", 
+                                                    "-o", "ConnectTimeout=30",
+                                                    "-o", "UserKnownHostsFile=/dev/null",
+                                                    f"root@{ssh_host}",
+                                                    "mkdir -p /workspace/data && mkdir -p /workspace/output/training && echo 'Directories recreated'"
+                                                ]
+                                                mkdir_result = subprocess.run(mkdir_cmd, capture_output=True, text=True, timeout=30)
+                                                if mkdir_result.returncode == 0:
+                                                    terminal_output.append(f"[SSH] Directories recreated successfully")
+                                                    mkdir_success = True
+                                                    break
                                                 else:
-                                                    terminal_output.append(f"[SSH] Directory recreation failed after 3 attempts: {stderr_filtered[:200]}")
-                                        
-                                        if cleanup_success and mkdir_success:
-                                            terminal_output.append(f"[SUCCESS] Phase 2 cleanup complete. Ready to upload files.")
+                                                    stderr_filtered = filter_malloc_warnings(mkdir_result.stderr)
+                                                    if retry < 2:
+                                                        terminal_output.append(f"[SSH] Directory recreation failed (attempt {retry + 1}/3): {stderr_filtered[:200]}")
+                                                    else:
+                                                        terminal_output.append(f"[SSH] Directory recreation failed after 3 attempts: {stderr_filtered[:200]}")
+                                            
+                                            if cleanup_success and mkdir_success:
+                                                terminal_output.append(f"[SUCCESS] Phase 2 cleanup complete. Ready to upload files.")
+                                            else:
+                                                terminal_output.append(f"[WARNING] Some cleanup operations failed. You may need to retry.")
                                         else:
-                                            terminal_output.append(f"[WARNING] Some cleanup operations failed. You may need to retry.")
+                                            terminal_output.append(f"[WARNING] SSH host not available - will clean up on next upload")
+                                        
+                                        # Reset files_uploaded flag
+                                        if active_job.get("files_uploaded"):
+                                            active_job["files_uploaded"] = False
+                                            training_manager._save_job(active_job)
+                                        
+                                        terminal_output.append(f"[SUCCESS] Phase 2 reset - ready to upload files again")
+                                        
+                                        st.session_state[terminal_output_key] = terminal_output
+                                        st.session_state[confirm_key_phase2] = False
+                                        st.success("✅ Phase 2 reset. You can now upload files again.")
+                                        st.rerun()
                                     else:
-                                        terminal_output.append(f"[WARNING] SSH host not available - will clean up on next upload")
-                                    
-                                    # Reset files_uploaded flag
-                                    if active_job.get("files_uploaded"):
-                                        active_job["files_uploaded"] = False
-                                        training_manager._save_job(active_job)
-                                    
-                                    terminal_output.append(f"[SUCCESS] Phase 2 reset - ready to upload files again")
-                                    
+                                        terminal_output.append(f"[ERROR] No instance ID found")
+                                        st.error("No instance ID found")
+                                        st.session_state[terminal_output_key] = terminal_output
+                                except Exception as e:
+                                    error_msg = str(e)
+                                    terminal_output.append(f"[ERROR] Failed to redo phase: {error_msg}")
                                     st.session_state[terminal_output_key] = terminal_output
-                                    st.success("✅ Phase 2 reset. You can now upload files again.")
-                                    st.rerun()
-                                else:
-                                    terminal_output.append(f"[ERROR] No instance ID found")
-                                    st.error("No instance ID found")
-                                    st.session_state[terminal_output_key] = terminal_output
-                            except Exception as e:
-                                error_msg = str(e)
-                                terminal_output.append(f"[ERROR] Failed to redo phase: {error_msg}")
-                                st.session_state[terminal_output_key] = terminal_output
-                                st.error(f"Error: {error_msg}")
+                                    st.error(f"Error: {error_msg}")
+                            if st.button("❌ Cancel", key="cancel_redo_phase_2"):
+                                st.session_state[confirm_key_phase2] = False
+                                st.rerun()
+                        else:
+                            if st.button("🔄 Redo Phase", key="retry_phase_2", type="secondary", help="Reset Phase 2, delete uploaded files, and clear terminal output"):
+                                st.session_state[confirm_key_phase2] = True
+                                st.rerun()
                     
                     with col3:
                         if active_job.get("files_uploaded"):
@@ -1966,13 +2472,9 @@ def render():
                     st.markdown(f"### {phases[3]['icon']} Phase 3: {phases[3]['name']}")
                     st.caption(phases[3]['description'])
                     
-                    # Get job queue info for initialization
-                    job_queue = active_job.get("job_queue")
-                    current_job_index = active_job.get("current_job_index")
-                    
-                    # Initialize Phase 3: Ensure current job's files are active on instance
-                    phase3_init_key = f"phase3_init_{active_job.get('instance_id')}_{current_job_index}"
-                    if phase3_init_key not in st.session_state and job_queue and current_job_index is not None:
+                    # Initialize Phase 3: Ensure files are active on instance (single job, no index needed)
+                    phase3_init_key = f"phase3_init_{active_job.get('instance_id')}"
+                    if phase3_init_key not in st.session_state:
                         try:
                             import subprocess
                             instance_id = active_job.get("instance_id")
@@ -1980,38 +2482,104 @@ def render():
                             ssh_host = active_job.get("ssh_host")
                             ssh_port = active_job.get("ssh_port", 22)
                             
-                            # If not in job, get from API
+                            # If not in job, get from API (proactively retrieve SSH info)
                             if not ssh_host:
-                                job_status = training_manager.get_job_status(instance_id)
-                                ssh_host = job_status.get("ssh_host")
-                                ssh_port = job_status.get("ssh_port", 22)
-                                # Save to job for future use
-                                if ssh_host:
-                                    active_job["ssh_host"] = ssh_host
-                                    active_job["ssh_port"] = ssh_port
-                                    training_manager._save_job(active_job)
+                                if not terminal_output:
+                                    terminal_output = []
+                                terminal_output.append(f"[INFO] SSH info not in job - retrieving from API...")
+                                try:
+                                    job_status = training_manager.get_job_status(instance_id)
+                                    ssh_host = job_status.get("ssh_host")
+                                    ssh_port = job_status.get("ssh_port", 22)
+                                    # Save to job for future use
+                                    if ssh_host:
+                                        active_job["ssh_host"] = ssh_host
+                                        active_job["ssh_port"] = ssh_port
+                                        training_manager._save_job(active_job)
+                                        terminal_output.append(f"[SUCCESS] Retrieved SSH info from API: {ssh_host}:{ssh_port}")
+                                    else:
+                                        terminal_output.append(f"[WARNING] SSH host not available from API - instance may still be initializing")
+                                        terminal_output.append(f"[INFO] The 'Start Training' button will appear once SSH info is available")
+                                except Exception as e:
+                                    terminal_output.append(f"[WARNING] Could not retrieve SSH info from API: {str(e)}")
                             
                             if ssh_host:
                                 if not terminal_output:
                                     terminal_output = []
                                 
-                                terminal_output.append(f"[{datetime.now().strftime('%H:%M:%S')}] Initializing Phase 3 for job {current_job_index + 1}...")
-                                terminal_output.append(f"[SSH] Ensuring job {current_job_index + 1} files are active on instance...")
+                                terminal_output.append(f"[{datetime.now().strftime('%H:%M:%S')}] Initializing Phase 3...")
                                 
-                                # Clean up any old active files and rename current job's files to active names
-                                rename_cmd = [
+                                # Clean up old numbered files (single job uses active files, no numbered files needed)
+                                terminal_output.append(f"[SSH] Cleaning up old numbered training files (keeping active files)...")
+                                cleanup_cmd = [
                                     "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
                                     f"root@{ssh_host}",
                                     f"cd /workspace/data && "
-                                    f"rm -f axolotl_config.yaml training_data.jsonl && "
-                                    f"mv axolotl_config_{current_job_index}.yaml axolotl_config.yaml 2>/dev/null || true && "
-                                    f"mv training_data_{current_job_index}.jsonl training_data.jsonl 2>/dev/null || true && "
-                                    f"echo 'Files activated for job {current_job_index + 1}'"
+                                    f"echo 'Cleaning up old numbered training files...' && "
+                                    f"# Verify active files exist before cleaning "
+                                    f"if [ ! -f axolotl_config.yaml ] || [ ! -f training_data.jsonl ]; then "
+                                    f"  echo 'WARNING: Active files missing - skipping cleanup to preserve any files'; "
+                                    f"else "
+                                    f"  # Remove ONLY numbered files (pattern requires underscore+number, won't match active files) "
+                                    f"  rm -f axolotl_config_0.yaml training_data_0.jsonl 2>/dev/null || true && "
+                                    f"  for f in axolotl_config_[0-9]*.yaml training_data_[0-9]*.jsonl; do "
+                                    f"    if [ -f \"$f\" ]; then "
+                                    f"      rm -f \"$f\" && echo \"Removed old numbered file: $f\"; "
+                                    f"    fi; "
+                                    f"  done; "
+                                    f"  echo 'Removed numbered files (kept active files)'; "
+                                    f"fi && "
+                                    f"echo 'Cleanup complete' && "
+                                    f"ls -la /workspace/data/ 2>/dev/null | grep -E '(training_data|axolotl_config)' || echo 'No training files found'"
                                 ]
-                                rename_result = subprocess.run(rename_cmd, capture_output=True, text=True, timeout=30)
+                                cleanup_result = subprocess.run(cleanup_cmd, capture_output=True, text=True, timeout=30)
+                                if cleanup_result.returncode == 0:
+                                    terminal_output.append(f"[SSH] Old files cleaned up successfully")
+                                    if cleanup_result.stdout:
+                                        for line in cleanup_result.stdout.strip().split("\n"):
+                                            if line.strip() and "Cleaning up" not in line and "complete" not in line and "No training files" not in line:
+                                                terminal_output.append(f"[SSH]   {line}")
+                                else:
+                                    terminal_output.append(f"[WARNING] Cleanup had issues, but continuing...")
                                 
-                                if rename_result.returncode == 0:
-                                    terminal_output.append(f"[SUCCESS] Job {current_job_index + 1} files are now active")
+                                terminal_output.append(f"[SSH] Verifying training files are ready...")
+                                
+                                # Check for active files (single job, no suffix needed)
+                                expected_config_name = "axolotl_config.yaml"
+                                expected_data_name = "training_data.jsonl"
+                                
+                                check_files_cmd = [
+                                    "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
+                                    f"root@{ssh_host}",
+                                    f"cd /workspace/data && "
+                                    f"if [ -f {expected_config_name} ] && [ -f {expected_data_name} ]; then "
+                                    f"  config_size=$(stat -c%s {expected_config_name} 2>/dev/null || echo 0) "
+                                    f"  data_size=$(stat -c%s {expected_data_name} 2>/dev/null || echo 0) "
+                                    f"  if [ $config_size -gt 0 ] && [ $data_size -gt 0 ]; then "
+                                    f"    echo 'FILES_READY'; "
+                                    f"    ls -lh {expected_config_name} {expected_data_name}; "
+                                    f"  else "
+                                    f"    echo 'FILES_EMPTY'; "
+                                    f"  fi "
+                                    f"else "
+                                    f"  echo 'FILES_MISSING'; "
+                                    f"fi"
+                                ]
+                                check_result = subprocess.run(check_files_cmd, capture_output=True, text=True, timeout=15)
+                                if "FILES_MISSING" in check_result.stdout:
+                                    terminal_output.append(f"[ERROR] Training files ({expected_config_name}, {expected_data_name}) are missing!")
+                                    st.error("❌ Training files are missing. Please re-upload files in Phase 2.")
+                                    st.stop()
+                                elif "FILES_EMPTY" in check_result.stdout:
+                                    terminal_output.append(f"[ERROR] Training files exist but are empty!")
+                                    st.error("❌ Training files are empty. Please re-upload files in Phase 2.")
+                                    st.stop()
+                                else:
+                                    terminal_output.append(f"[SUCCESS] Training files are verified and ready")
+                                    if check_result.stdout:
+                                        for line in check_result.stdout.strip().split("\n"):
+                                            if line.strip() and "FILES" not in line:
+                                                terminal_output.append(f"[SSH]   {line}")
                                     
                                     # Verify and fix config file (dataset_preparation_path, tokenizer_type, etc.)
                                     terminal_output.append(f"[SSH] Verifying and fixing config file...")
@@ -2024,6 +2592,27 @@ def render():
                                         f"try:\n"
                                         f"    with open('axolotl_config.yaml', 'r') as f:\n"
                                         f"        config = yaml.safe_load(f) or {{}}\n"
+                                        f"    \n"
+                                        f"    # First, verify the dataset file exists and config points to it\n"
+                                        f"    expected_dataset = '/workspace/data/training_data.jsonl'\n"
+                                        f"    if not os.path.exists(expected_dataset):\n"
+                                        f"        print(f'ERROR: Dataset file not found: {{expected_dataset}}')\n"
+                                        f"        sys.exit(1)\n"
+                                        f"    \n"
+                                        f"    # Check if datasets config points to the correct file\n"
+                                        f"    datasets = config.get('datasets', [])\n"
+                                        f"    dataset_found = False\n"
+                                        f"    for dataset in datasets:\n"
+                                        f"        if isinstance(dataset, dict):\n"
+                                        f"            dataset_path = dataset.get('path', '')\n"
+                                        f"            if dataset_path == expected_dataset or dataset_path.endswith('training_data.jsonl'):\n"
+                                        f"                dataset_found = True\n"
+                                        f"                print(f'Dataset path found in config: {{dataset_path}}')\n"
+                                        f"                break\n"
+                                        f"    \n"
+                                        f"    if not dataset_found and datasets:\n"
+                                        f"        print(f'WARNING: Dataset path in config may not match expected path: {{expected_dataset}}')\n"
+                                        f"        print(f'Current datasets config: {{datasets}}')\n"
                                         f"    \n"
                                         f"    fixed = False\n"
                                         f"    \n"
@@ -2070,8 +2659,7 @@ def render():
                                         f"        fixed = True\n"
                                         f"        print('Fixed tokenizer_type to Qwen2Tokenizer')\n"
                                         f"    \n"
-                                        f"    # Fix adapter issue: if adapter is set to 'lora' as a string (not a path), remove it\n"
-                                        f"    # Axolotl will infer LoRA from lora_* parameters, and 'lora' as a string causes it to look for adapter files\n"
+                                        f"    # Fix adapter issue: Always remove adapter: 'lora' as it causes path interpretation issues\n"
                                         f"    if config.get('adapter') == 'lora':\n"
                                         f"        import os\n"
                                         f"        adapter_path = str(config.get('adapter', ''))\n"
@@ -2079,6 +2667,20 @@ def render():
                                         f"            del config['adapter']\n"
                                         f"            fixed = True\n"
                                         f"            print('Removed adapter: lora (LoRA will be inferred from lora_* parameters)')\n"
+                                        f"    \n"
+                                        f"    # CRITICAL: Remove lora_model_dir if it's set to output_dir (causes Axolotl to try loading from there)\n"
+                                        f"    # lora_model_dir should only be set to a valid adapter path (for incremental training)\n"
+                                        f"    output_dir = config.get('output_dir', '')\n"
+                                        f"    lora_model_dir = config.get('lora_model_dir', '')\n"
+                                        f"    adapter_val = config.get('adapter', '')\n"
+                                        f"    \n"
+                                        f"    # If lora_model_dir is set to output_dir, always remove it (unless there's a valid adapter path)\n"
+                                        f"    if lora_model_dir == output_dir:\n"
+                                        f"        # Only keep it if adapter is set to a valid path (incremental training)\n"
+                                        f"        if not adapter_val or not isinstance(adapter_val, str) or not adapter_val.startswith('/'):\n"
+                                        f"            del config['lora_model_dir']\n"
+                                        f"            fixed = True\n"
+                                        f"            print('Removed lora_model_dir (was pointing to output_dir - causes adapter loading errors)')\n"
                                         f"    \n"
                                         f"    # Fix quantization/adapter conflict: if quantization is enabled but no valid adapter, disable quantization\n"
                                         f"    # Axolotl requires an adapter field when quantization is enabled, but setting adapter: 'lora' causes path issues\n"
@@ -2189,22 +2791,21 @@ def render():
                                         error_msg = filter_malloc_warnings(fix_config_result.stderr or fix_config_result.stdout)
                                         terminal_output.append(f"[WARNING] Config verification failed: {error_msg[:200]}")
                                     
-                                    # Update package_info to point to current job's package
+                                    # Update package_info (single job, no index needed)
                                     all_package_infos = active_job.get("all_package_infos", [])
-                                    if all_package_infos and current_job_index < len(all_package_infos):
-                                        active_job["package_info"] = all_package_infos[current_job_index]
+                                    if all_package_infos and len(all_package_infos) > 0:
+                                        active_job["package_info"] = all_package_infos[0]  # Only one job
                                         # Update YAML config in package_info for display
-                                        current_job = job_queue[current_job_index]
-                                        if current_job.get("yaml_path"):
-                                            from pathlib import Path
-                                            yaml_filename = Path(current_job.get("yaml_path")).name
-                                            active_job["package_info"]["yaml_config"] = yaml_filename
-                                        else:
-                                            active_job["package_info"]["yaml_config"] = None
+                                        job_queue = active_job.get("job_queue", [])
+                                        if job_queue and len(job_queue) > 0:
+                                            current_job = job_queue[0]  # Only one job
+                                            if current_job.get("yaml_path"):
+                                                from pathlib import Path
+                                                yaml_filename = Path(current_job.get("yaml_path")).name
+                                                active_job["package_info"]["yaml_config"] = yaml_filename
+                                            else:
+                                                active_job["package_info"]["yaml_config"] = None
                                         training_manager._save_job(active_job)
-                                else:
-                                    error_output = filter_malloc_warnings(rename_result.stderr or rename_result.stdout)
-                                    terminal_output.append(f"[WARNING] File rename result: {error_output[:200]}")
                                 
                                 st.session_state[terminal_output_key] = terminal_output
                                 st.session_state[phase3_init_key] = True
@@ -2217,7 +2818,7 @@ def render():
                             st.session_state[phase3_init_key] = True
                     
                     # YAML Debugging - Check at beginning of Phase 3
-                    phase3_yaml_debug_key = f"phase3_yaml_debug_{active_job.get('instance_id')}_{current_job_index}"
+                    phase3_yaml_debug_key = f"phase3_yaml_debug_{active_job.get('instance_id')}"
                     if phase3_yaml_debug_key not in st.session_state:
                         try:
                             from datetime import datetime
@@ -2235,15 +2836,15 @@ def render():
                             expected_yaml_from_queue = None
                             expected_yaml_path = None
                             
-                            if job_queue and current_job_index is not None:
-                                current_job = job_queue[current_job_index]
+                            job_queue = active_job.get("job_queue", [])
+                            if job_queue and len(job_queue) > 0:
+                                current_job = job_queue[0]  # Only one job
                                 expected_yaml_from_queue = current_job.get("yaml_filename")
                                 expected_yaml_path = current_job.get("yaml_path")
-                                terminal_output.append(f"[YAML DEBUG] Job queue index: {current_job_index}")
                                 terminal_output.append(f"[YAML DEBUG] Expected YAML from queue: {expected_yaml_from_queue if expected_yaml_from_queue else 'None'}")
                                 terminal_output.append(f"[YAML DEBUG] Expected YAML path: {expected_yaml_path if expected_yaml_path else 'None'}")
                             else:
-                                terminal_output.append(f"[YAML DEBUG] No job queue or index - checking package_info")
+                                terminal_output.append(f"[YAML DEBUG] Checking package_info")
                                 terminal_output.append(f"[YAML DEBUG] Expected YAML from package_info: {expected_yaml if expected_yaml else 'None'}")
                             
                             yaml_should_be_included = bool(expected_yaml or expected_yaml_from_queue)
@@ -2360,41 +2961,46 @@ def render():
                             st.session_state[terminal_output_key] = terminal_output
                             st.session_state[phase3_yaml_debug_key] = True
                     
-                    # Terminal output area (scrollable)
+                    # Terminal output area (scrollable) - CREATE PLACEHOLDER FIRST
                     st.markdown("#### Terminal Output")
-                    terminal_container = st.container()
-                    with terminal_container:
-                        if terminal_output:
-                            # Keep only last 200 lines
-                            display_output = terminal_output[-200:] if len(terminal_output) > 200 else terminal_output
-                            output_text = "\n".join(display_output)
-                            st.code(output_text, language="text")
-                            if len(terminal_output) > 200:
-                                st.caption(f"Showing last 200 of {len(terminal_output)} lines")
-                        else:
-                            st.info("Terminal is empty. Click 'Check Training Status.'")
+                    terminal_placeholder = st.empty()
                     
-                    # Action buttons
+                    # Action buttons - BUTTONS MUST BE DEFINED BEFORE TERMINAL DISPLAY
+                    # This ensures button handlers run and update session state BEFORE terminal reads
                     col1, col2, col3, col4 = st.columns([1, 1, 1, 2])
                     with col1:
-                        # Check if training is already running
+                        # Check if training is already running - check both status AND actual processes
                         training_status = active_job.get("training_status", {})
-                        training_is_running = training_status.get("status") in ["training", "preprocessing", "completed"]
+                        status_indicates_running = training_status.get("status") in ["training", "preprocessing", "completed"]
                         
-                        # Check if we're in queue mode and should wait for automatic transition
-                        job_queue = active_job.get("job_queue")
-                        current_job_index = active_job.get("current_job_index")
-                        in_queue_mode = job_queue and current_job_index is not None and len(job_queue) > 1
+                        # Also check if processes are actually running via SSH (more reliable)
+                        processes_actually_running = False
+                        ssh_host = active_job.get("ssh_host")
+                        ssh_port = active_job.get("ssh_port", 22)
+                        ssh_port_override = active_job.get("ssh_port_override")
+                        if ssh_port_override:
+                            ssh_port = ssh_port_override
                         
-                        # Don't show manual start button if in queue mode with multiple jobs
-                        # (queue jobs should transition automatically when previous completes)
-                        if in_queue_mode and current_job_index + 1 < len(job_queue):
-                            # In queue mode - jobs transition automatically
-                            if not training_is_running:
-                                st.info(f"⏳ Waiting for job {current_job_index + 1} to complete before starting job {current_job_index + 2}...")
-                            else:
-                                st.info(f"🔄 Job {current_job_index + 1}/{len(job_queue)} in progress. Next job will start automatically when this completes.")
-                        elif not training_is_running:
+                        if ssh_host:
+                            try:
+                                check_process_cmd = [
+                                    "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
+                                    f"root@{ssh_host}",
+                                    "ps aux | grep -E '(accelerate|axolotl.cli.train)' | grep -v grep | wc -l"
+                                ]
+                                process_check_result = subprocess.run(check_process_cmd, capture_output=True, text=True, timeout=10)
+                                if process_check_result.returncode == 0:
+                                    process_count = int(process_check_result.stdout.strip())
+                                    processes_actually_running = process_count > 0
+                            except:
+                                # If SSH check fails, fall back to status check
+                                pass
+                        
+                        # Training is running if either status says so OR processes are actually running
+                        training_is_running = status_indicates_running or processes_actually_running
+                        
+                        # Show "Start Training" button if training hasn't started
+                        if not training_is_running:
                             # Show "Start Training" button if training hasn't started
                             if st.button("▶️ Start Training", key="start_training", type="primary"):
                                 try:
@@ -2408,20 +3014,155 @@ def render():
                                     else:
                                         terminal_output.append(f"[WARNING] No Hugging Face token found. Gated models (e.g., Gemma) may fail to load.")
                                     
-                                    # Get SSH info
+                                    # Get SSH info - check for port override first
                                     ssh_host = active_job.get("ssh_host")
-                                    ssh_port = active_job.get("ssh_port", 22)
+                                    ssh_port_override = active_job.get("ssh_port_override")
+                                    
+                                    # Use port override if provided, otherwise use saved port
+                                    if ssh_port_override:
+                                        ssh_port = ssh_port_override
+                                        terminal_output.append(f"[INFO] Using SSH port override: {ssh_port}")
+                                    else:
+                                        ssh_port = active_job.get("ssh_port", 22)
                                     
                                     if not ssh_host:
                                         job_status = training_manager.get_job_status(instance_id)
                                         ssh_host = job_status.get("ssh_host")
-                                        ssh_port = job_status.get("ssh_port", 22)
+                                        api_ssh_port = job_status.get("ssh_port", 22)
+                                        
+                                        # Use port override if provided, otherwise use API port
+                                        if ssh_port_override:
+                                            ssh_port = ssh_port_override
+                                            terminal_output.append(f"[INFO] Using SSH port override: {ssh_port} (instead of API port: {api_ssh_port})")
+                                        else:
+                                            ssh_port = api_ssh_port
+                                        
                                         if ssh_host:
                                             active_job["ssh_host"] = ssh_host
                                             active_job["ssh_port"] = ssh_port
                                             training_manager._save_job(active_job)
                                     
                                     if ssh_host:
+                                        # Find and embed most recent version weights before training
+                                        terminal_output.append(f"[LOCAL] Looking for most recent version weights to embed...")
+                                        from utils.model_manager import ModelManager
+                                        model_manager = ModelManager()
+                                        latest_version = model_manager.get_latest_version(model_name)
+                                        
+                                        if latest_version:
+                                            weights_path = model_manager.get_version_weights_path(model_name, latest_version)
+                                            if weights_path and weights_path.exists():
+                                                terminal_output.append(f"[SUCCESS] Found version {latest_version} weights at: {weights_path}")
+                                                terminal_output.append(f"[INFO] Embedding previous version weights in config before training...")
+                                                
+                                                # Upload weights to instance and update config
+                                                # First, upload the adapter directory
+                                                import subprocess
+                                                upload_weights_cmd = [
+                                                    "scp", "-r", "-P", str(ssh_port), 
+                                                    "-o", "StrictHostKeyChecking=no", 
+                                                    "-o", "ConnectTimeout=30",
+                                                    str(weights_path),
+                                                    f"root@{ssh_host}:/workspace/previous_adapter"
+                                                ]
+                                                upload_result = subprocess.run(upload_weights_cmd, capture_output=True, text=True, timeout=300)
+                                                if upload_result.returncode == 0:
+                                                    terminal_output.append(f"[SUCCESS] Uploaded previous version weights to instance")
+                                                    
+                                                    # Update config file to use the adapter
+                                                    update_config_cmd = [
+                                                        "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
+                                                        f"root@{ssh_host}",
+                                                        f"cd /workspace/data && "
+                                                        f"python3 << 'PYTHON_EOF'\n"
+                                                        f"import yaml\n"
+                                                        f"import os\n"
+                                                        f"try:\n"
+                                                        f"    with open('axolotl_config.yaml', 'r') as f:\n"
+                                                        f"        config = yaml.safe_load(f) or {{}}\n"
+                                                        f"    \n"
+                                                        f"    # Set adapter path to uploaded weights\n"
+                                                        f"    config['adapter'] = '/workspace/previous_adapter'\n"
+                                                        f"    \n"
+                                                        f"    with open('axolotl_config.yaml', 'w') as f:\n"
+                                                        f"        yaml.dump(config, f, default_flow_style=False, sort_keys=False)\n"
+                                                        f"    \n"
+                                                        f"    print('SUCCESS: Updated config with adapter path: /workspace/previous_adapter')\n"
+                                                        f"except Exception as e:\n"
+                                                        f"    print(f'ERROR: Failed to update config: {{str(e)}}')\n"
+                                                        f"    import sys\n"
+                                                        f"    sys.exit(1)\n"
+                                                        f"PYTHON_EOF"
+                                                    ]
+                                                    update_result = subprocess.run(update_config_cmd, capture_output=True, text=True, timeout=30)
+                                                    if update_result.returncode == 0:
+                                                        terminal_output.append(f"[SUCCESS] Embedded version {latest_version} weights in config")
+                                                        if update_result.stdout:
+                                                            for line in update_result.stdout.strip().split("\n"):
+                                                                if line.strip():
+                                                                    terminal_output.append(f"[SSH]   {line}")
+                                                    else:
+                                                        terminal_output.append(f"[WARNING] Failed to update config with adapter path: {update_result.stderr[:200]}")
+                                                else:
+                                                    terminal_output.append(f"[WARNING] Failed to upload previous version weights: {upload_result.stderr[:200]}")
+                                                    terminal_output.append(f"[INFO] Will train from base model instead")
+                                            else:
+                                                terminal_output.append(f"[INFO] Version {latest_version} exists but weights not found. Training from base model.")
+                                        else:
+                                            terminal_output.append(f"[INFO] No previous versions found. Training from base model.")
+                                        
+                                        # CRITICAL: Ensure files are activated before starting training
+                                        # Files should already be axolotl_config.yaml and training_data.jsonl (no suffix needed for single job)
+                                        terminal_output.append(f"[SSH] Ensuring training files are ready before starting training...")
+                                        
+                                        # Check for active files (single job, no suffix)
+                                        check_active_cmd = [
+                                            "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
+                                            f"root@{ssh_host}",
+                                            f"cd /workspace/data && "
+                                            f"if [ -f axolotl_config.yaml ] && [ -f training_data.jsonl ]; then "
+                                            f"  # Check file sizes to ensure they're not empty "
+                                            f"  config_size=$(stat -c%s axolotl_config.yaml 2>/dev/null || echo 0) "
+                                            f"  data_size=$(stat -c%s training_data.jsonl 2>/dev/null || echo 0) "
+                                            f"  if [ $config_size -gt 0 ] && [ $data_size -gt 0 ]; then "
+                                            f"    echo 'ACTIVE_EXISTS'; "
+                                            f"    ls -lh axolotl_config.yaml training_data.jsonl; "
+                                            f"  else "
+                                            f"    echo 'ACTIVE_EMPTY'; "
+                                            f"    echo 'Config size: '$config_size', Data size: '$data_size; "
+                                            f"  fi "
+                                            f"else "
+                                            f"  echo 'ACTIVE_MISSING'; "
+                                            f"  ls -la axolotl_config.yaml training_data.jsonl 2>&1 || echo 'Files not found'; "
+                                            f"fi"
+                                        ]
+                                        check_result = subprocess.run(check_active_cmd, capture_output=True, text=True, timeout=15)
+                                        if "ACTIVE_MISSING" in check_result.stdout:
+                                            terminal_output.append(f"[ERROR] Training files (axolotl_config.yaml, training_data.jsonl) are missing!")
+                                            if check_result.stdout:
+                                                for line in check_result.stdout.strip().split("\n"):
+                                                    if line.strip() and "ACTIVE" not in line:
+                                                        terminal_output.append(f"[SSH]   {line}")
+                                            terminal_output.append(f"[ERROR] Cannot start training without active files.")
+                                            st.error("❌ Training files are missing. Please re-upload files in Phase 2.")
+                                            st.stop()
+                                        elif "ACTIVE_EMPTY" in check_result.stdout:
+                                            terminal_output.append(f"[ERROR] Job 1 files exist but are empty!")
+                                            if check_result.stdout:
+                                                for line in check_result.stdout.strip().split("\n"):
+                                                    if line.strip() and "ACTIVE" not in line:
+                                                        terminal_output.append(f"[SSH]   {line}")
+                                            terminal_output.append(f"[ERROR] Cannot start training with empty files. Please re-upload files in Phase 2.")
+                                            st.error("❌ Training files are empty. Please re-upload files in Phase 2.")
+                                            st.stop()
+                                        else:
+                                            terminal_output.append(f"[SUCCESS] Training files are ready (axolotl_config.yaml, training_data.jsonl)")
+                                            if check_result.stdout:
+                                                for line in check_result.stdout.strip().split("\n"):
+                                                    if line.strip() and "ACTIVE" not in line:
+                                                        terminal_output.append(f"[SSH]   {line}")
+                                        
+                                        st.session_state[terminal_output_key] = terminal_output
                                         terminal_output.append(f"[SSH] Connecting to {ssh_host}:{ssh_port}")
                                         
                                         # Check if files exist
@@ -2436,11 +3177,7 @@ def render():
                                         if "files_exist" in files_check.stdout:
                                             terminal_output.append(f"[SSH] Training files found - setting up environment...")
                                             
-                                            # Check if there's already a training process running for this job
-                                            # Only kill if we're in a queue and this is a different job, or if manually restarting
-                                            job_queue = active_job.get("job_queue")
-                                            current_job_index = active_job.get("current_job_index")
-                                            
+                                            # Check if there's already a training process running
                                             # Check for existing processes
                                             check_processes_cmd = [
                                                 "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
@@ -2451,33 +3188,15 @@ def render():
                                             
                                             has_existing_process = "no_processes" not in check_processes_result.stdout and check_processes_result.stdout.strip()
                                             
+                                            # ALWAYS kill any existing processes before starting training
+                                            # This ensures a clean state even if process detection missed something
                                             if has_existing_process:
-                                                # There's a process running - check if it's for a different job in queue
-                                                if job_queue and current_job_index is not None:
-                                                    # In queue mode - it's OK to kill previous job's process
-                                                    terminal_output.append(f"[SSH] Found existing training process - stopping (transitioning to job {current_job_index + 1})...")
-                                                else:
-                                                    # Single job mode - warn but allow restart
-                                                    terminal_output.append(f"[WARNING] Found existing training process. This will be stopped to start fresh training.")
-                                                
-                                                # Kill existing processes
-                                                kill_existing_cmd = [
-                                                    "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
-                                                    f"root@{ssh_host}",
-                                                    "pkill -9 -f accelerate || true; "
-                                                    "pkill -9 -f axolotl || true; "
-                                                    "ps aux | grep -E 'python.*train|python.*axolotl|python.*accelerate' | grep -v grep | awk '{print $2}' | xargs -r kill -9 || true; "
-                                                    "sleep 2; "
-                                                    "remaining=$(ps aux | grep -E 'accelerate|axolotl|train' | grep -v grep | wc -l); "
-                                                    "echo 'Processes stopped. Remaining: '$remaining"
-                                                ]
-                                                kill_existing_result = subprocess.run(kill_existing_cmd, capture_output=True, text=True, timeout=30)
-                                                if kill_existing_result.returncode == 0:
-                                                    stdout_filtered = filter_malloc_warnings(kill_existing_result.stdout)
-                                                    if stdout_filtered.strip():
-                                                        terminal_output.append(f"[SSH] {stdout_filtered.strip()}")
+                                                terminal_output.append(f"[WARNING] Found existing training process. This will be stopped to start fresh training.")
                                             else:
-                                                terminal_output.append(f"[SSH] No existing training processes found - starting fresh")
+                                                terminal_output.append(f"[SSH] No existing training processes detected - ensuring clean state...")
+                                            
+                                            # Always kill processes to ensure clean state
+                                            kill_all_training_processes(ssh_host, ssh_port, terminal_output)
                                             
                                             # Clean output directory
                                             terminal_output.append(f"[SSH] Cleaning output directory...")
@@ -2490,10 +3209,176 @@ def render():
                                             if cleanup_result.returncode == 0:
                                                 terminal_output.append(f"[SSH] Output directory cleaned")
                                             
+                                            # FINAL VERIFICATION: Check files exist and are valid right before starting training
+                                            terminal_output.append(f"[SSH] Final verification: Checking files exist and are valid before starting training...")
+                                            final_verify_cmd = [
+                                                "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
+                                                f"root@{ssh_host}",
+                                                f"cd /workspace/data && "
+                                                f"echo '=== FINAL FILE VERIFICATION ===' && "
+                                                f"if [ ! -f axolotl_config.yaml ]; then "
+                                                f"  echo 'ERROR: axolotl_config.yaml missing'; exit 1; "
+                                                f"fi && "
+                                                f"if [ ! -f training_data.jsonl ]; then "
+                                                f"  echo 'ERROR: training_data.jsonl missing'; exit 1; "
+                                                f"fi && "
+                                                f"config_size=$(stat -c%s axolotl_config.yaml 2>/dev/null || echo 0) && "
+                                                f"data_size=$(stat -c%s training_data.jsonl 2>/dev/null || echo 0) && "
+                                                f"if [ $config_size -eq 0 ]; then "
+                                                f"  echo 'ERROR: axolotl_config.yaml is empty'; exit 1; "
+                                                f"fi && "
+                                                f"if [ $data_size -eq 0 ]; then "
+                                                f"  echo 'ERROR: training_data.jsonl is empty'; exit 1; "
+                                                f"fi && "
+                                                f"echo 'Files verified:' && "
+                                                f"ls -lh axolotl_config.yaml training_data.jsonl && "
+                                                f"echo 'File sizes: config=$config_size bytes, data=$data_size bytes' && "
+                                                f"echo '=== VERIFICATION PASSED ==='"
+                                            ]
+                                            final_verify_result = subprocess.run(final_verify_cmd, capture_output=True, text=True, timeout=15)
+                                            if final_verify_result.returncode != 0:
+                                                terminal_output.append(f"[ERROR] Final verification FAILED!")
+                                                if final_verify_result.stdout:
+                                                    for line in final_verify_result.stdout.strip().split("\n"):
+                                                        if line.strip():
+                                                            terminal_output.append(f"[SSH]   {line}")
+                                                if final_verify_result.stderr:
+                                                    stderr_filtered = filter_malloc_warnings(final_verify_result.stderr)
+                                                    for line in stderr_filtered.strip().split("\n"):
+                                                        if line.strip():
+                                                            terminal_output.append(f"[SSH]   stderr: {line}")
+                                                terminal_output.append(f"[ERROR] Cannot start training - files are missing or invalid!")
+                                                st.error("❌ Training files are missing or invalid. Please re-upload files in Phase 2.")
+                                                st.session_state[terminal_output_key] = terminal_output
+                                                st.stop()
+                                            else:
+                                                terminal_output.append(f"[SUCCESS] Final verification passed - files are ready")
+                                                if final_verify_result.stdout:
+                                                    for line in final_verify_result.stdout.strip().split("\n"):
+                                                        if line.strip() and "VERIFICATION" not in line:
+                                                            terminal_output.append(f"[SSH]   {line}")
+                                            
+                                            # Verify config file points to correct dataset path
+                                            terminal_output.append(f"[SSH] Verifying config file points to correct dataset path...")
+                                            verify_config_cmd = [
+                                                "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
+                                                f"root@{ssh_host}",
+                                                f"cd /workspace/data && "
+                                                f"python3 << 'PYTHON_EOF'\n"
+                                                f"import yaml\n"
+                                                f"import os\n"
+                                                f"import sys\n"
+                                                f"try:\n"
+                                                f"    with open('axolotl_config.yaml', 'r') as f:\n"
+                                                f"        config = yaml.safe_load(f) or {{}}\n"
+                                                f"    \n"
+                                                f"    expected_dataset = '/workspace/data/training_data.jsonl'\n"
+                                                f"    \n"
+                                                f"    # Check if file exists\n"
+                                                f"    if not os.path.exists(expected_dataset):\n"
+                                                f"        print(f'ERROR: Dataset file does not exist: {{expected_dataset}}')\n"
+                                                f"        sys.exit(1)\n"
+                                                f"    \n"
+                                                f"    # Check file size\n"
+                                                f"    file_size = os.path.getsize(expected_dataset)\n"
+                                                f"    if file_size == 0:\n"
+                                                f"        print(f'ERROR: Dataset file is empty: {{expected_dataset}}')\n"
+                                                f"        sys.exit(1)\n"
+                                                f"    \n"
+                                                f"    # Check if datasets config points to the correct file\n"
+                                                f"    datasets = config.get('datasets', [])\n"
+                                                f"    dataset_found = False\n"
+                                                f"    for dataset in datasets:\n"
+                                                f"        if isinstance(dataset, dict):\n"
+                                                f"            dataset_path = dataset.get('path', '')\n"
+                                                f"            if dataset_path == expected_dataset:\n"
+                                                f"                dataset_found = True\n"
+                                                f"                print(f'✓ Dataset path in config matches: {{dataset_path}}')\n"
+                                                f"                break\n"
+                                                f"            elif dataset_path and dataset_path.endswith('training_data.jsonl'):\n"
+                                                f"                print(f'WARNING: Dataset path in config is {{dataset_path}}, expected {{expected_dataset}}')\n"
+                                                f"    \n"
+                                                f"    if not dataset_found and datasets:\n"
+                                                f"        print(f'WARNING: Dataset path in config may not match expected path')\n"
+                                                f"        print(f'Expected: {{expected_dataset}}')\n"
+                                                f"        print(f'Config datasets: {{datasets}}')\n"
+                                                f"    \n"
+                                                f"    print(f'✓ Config verification passed')\n"
+                                                f"    print(f'✓ Dataset file exists: {{expected_dataset}}')\n"
+                                                f"    print(f'✓ Dataset file size: {{file_size}} bytes')\n"
+                                                f"except Exception as e:\n"
+                                                f"    print(f'ERROR: Config verification failed: {{str(e)}}')\n"
+                                                f"    sys.exit(1)\n"
+                                                f"PYTHON_EOF"
+                                            ]
+                                            verify_config_result = subprocess.run(verify_config_cmd, capture_output=True, text=True, timeout=15)
+                                            if verify_config_result.returncode != 0:
+                                                terminal_output.append(f"[ERROR] Config verification FAILED!")
+                                                if verify_config_result.stdout:
+                                                    for line in verify_config_result.stdout.strip().split("\n"):
+                                                        if line.strip():
+                                                            terminal_output.append(f"[SSH]   {line}")
+                                                if verify_config_result.stderr:
+                                                    stderr_filtered = filter_malloc_warnings(verify_config_result.stderr)
+                                                    for line in stderr_filtered.strip().split("\n"):
+                                                        if line.strip():
+                                                            terminal_output.append(f"[SSH]   stderr: {line}")
+                                                terminal_output.append(f"[ERROR] Cannot start training - config or dataset file is invalid!")
+                                                st.error("❌ Config or dataset file verification failed. Please re-upload files in Phase 2.")
+                                                st.session_state[terminal_output_key] = terminal_output
+                                                st.stop()
+                                            else:
+                                                terminal_output.append(f"[SUCCESS] Config verification passed")
+                                                if verify_config_result.stdout:
+                                                    for line in verify_config_result.stdout.strip().split("\n"):
+                                                        if line.strip() and "ERROR" not in line:
+                                                            terminal_output.append(f"[SSH]   {line}")
+                                            
+                                            # CRITICAL: Ensure sample_packing is disabled before starting training
+                                            # This prevents multipack sampler IndexError issues
+                                            terminal_output.append(f"[SSH] Ensuring sample_packing is disabled...")
+                                            fix_sample_packing_cmd = [
+                                                "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
+                                                f"root@{ssh_host}",
+                                                f"cd /workspace/data && "
+                                                f"python3 << 'PYTHON_EOF'\n"
+                                                f"import yaml\n"
+                                                f"import sys\n"
+                                                f"try:\n"
+                                                f"    with open('axolotl_config.yaml', 'r') as f:\n"
+                                                f"        config = yaml.safe_load(f) or {{}}\n"
+                                                f"    \n"
+                                                f"    # Always disable sample_packing to prevent multipack sampler errors\n"
+                                                f"    if config.get('sample_packing', True):  # Default to True if not set\n"
+                                                f"        config['sample_packing'] = False\n"
+                                                f"        with open('axolotl_config.yaml', 'w') as f:\n"
+                                                f"            yaml.dump(config, f, default_flow_style=False, sort_keys=False)\n"
+                                                f"        print('SUCCESS: Disabled sample_packing')\n"
+                                                f"    else:\n"
+                                                f"        print('OK: sample_packing already disabled')\n"
+                                                f"except Exception as e:\n"
+                                                f"    print(f'ERROR: {{str(e)}}')\n"
+                                                f"    sys.exit(1)\n"
+                                                f"PYTHON_EOF"
+                                            ]
+                                            fix_sample_packing_result = subprocess.run(fix_sample_packing_cmd, capture_output=True, text=True, timeout=30)
+                                            if fix_sample_packing_result.returncode == 0:
+                                                if "SUCCESS" in fix_sample_packing_result.stdout:
+                                                    terminal_output.append(f"[SUCCESS] sample_packing disabled in config")
+                                                elif "OK" in fix_sample_packing_result.stdout:
+                                                    terminal_output.append(f"[INFO] sample_packing already disabled")
+                                                else:
+                                                    terminal_output.append(f"[INFO] Config check: {fix_sample_packing_result.stdout.strip()}")
+                                            else:
+                                                terminal_output.append(f"[WARNING] Could not verify sample_packing setting: {fix_sample_packing_result.stderr[:200]}")
+                                                # Continue anyway - the error detection will catch it if it fails
+                                            
+                                            st.session_state[terminal_output_key] = terminal_output
+                                            
                                             # Setup script that installs dependencies and starts training
                                             # This mirrors the onstart script but runs directly
                                             # Use a here-doc to avoid quote escaping issues
-                                            
+
                                             # Build HF token export section
                                             if hf_token:
                                                 hf_token_escaped = hf_token.replace("'", "'\"'\"'")
@@ -2612,6 +3497,7 @@ def render():
                                             
                                             # Start training in background
                                             terminal_output.append(f"[SSH] Installing dependencies and starting training...")
+                                            terminal_output.append(f"[DEBUG] Using SSH port: {ssh_port} for training command")
                                             # Write script to remote file first to avoid quote escaping issues
                                             script_content = setup_and_train_cmd
                                             
@@ -2633,20 +3519,29 @@ def render():
                                                 ]
                                                 training_result = subprocess.run(chmod_cmd, capture_output=True, text=True, timeout=600)
                                                 
-                                                # Show output from script execution
+                                                # Show output from script execution - show more lines for debugging
                                                 if training_result.stdout:
                                                     stdout_filtered = filter_malloc_warnings(training_result.stdout)
-                                                    for line in stdout_filtered.strip().split("\n")[-10:]:
+                                                    # Show all output, not just last 10 lines
+                                                    for line in stdout_filtered.strip().split("\n"):
                                                         if line.strip():
                                                             terminal_output.append(f"[SCRIPT] {line[:200]}")
                                                 if training_result.stderr:
                                                     stderr_filtered = filter_malloc_warnings(training_result.stderr)
-                                                    for line in stderr_filtered.strip().split("\n")[-10:]:
+                                                    # Show all stderr output
+                                                    for line in stderr_filtered.strip().split("\n"):
                                                         if line.strip():
                                                             terminal_output.append(f"[SCRIPT ERROR] {line[:200]}")
+                                                
+                                                # Log return code for debugging
+                                                terminal_output.append(f"[DEBUG] Script execution return code: {training_result.returncode}")
                                             else:
                                                 error_msg = filter_malloc_warnings(write_result.stderr or write_result.stdout)
-                                                terminal_output.append(f"[ERROR] Failed to write script: {error_msg[:200]}")
+                                                terminal_output.append(f"[ERROR] Failed to write script to remote server")
+                                                if write_result.stdout:
+                                                    terminal_output.append(f"[ERROR] stdout: {write_result.stdout[:500]}")
+                                                if write_result.stderr:
+                                                    terminal_output.append(f"[ERROR] stderr: {write_result.stderr[:500]}")
                                                 training_result = write_result
                                             
                                             # Verify training actually started by checking for the process
@@ -2661,38 +3556,71 @@ def render():
                                                     f"root@{ssh_host}",
                                                     "ps aux | grep -E '(axolotl|accelerate|train)' | grep -v grep | head -1 || echo 'no_training'"
                                                 ]
-                                                process_check = subprocess.run(check_process_cmd, capture_output=True, text=True, timeout=15)
-                                                
-                                                if "no_training" not in process_check.stdout and process_check.stdout.strip():
-                                                    terminal_output.append(f"[SUCCESS] Training started successfully!")
-                                                    terminal_output.append(f"[INFO] Training is running in the background.")
-                                                    terminal_output.append(f"[INFO] Click 'Check Training Status' to monitor progress.")
+                                                try:
+                                                    process_check = subprocess.run(check_process_cmd, capture_output=True, text=True, timeout=15)
                                                     
-                                                    # Update job status
-                                                    active_job["training_status"] = {"status": "training"}
-                                                    training_manager._save_job(active_job)
-                                                else:
-                                                    # Script ran but training didn't start - check logs
-                                                    check_log_cmd = [
-                                                        "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
-                                                        f"root@{ssh_host}",
-                                                        "tail -20 /workspace/output/training/training.log 2>/dev/null || echo 'no_log'"
-                                                    ]
-                                                    log_check = subprocess.run(check_log_cmd, capture_output=True, text=True, timeout=15)
-                                                    if "no_log" not in log_check.stdout:
-                                                        log_output = filter_malloc_warnings(log_check.stdout)
-                                                        terminal_output.append(f"[WARNING] Script completed but training process not found.")
-                                                        terminal_output.append(f"[WARNING] Last log output:")
-                                                        for line in log_output.strip().split("\n")[-5:]:
-                                                            if line.strip():
-                                                                terminal_output.append(f"[LOG] {line[:200]}")
-                                                    terminal_output.append(f"[ERROR] Training script completed but training process did not start.")
-                                                    terminal_output.append(f"[ACTION] Check the script output above and training.log for errors.")
-                                                    st.error("Training script ran but training process did not start. Check terminal output above.")
+                                                    if "no_training" not in process_check.stdout and process_check.stdout.strip():
+                                                        terminal_output.append(f"[SUCCESS] Training started successfully!")
+                                                        terminal_output.append(f"[INFO] Training is running in the background.")
+                                                        terminal_output.append(f"[INFO] Click 'Check Training Status' to monitor progress.")
+                                                        
+                                                        # Update job status
+                                                        active_job["training_status"] = {"status": "training"}
+                                                        training_manager._save_job(active_job)
+                                                    else:
+                                                        # Script ran but training didn't start - check logs
+                                                        check_log_cmd = [
+                                                            "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
+                                                            f"root@{ssh_host}",
+                                                            "tail -50 /workspace/output/training/training.log 2>/dev/null || echo 'no_log'"
+                                                        ]
+                                                        log_check = subprocess.run(check_log_cmd, capture_output=True, text=True, timeout=15)
+                                                        if "no_log" not in log_check.stdout:
+                                                            log_output = filter_malloc_warnings(log_check.stdout)
+                                                            terminal_output.append(f"[WARNING] Script completed but training process not found.")
+                                                            terminal_output.append(f"[WARNING] Last log output (showing more lines for debugging):")
+                                                            for line in log_output.strip().split("\n"):
+                                                                if line.strip():
+                                                                    terminal_output.append(f"[LOG] {line[:200]}")
+                                                        else:
+                                                            terminal_output.append(f"[WARNING] Training log file not found at /workspace/output/training/training.log")
+                                                        
+                                                        # Also check if script file exists and show its contents for debugging
+                                                        check_script_cmd = [
+                                                            "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
+                                                            f"root@{ssh_host}",
+                                                            "cat /tmp/start_training.sh 2>/dev/null | tail -30 || echo 'script_not_found'"
+                                                        ]
+                                                        script_check = subprocess.run(check_script_cmd, capture_output=True, text=True, timeout=15)
+                                                        if "script_not_found" not in script_check.stdout:
+                                                            terminal_output.append(f"[DEBUG] Last 30 lines of training script:")
+                                                            for line in script_check.stdout.strip().split("\n"):
+                                                                if line.strip():
+                                                                    terminal_output.append(f"[SCRIPT] {line[:200]}")
+                                                        
+                                                        terminal_output.append(f"[ERROR] Training script completed but training process did not start.")
+                                                        terminal_output.append(f"[ACTION] Check the script output above and training.log for errors.")
+                                                        st.error("Training script ran but training process did not start. Check terminal output above.")
+                                                except subprocess.TimeoutExpired:
+                                                    terminal_output.append(f"[WARNING] Process check timed out - training may still be starting")
+                                                    terminal_output.append(f"[INFO] Check training status again in a few moments")
+                                                except Exception as e:
+                                                    terminal_output.append(f"[WARNING] Could not verify training process: {str(e)}")
+                                                    terminal_output.append(f"[INFO] Training script completed successfully - check status to verify training started")
                                             else:
                                                 error_msg = filter_malloc_warnings(training_result.stderr or training_result.stdout)
-                                                terminal_output.append(f"[ERROR] Failed to start training: {error_msg[:300]}")
-                                                st.error(f"Failed to start training: {error_msg[:200]}")
+                                                terminal_output.append(f"[ERROR] Training script failed with return code {training_result.returncode}")
+                                                if training_result.stdout:
+                                                    terminal_output.append(f"[ERROR] Script stdout (last 50 lines):")
+                                                    for line in training_result.stdout.strip().split("\n")[-50:]:
+                                                        if line.strip():
+                                                            terminal_output.append(f"[STDOUT] {line[:200]}")
+                                                if training_result.stderr:
+                                                    terminal_output.append(f"[ERROR] Script stderr (last 50 lines):")
+                                                    for line in training_result.stderr.strip().split("\n")[-50:]:
+                                                        if line.strip():
+                                                            terminal_output.append(f"[STDERR] {line[:200]}")
+                                                st.error(f"Failed to start training. Check terminal output above for details.")
                                         else:
                                             terminal_output.append(f"[ERROR] Training files not found on instance!")
                                             terminal_output.append(f"[ACTION] Please go back to Phase 2 and upload files first.")
@@ -2708,341 +3636,772 @@ def render():
                                     terminal_output.append(f"[ERROR] Failed to start training: {error_msg}")
                                     st.session_state[terminal_output_key] = terminal_output
                                     st.error(f"Error: {error_msg}")
+                    
+                    with col2:
+                        # Always show "Check Training Status" button - needed for queue monitoring
+                        status_msg = training_status.get("status", "unknown")
+                        if status_msg == "training":
+                            button_label = "🔄 Check Training Status"
+                        elif status_msg == "completed":
+                            button_label = "✅ Check Training Status"
                         else:
-                            # Training is running - show check button
-                            status_msg = training_status.get("status", "unknown")
-                            if status_msg == "training":
-                                st.info("🔄 Training is currently running. Use 'Check Training Status' to monitor progress.")
-                            elif status_msg == "completed":
-                                st.success("✅ Training completed! Check status for details.")
+                            button_label = "🔍 Check Training Status"
+                        
+                        # Check if button was clicked or manually triggered (e.g., by force advance)
+                        button_clicked = st.button(button_label, key="check_training_status")
+                        trigger_flag = st.session_state.get("trigger_status_check", False)
+                        should_check = button_clicked or trigger_flag
+                        
+                        if should_check:
+                            # Clear the trigger flag
+                            if "trigger_status_check" in st.session_state:
+                                del st.session_state["trigger_status_check"]
                             
-                            if st.button("🔄 Check Training Status", key="check_training_status"):
-                                try:
-                                    instance_id = active_job.get("instance_id")
-                                    
-                                    terminal_output.append(f"[{datetime.now().strftime('%H:%M:%S')}] Checking training status...")
-                                    
-                                    # Initialize SSH check results (will be updated if SSH is available)
-                                    ssh_files_exist = None
-                                    ssh_training_running = None
-                                    training_logs_content = None
-                                    debug_log_content = None
-                                    training_error = None
-                                    
-                                    # Get SSH info - prefer saved SSH details from job over API
-                                    ssh_host = active_job.get("ssh_host")
-                                    ssh_port = active_job.get("ssh_port", 22)
-                                    
-                                    # If not in job, get from API
-                                    if not ssh_host:
-                                        job_status = training_manager.get_job_status(instance_id)
-                                        ssh_host = job_status.get("ssh_host")
-                                        ssh_port = job_status.get("ssh_port", 22)
-                                        # Save to job for future use
-                                        if ssh_host:
-                                            active_job["ssh_host"] = ssh_host
-                                            active_job["ssh_port"] = ssh_port
-                                            training_manager._save_job(active_job)
-                                    
+                            try:
+                                instance_id = active_job.get("instance_id")
+                                
+                                if not instance_id:
+                                    st.error("No instance ID found in job.")
+                                    return
+                                
+                                # Ensure terminal_output is initialized from session state
+                                if terminal_output_key not in st.session_state:
+                                    st.session_state[terminal_output_key] = []
+                                # Get terminal_output from session state and make a copy to modify
+                                terminal_output = list(st.session_state[terminal_output_key])
+                                
+                                terminal_output.append(f"[{datetime.now().strftime('%H:%M:%S')}] ⚡ Button clicked - checking training status...")
+                                # Save immediately - use list() to create a fresh copy
+                                # CRITICAL: Force a new list object so Streamlit detects the change
+                                # Create a completely new list to break any reference issues
+                                fresh_output = [line for line in terminal_output]  # List comprehension creates new list
+                                
+                                # CRITICAL: Increment version counter FIRST before saving
+                                # This ensures the version changes, which triggers the dependency
+                                terminal_version_key = f"{terminal_output_key}_version"
+                                current_version = st.session_state.get(terminal_version_key, 0)
+                                new_version = current_version + 1
+                                st.session_state[terminal_version_key] = new_version
+                                
+                                # Now save the terminal output
+                                st.session_state[terminal_output_key] = fresh_output
+                                
+                                # Force Streamlit to recognize the change by updating a timestamp
+                                st.session_state[f"{terminal_output_key}_updated"] = datetime.now().isoformat()
+                                # Debug: Verify it was saved
+                                if st.session_state.get("debug_terminal", False):
+                                    terminal_output.append(f"[DEBUG] Terminal output saved. Key: {terminal_output_key}, Length: {len(terminal_output)}")
+                                    st.session_state[terminal_output_key] = list(terminal_output)
+                                    st.session_state[f"{terminal_output_key}_updated"] = datetime.now().isoformat()
+                                
+                                # Initialize SSH check results (will be updated if SSH is available)
+                                ssh_files_exist = None
+                                ssh_training_running = None
+                                training_logs_content = None
+                                debug_log_content = None
+                                training_error = None
+                                
+                                # Get SSH info - prefer saved SSH details from job over API
+                                ssh_host = active_job.get("ssh_host")
+                                ssh_port = active_job.get("ssh_port", 22)
+                                
+                                # If not in job, get from API
+                                if not ssh_host:
+                                    job_status = training_manager.get_job_status(instance_id)
+                                    ssh_host = job_status.get("ssh_host")
+                                    ssh_port = job_status.get("ssh_port", 22)
+                                    # Save to job for future use
                                     if ssh_host:
-                                        terminal_output.append(f"[SSH] Connecting to {ssh_host}:{ssh_port}")
+                                        active_job["ssh_host"] = ssh_host
+                                        active_job["ssh_port"] = ssh_port
+                                        training_manager._save_job(active_job)
+                                
+                                if ssh_host:
+                                    terminal_output.append(f"[SSH] Connecting to {ssh_host}:{ssh_port}")
+                                    st.session_state[terminal_output_key] = list(terminal_output)  # Save as fresh copy
+                                    st.session_state[f"{terminal_output_key}_updated"] = datetime.now().isoformat()
+                                    
+                                    # Check for output directory
+                                    terminal_output.append(f"[SSH] Checking output directory...")
+                                    check_output_cmd = [
+                                        "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
+                                        f"root@{ssh_host}",
+                                        "ls -la /workspace/output/training 2>/dev/null | tail -5 || echo 'no_output'"
+                                    ]
+                                    output_result = subprocess.run(check_output_cmd, capture_output=True, text=True, timeout=15)
+                                    if "no_output" not in output_result.stdout:
+                                        terminal_output.append(f"[SSH] Output directory exists")
+                                        stdout_filtered = filter_malloc_warnings(output_result.stdout)
+                                        terminal_output.append(f"[SSH] {stdout_filtered[:300]}")
+                                    else:
+                                        terminal_output.append(f"[SSH] Output directory not found")
+                                    st.session_state[terminal_output_key] = list(terminal_output)  # Save after output check
+                                    st.session_state[f"{terminal_output_key}_updated"] = datetime.now().isoformat()
+                                    
+                                    # Check if training files exist
+                                    terminal_output.append(f"[SSH] Checking if training files are present...")
+                                    check_files_cmd = [
+                                        "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
+                                        f"root@{ssh_host}",
+                                        "ls -la /workspace/data/ 2>/dev/null | grep -E '(training_data|axolotl_config)' || echo 'files_missing'"
+                                    ]
+                                    files_result = subprocess.run(check_files_cmd, capture_output=True, text=True, timeout=15)
+                                    # Capture whether files exist for diagnostics
+                                    ssh_files_exist = "files_missing" not in files_result.stdout
+                                    if not ssh_files_exist:
+                                        terminal_output.append(f"[WARNING] Training files not found in /workspace/data/")
+                                    else:
+                                        stdout_filtered = filter_malloc_warnings(files_result.stdout)
+                                        terminal_output.append(f"[SSH] Training files found:")
                                         
-                                        # Check if training process is running
-                                        terminal_output.append(f"[SSH] Checking for training process...")
-                                        import subprocess
-                                        check_process_cmd = [
-                                            "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
-                                            f"root@{ssh_host}",
-                                            "ps aux | grep -E '(axolotl|accelerate|train)' | grep -v grep || echo 'no_training'"
-                                        ]
-                                        process_result = subprocess.run(check_process_cmd, capture_output=True, text=True, timeout=15)
-                                        if "no_training" not in process_result.stdout:
-                                            stdout_filtered = filter_malloc_warnings(process_result.stdout)
-                                            terminal_output.append(f"[SSH] Training process found: {stdout_filtered[:200]}")
+                                        # Parse files and categorize them
+                                        all_files = []
+                                        expected_files = []
+                                        unexpected_files = []
+                                        
+                                        # Determine expected files based on job queue
+                                        job_queue = active_job.get("job_queue", [])
+                                        if job_queue:
+                                            # Single job - only expect active files (no suffix)
+                                            expected_files.extend(["axolotl_config.yaml", "training_data.jsonl"])
                                         else:
-                                            terminal_output.append(f"[SSH] No training process found")
+                                            # Single job - should be no suffix
+                                            expected_files.extend(["axolotl_config.yaml", "training_data.jsonl"])
                                         
-                                        # Check for output directory
-                                        terminal_output.append(f"[SSH] Checking output directory...")
-                                        check_output_cmd = [
-                                            "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
-                                            f"root@{ssh_host}",
-                                            "ls -la /workspace/output/training 2>/dev/null | tail -5 || echo 'no_output'"
-                                        ]
-                                        output_result = subprocess.run(check_output_cmd, capture_output=True, text=True, timeout=15)
-                                        if "no_output" not in output_result.stdout:
-                                            terminal_output.append(f"[SSH] Output directory exists")
-                                            stdout_filtered = filter_malloc_warnings(output_result.stdout)
-                                            terminal_output.append(f"[SSH] {stdout_filtered[:300]}")
-                                        else:
-                                            terminal_output.append(f"[SSH] Output directory not found")
-                                        
-                                        # Check if training files exist
-                                        terminal_output.append(f"[SSH] Checking if training files are present...")
-                                        check_files_cmd = [
-                                            "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
-                                            f"root@{ssh_host}",
-                                            "ls -la /workspace/data/ 2>/dev/null | grep -E '(training_data|axolotl_config)' || echo 'files_missing'"
-                                        ]
-                                        files_result = subprocess.run(check_files_cmd, capture_output=True, text=True, timeout=15)
-                                        # Capture whether files exist for diagnostics
-                                        ssh_files_exist = "files_missing" not in files_result.stdout
-                                        if not ssh_files_exist:
-                                            terminal_output.append(f"[WARNING] Training files not found in /workspace/data/")
-                                        else:
-                                            stdout_filtered = filter_malloc_warnings(files_result.stdout)
-                                            terminal_output.append(f"[SSH] Training files found:")
-                                            for line in stdout_filtered.strip().split("\n")[:5]:
-                                                if line.strip():
-                                                    terminal_output.append(f"[SSH]   {line}")
-                                        
-                                        # Check for training processes (ignore onstart script for existing instances)
-                                        terminal_output.append(f"[SSH] Checking for training processes...")
-                                        check_training_cmd = [
-                                            "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
-                                            f"root@{ssh_host}",
-                                            "ps aux | grep -E '(accelerate|axolotl|train)' | grep -v grep | head -5 || echo 'no_training'"
-                                        ]
-                                        training_process_result = subprocess.run(check_training_cmd, capture_output=True, text=True, timeout=15)
-                                        ssh_training_running = "no_training" not in training_process_result.stdout
-                                        if ssh_training_running:
-                                            stdout_filtered = filter_malloc_warnings(training_process_result.stdout)
-                                            terminal_output.append(f"[SSH] ✓ Training process detected:")
-                                            for line in stdout_filtered.strip().split("\n")[:5]:
-                                                if line.strip():
-                                                    terminal_output.append(f"[SSH]   {line[:150]}")
-                                            
-                                            # Get more details about the process - show full command line
-                                            check_process_cmd_full = [
-                                                "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
-                                                f"root@{ssh_host}",
-                                                "ps aux | grep -E '(accelerate|axolotl|train)' | grep -v grep | head -1"
-                                            ]
-                                            process_cmd_full_result = subprocess.run(check_process_cmd_full, capture_output=True, text=True, timeout=15)
-                                            if process_cmd_full_result.stdout and process_cmd_full_result.stdout.strip():
-                                                cmd_filtered = filter_malloc_warnings(process_cmd_full_result.stdout)
-                                                terminal_output.append(f"[SSH] Process details:")
-                                                # Parse the ps output to show PID, status, and command
-                                                parts = cmd_filtered.strip().split(None, 10)
-                                                if len(parts) >= 11:
-                                                    pid = parts[1]
-                                                    stat = parts[7]
-                                                    cmd = " ".join(parts[10:])
-                                                    terminal_output.append(f"[SSH]   PID: {pid}, Status: {stat}")
-                                                    terminal_output.append(f"[SSH]   Command: {cmd[:300]}")
+                                        # Parse file listing
+                                        for line in stdout_filtered.strip().split("\n"):
+                                            if line.strip() and "files_missing" not in line:
+                                                # Extract filename from ls output (last field)
+                                                parts = line.strip().split()
+                                                if len(parts) >= 9:
+                                                    filename = parts[-1]
+                                                    all_files.append(filename)
                                                     
-                                                    # Check if it's actually the training process
-                                                    if "axolotl.cli.train" in cmd or ("accelerate" in cmd and "train" in cmd):
-                                                        terminal_output.append(f"[SSH]   ✓ This is the training process")
+                                                    # Check if it's expected or unexpected
+                                                    if filename in expected_files:
+                                                        terminal_output.append(f"[SSH]   {line} (expected)")
+                                                    elif filename.endswith("_0.yaml") or filename.endswith("_0.jsonl"):
+                                                        # Old naming scheme - warn about it
+                                                        terminal_output.append(f"[SSH]   {line} (⚠️ old naming - should be removed)")
+                                                        unexpected_files.append(filename)
                                                     else:
-                                                        terminal_output.append(f"[WARNING] This may not be the training process - it might be a shell script or other process")
-                                                        terminal_output.append(f"[ACTION] The training process may have failed to start. Check if training actually started.")
-                                                    
-                                                    # Check process state - if it's in 'Z' (zombie) or 'T' (stopped), it's not running properly
-                                                    if 'Z' in stat:
-                                                        terminal_output.append(f"[WARNING] Process is a zombie (exited but not reaped) - training may have failed")
-                                                    elif 'T' in stat:
-                                                        terminal_output.append(f"[WARNING] Process is stopped - training is not running")
+                                                        terminal_output.append(f"[SSH]   {line}")
+                                        
+                                    st.session_state[terminal_output_key] = list(terminal_output)  # Save after file check
+                                    st.session_state[f"{terminal_output_key}_updated"] = datetime.now().isoformat()
+                                    
+                                    if unexpected_files:
+                                        terminal_output.append(f"[WARNING] Found files with old naming scheme (_0 suffix). These should be removed.")
+                                        # Automatically remove _0 files (old naming scheme)
+                                        terminal_output.append(f"[SSH] Removing old _0 files...")
+                                        remove_old_files_cmd = [
+                                            "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
+                                            f"root@{ssh_host}",
+                                            "cd /workspace/data && rm -f axolotl_config_0.yaml training_data_0.jsonl && echo 'Removed _0 files' || echo 'No _0 files to remove'"
+                                        ]
+                                        remove_result = subprocess.run(remove_old_files_cmd, capture_output=True, text=True, timeout=15)
+                                        if remove_result.returncode == 0:
+                                            terminal_output.append(f"[SUCCESS] Removed old _0 files")
                                         else:
-                                            terminal_output.append(f"[SSH] No training process found")
+                                            terminal_output.append(f"[WARNING] Could not remove _0 files: {remove_result.stderr[:200]}")
+                                    
+                                    # Check for training processes (ignore onstart script for existing instances)
+                                    terminal_output.append(f"[SSH] Checking for training processes...")
+                                    check_training_cmd = [
+                                        "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
+                                        f"root@{ssh_host}",
+                                        "ps aux | grep -E '(accelerate|axolotl|train)' | grep -v grep | head -5 || echo 'no_training'"
+                                    ]
+                                    try:
+                                        training_process_result = subprocess.run(check_training_cmd, capture_output=True, text=True, timeout=15)
+                                    except subprocess.TimeoutExpired:
+                                        terminal_output.append(f"[WARNING] Process check timed out")
+                                        st.session_state[terminal_output_key] = terminal_output
+                                        training_process_result = type('obj', (object,), {'stdout': 'no_training', 'returncode': 1})()
+                                    
+                                    # Check if process is running - need actual output, not just absence of "no_training"
+                                    stdout_text = training_process_result.stdout or ""
+                                    ssh_training_running = (
+                                        stdout_text.strip() and 
+                                        "no_training" not in stdout_text and
+                                        len(stdout_text.strip()) > 0
+                                    )
+                                    
+                                    if ssh_training_running:
+                                        # Show raw output first for debugging
+                                        raw_output = training_process_result.stdout
+                                        stdout_filtered = filter_malloc_warnings(raw_output)
                                         
-                                        # Check training log (not onstart log - we're using existing instances)
-                                        terminal_output.append(f"[SSH] Checking training logs...")
+                                        # Count processes and check if they're legitimate workers or duplicates
+                                        process_lines = [line for line in raw_output.strip().split("\n") 
+                                                        if line.strip() and "no_training" not in line and "grep" not in line.lower()]
                                         
-                                        # First check if log file exists and its size
-                                        check_log_exists_cmd = [
+                                        # Extract PIDs to analyze process relationships
+                                        pids = []
+                                        for line in process_lines:
+                                            parts = line.split()
+                                            if len(parts) > 1:
+                                                try:
+                                                    pids.append(int(parts[1]))  # PID is second column in ps aux
+                                                except:
+                                                    pass
+                                        
+                                        # Analyze if multiple processes are legitimate workers or duplicates
+                                        if len(pids) > 1:
+                                            terminal_output.append(f"[SSH] ⚠️ Detected {len(pids)} training-related processes")
+                                            # Check if processes share a common parent (legitimate workers from accelerate)
+                                            try:
+                                                parent_pids = {}
+                                                for pid in pids:
+                                                    get_parent_cmd = [
+                                                        "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
+                                                        f"root@{ssh_host}",
+                                                        f"ps -o ppid= -p {pid} 2>/dev/null | tr -d ' '"
+                                                    ]
+                                                    parent_result = subprocess.run(get_parent_cmd, capture_output=True, text=True, timeout=5)
+                                                    if parent_result.returncode == 0 and parent_result.stdout.strip():
+                                                        try:
+                                                            parent_pid = int(parent_result.stdout.strip())
+                                                            parent_pids[pid] = parent_pid
+                                                        except:
+                                                            pass
+                                                
+                                                # Check if processes are related (shared parents indicate workers)
+                                                unique_parents = set(parent_pids.values())
+                                                if len(unique_parents) <= 2:  # Allow for accelerate parent + main process
+                                                    terminal_output.append(f"[SSH] ✓ Processes appear to be legitimate worker processes (accelerate workers)")
+                                                else:
+                                                    terminal_output.append(f"[SSH] ⚠️ WARNING: Multiple independent training processes detected!")
+                                                    terminal_output.append(f"[SSH] ⚠️ This may cause OOM errors. Use 'Redo Phase' to kill all processes.")
+                                            except Exception as e:
+                                                # If analysis fails, just show warning
+                                                terminal_output.append(f"[SSH] ⚠️ Multiple processes detected - unable to verify if they're workers or duplicates")
+                                        
+                                        terminal_output.append(f"[SSH] ✓ Training process detected:")
+                                        
+                                        # Show raw output if filtered output is empty or different
+                                        if not stdout_filtered.strip() or stdout_filtered.strip() == raw_output.strip():
+                                            # No filtering happened or output is the same
+                                            display_lines = process_lines
+                                        else:
+                                            # Output was filtered, show both
+                                            terminal_output.append(f"[DEBUG] Raw process output (before filtering):")
+                                            for line in raw_output.strip().split("\n")[:3]:
+                                                if line.strip() and "no_training" not in line:
+                                                    terminal_output.append(f"[DEBUG]   {line[:200]}")
+                                            display_lines = stdout_filtered.strip().split("\n")
+                                        
+                                        process_lines_shown = False
+                                        for line in display_lines[:5]:
+                                            if line.strip() and "no_training" not in line and "grep" not in line.lower():
+                                                terminal_output.append(f"[SSH]   {line[:150]}")
+                                                process_lines_shown = True
+                                        
+                                        if not process_lines_shown:
+                                            terminal_output.append(f"[SSH]   (Process found but no process lines to display)")
+                                            terminal_output.append(f"[SSH]   Raw output length: {len(raw_output)} chars")
+                                            if raw_output.strip():
+                                                terminal_output.append(f"[SSH]   First 200 chars of raw output: {raw_output[:200]}")
+                                        
+                                        st.session_state[terminal_output_key] = terminal_output
+                                        
+                                        # Get more details about the process - show full command line
+                                        terminal_output.append(f"[SSH] Getting detailed process information...")
+                                        st.session_state[terminal_output_key] = terminal_output
+                                        
+                                        check_process_cmd_full = [
                                             "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
+                                            "-o", "ServerAliveInterval=5", "-o", "ServerAliveCountMax=2",
                                             f"root@{ssh_host}",
-                                            "ls -lh /workspace/output/training/training.log 2>/dev/null | awk '{print $5, $9}' || echo 'log_not_found'"
+                                            "ps aux | grep -E '(accelerate|axolotl|train)' | grep -v grep | head -1"
                                         ]
+                                        try:
+                                            process_cmd_full_result = subprocess.run(check_process_cmd_full, capture_output=True, text=True, timeout=15)
+                                        except subprocess.TimeoutExpired:
+                                            terminal_output.append(f"[WARNING] Process details check timed out")
+                                            st.session_state[terminal_output_key] = terminal_output
+                                            process_cmd_full_result = type('obj', (object,), {'stdout': '', 'returncode': 1})()
+                                        
+                                        if process_cmd_full_result.stdout and process_cmd_full_result.stdout.strip():
+                                            raw_cmd_output = process_cmd_full_result.stdout
+                                            cmd_filtered = filter_malloc_warnings(raw_cmd_output)
+                                            
+                                            # Use filtered output, or raw if filtering removed everything
+                                            cmd_output = cmd_filtered if cmd_filtered.strip() else raw_cmd_output
+                                            
+                                            terminal_output.append(f"[SSH] Process details:")
+                                            # Parse the ps output to show PID, status, and command
+                                            parts = cmd_output.strip().split(None, 10)
+                                            if len(parts) >= 11:
+                                                pid = parts[1]
+                                                stat = parts[7]
+                                                cmd = " ".join(parts[10:])
+                                                terminal_output.append(f"[SSH]   PID: {pid}, Status: {stat}")
+                                                terminal_output.append(f"[SSH]   Command: {cmd[:300]}")
+                                                
+                                                # Check if it's actually the training process
+                                                if "axolotl.cli.train" in cmd or ("accelerate" in cmd and "train" in cmd):
+                                                    terminal_output.append(f"[SSH]   ✓ This is the training process")
+                                                else:
+                                                    terminal_output.append(f"[WARNING] This may not be the training process - it might be a shell script or other process")
+                                                    terminal_output.append(f"[ACTION] The training process may have failed to start. Check if training actually started.")
+                                                
+                                                # Check process state - if it's in 'Z' (zombie) or 'T' (stopped), it's not running properly
+                                                if 'Z' in stat:
+                                                    terminal_output.append(f"[WARNING] Process is a zombie (exited but not reaped) - training may have failed")
+                                                elif 'T' in stat:
+                                                    terminal_output.append(f"[WARNING] Process is stopped - training is not running")
+                                            else:
+                                                terminal_output.append(f"[SSH]   Could not parse process details (unexpected format)")
+                                                terminal_output.append(f"[DEBUG]   Raw output: {cmd_output[:300]}")
+                                                terminal_output.append(f"[DEBUG]   Parts count: {len(parts)}")
+                                            st.session_state[terminal_output_key] = terminal_output
+                                        else:
+                                            terminal_output.append(f"[SSH]   Could not get process details")
+                                            if process_cmd_full_result.stdout:
+                                                terminal_output.append(f"[DEBUG]   stdout: {process_cmd_full_result.stdout[:200]}")
+                                            if hasattr(process_cmd_full_result, 'stderr') and process_cmd_full_result.stderr:
+                                                terminal_output.append(f"[DEBUG]   stderr: {process_cmd_full_result.stderr[:200]}")
+                                            terminal_output.append(f"[DEBUG]   returncode: {getattr(process_cmd_full_result, 'returncode', 'unknown')}")
+                                            st.session_state[terminal_output_key] = terminal_output
+                                    else:
+                                        # No process found - show what we got for debugging
+                                        terminal_output.append(f"[SSH] No training process found")
+                                        if training_process_result.stdout:
+                                            terminal_output.append(f"[DEBUG] Process check stdout: {training_process_result.stdout[:200]}")
+                                        if hasattr(training_process_result, 'stderr') and training_process_result.stderr:
+                                            stderr_text = training_process_result.stderr
+                                            if "Welcome to vast.ai" not in stderr_text:  # Don't show the welcome message
+                                                terminal_output.append(f"[DEBUG] Process check stderr: {stderr_text[:200]}")
+                                        terminal_output.append(f"[DEBUG] Process check returncode: {getattr(training_process_result, 'returncode', 'unknown')}")
+                                    st.session_state[terminal_output_key] = list(terminal_output)  # Save after process check
+                                    st.session_state[f"{terminal_output_key}_updated"] = datetime.now().isoformat()
+                                    
+                                    # Check training log (not onstart log - we're using existing instances)
+                                    terminal_output.append(f"[SSH] Checking training logs...")
+                                    st.session_state[terminal_output_key] = terminal_output
+                                    
+                                    # First check if log file exists and its size
+                                    check_log_exists_cmd = [
+                                        "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
+                                        "-o", "ServerAliveInterval=5", "-o", "ServerAliveCountMax=2",
+                                        f"root@{ssh_host}",
+                                        "ls -lh /workspace/output/training/training.log 2>/dev/null | awk '{print $5, $9}' || echo 'log_not_found'"
+                                    ]
+                                    try:
                                         log_exists_result = subprocess.run(check_log_exists_cmd, capture_output=True, text=True, timeout=15)
-                                        if "log_not_found" not in log_exists_result.stdout and log_exists_result.stdout.strip():
-                                            terminal_output.append(f"[SSH] Training log file: {log_exists_result.stdout.strip()}")
-                                        
-                                        check_training_log_cmd = [
-                                            "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
-                                            f"root@{ssh_host}",
-                                            "tail -100 /workspace/output/training/training.log 2>/dev/null || echo 'no_training_log'"
-                                        ]
+                                    except subprocess.TimeoutExpired:
+                                        terminal_output.append(f"[WARNING] Log file check timed out")
+                                        st.session_state[terminal_output_key] = terminal_output
+                                        log_exists_result = type('obj', (object,), {'stdout': 'log_not_found', 'returncode': 1})()
+                                    
+                                    if "log_not_found" not in log_exists_result.stdout and log_exists_result.stdout.strip():
+                                        terminal_output.append(f"[SSH] Training log file: {log_exists_result.stdout.strip()}")
+                                        st.session_state[terminal_output_key] = terminal_output
+                                    
+                                    check_training_log_cmd = [
+                                        "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
+                                        "-o", "ServerAliveInterval=5", "-o", "ServerAliveCountMax=2",
+                                        f"root@{ssh_host}",
+                                        "tail -100 /workspace/output/training/training.log 2>/dev/null || echo 'no_training_log'"
+                                    ]
+                                    try:
                                         training_log_result = subprocess.run(check_training_log_cmd, capture_output=True, text=True, timeout=15)
-                                        training_logs_content = None
-                                        if "no_training_log" not in training_log_result.stdout and training_log_result.stdout.strip():
-                                            stdout_filtered = filter_malloc_warnings(training_log_result.stdout)
-                                            training_logs_content = stdout_filtered
-                                            
-                                            # Also try to get the full log to extract stats more accurately
-                                            full_log_cmd = [
-                                                "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
-                                                f"root@{ssh_host}",
-                                                "cat /workspace/output/training/training.log 2>/dev/null | head -500 || echo 'no_full_log'"
-                                            ]
+                                    except subprocess.TimeoutExpired:
+                                        terminal_output.append(f"[WARNING] Training log check timed out")
+                                        st.session_state[terminal_output_key] = terminal_output
+                                        training_log_result = type('obj', (object,), {'stdout': 'no_training_log', 'returncode': 1})()
+                                    training_logs_content = None
+                                    if "no_training_log" not in training_log_result.stdout and training_log_result.stdout.strip():
+                                        stdout_filtered = filter_malloc_warnings(training_log_result.stdout)
+                                        training_logs_content = stdout_filtered
+                                        
+                                        # Also try to get the full log to extract stats more accurately
+                                        full_log_cmd = [
+                                            "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
+                                            "-o", "ServerAliveInterval=5", "-o", "ServerAliveCountMax=2",
+                                            f"root@{ssh_host}",
+                                            "cat /workspace/output/training/training.log 2>/dev/null | head -500 || echo 'no_full_log'"
+                                        ]
+                                        try:
                                             full_log_result = subprocess.run(full_log_cmd, capture_output=True, text=True, timeout=15)
-                                            if "no_full_log" not in full_log_result.stdout and full_log_result.stdout.strip():
-                                                full_log_content = filter_malloc_warnings(full_log_result.stdout)
-                                                # Use full log for stats extraction (more accurate)
-                                                training_logs_content = full_log_content
+                                        except subprocess.TimeoutExpired:
+                                            terminal_output.append(f"[WARNING] Full log retrieval timed out - using partial log")
+                                            st.session_state[terminal_output_key] = terminal_output
+                                            full_log_result = type('obj', (object,), {'stdout': 'no_full_log', 'returncode': 1})()
+                                        if "no_full_log" not in full_log_result.stdout and full_log_result.stdout.strip():
+                                            full_log_content = filter_malloc_warnings(full_log_result.stdout)
+                                            # Use full log for stats extraction (more accurate)
+                                            training_logs_content = full_log_content
+                                        
+                                        # Extract dataset statistics from training logs
+                                        training_stats = extract_dataset_stats(training_logs_content)
+                                        
+                                        # If we still don't have final_count, try to check the prepared dataset directly
+                                        if training_stats.get('original_count') and not training_stats.get('final_count'):
+                                            terminal_output.append(f"[DATASET STATS] Attempting to get final count from prepared dataset...")
+                                            st.session_state[terminal_output_key] = terminal_output
                                             
-                                            # Extract dataset statistics from training logs
-                                            training_stats = extract_dataset_stats(training_logs_content)
-                                            
-                                            # If we still don't have final_count, try to check the prepared dataset directly
-                                            if training_stats.get('original_count') and not training_stats.get('final_count'):
-                                                terminal_output.append(f"[DATASET STATS] Attempting to get final count from prepared dataset...")
-                                                check_dataset_cmd = [
-                                                    "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
-                                                    f"root@{ssh_host}",
-                                                    "python3 -c \"import json; f=open('/workspace/axolotl/prepared_data/last_run_prepared/*/train.jsonl' if __import__('glob').glob('/workspace/axolotl/prepared_data/last_run_prepared/*/train.jsonl') else '/workspace/axolotl/prepared_data/*/train.jsonl', 'r'); count=sum(1 for _ in f); print(f'final_count:{count}')\" 2>/dev/null || "
-                                                    "find /workspace/axolotl/prepared_data -name 'train.jsonl' -exec wc -l {} + 2>/dev/null | tail -1 | awk '{print \"final_count:\" $1}' || echo 'cannot_count'"
-                                                ]
+                                            # Try multiple methods to count the prepared dataset
+                                            check_dataset_cmd = [
+                                                "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
+                                                "-o", "ServerAliveInterval=5", "-o", "ServerAliveCountMax=2",
+                                                f"root@{ssh_host}",
+                                                "find /workspace/axolotl/prepared_data -name 'train.jsonl' -type f 2>/dev/null | head -1 | xargs -I {} sh -c 'if [ -f \"{}\" ]; then wc -l \"{}\" | awk \"{print \\$1}\"; else echo \"0\"; fi' || echo 'cannot_count'"
+                                            ]
+                                            try:
                                                 dataset_count_result = subprocess.run(check_dataset_cmd, capture_output=True, text=True, timeout=15)
-                                                if "final_count:" in dataset_count_result.stdout:
-                                                    try:
-                                                        count_line = [l for l in dataset_count_result.stdout.split('\n') if 'final_count:' in l][0]
-                                                        final_count = int(count_line.split(':')[1].strip())
+                                            except subprocess.TimeoutExpired:
+                                                terminal_output.append(f"[WARNING] Dataset count check timed out")
+                                                st.session_state[terminal_output_key] = terminal_output
+                                                dataset_count_result = type('obj', (object,), {'stdout': 'cannot_count', 'returncode': 1})()
+                                            
+                                            if dataset_count_result.stdout and dataset_count_result.stdout.strip().isdigit():
+                                                try:
+                                                    final_count = int(dataset_count_result.stdout.strip())
+                                                    if final_count > 0:
                                                         training_stats['final_count'] = final_count
                                                         terminal_output.append(f"[DATASET STATS] Found final count from prepared dataset: {final_count}")
-                                                    except:
-                                                        pass
-                                            if training_stats:
-                                                terminal_output.append(f"[DATASET STATS] ========================================")
+                                                        st.session_state[terminal_output_key] = terminal_output
+                                                except:
+                                                    pass
+                                            elif "cannot_count" not in dataset_count_result.stdout:
+                                                terminal_output.append(f"[DEBUG] Dataset count result: {dataset_count_result.stdout[:200]}")
+                                                st.session_state[terminal_output_key] = terminal_output
+                                        if training_stats:
+                                            terminal_output.append(f"[DATASET STATS] ========================================")
+                                            if training_stats.get("original_count"):
+                                                terminal_output.append(f"[DATASET STATS] Original samples: {training_stats['original_count']}")
+                                            if training_stats.get("final_count"):
+                                                terminal_output.append(f"[DATASET STATS] Final training samples: {training_stats['final_count']}")
+                                                # Calculate retention
                                                 if training_stats.get("original_count"):
-                                                    terminal_output.append(f"[DATASET STATS] Original samples: {training_stats['original_count']}")
-                                                if training_stats.get("final_count"):
-                                                    terminal_output.append(f"[DATASET STATS] Final training samples: {training_stats['final_count']}")
-                                                if training_stats.get("dropped_long"):
-                                                    terminal_output.append(f"[DATASET STATS] Dropped (too long): {training_stats['dropped_long']}")
-                                                if training_stats.get("dropped_zero_tokens"):
-                                                    terminal_output.append(f"[DATASET STATS] Dropped (zero tokens): {training_stats['dropped_zero_tokens']}")
-                                                if training_stats.get("total_dropped"):
-                                                    dropped_pct = (training_stats['total_dropped'] / training_stats['original_count'] * 100) if training_stats.get('original_count') else 0
-                                                    terminal_output.append(f"[DATASET STATS] Total dropped: {training_stats['total_dropped']} ({dropped_pct:.1f}%)")
-                                                terminal_output.append(f"[DATASET STATS] ========================================")
+                                                    retention_pct = (training_stats['final_count'] / training_stats['original_count'] * 100)
+                                                    terminal_output.append(f"[DATASET STATS] Sample retention: {retention_pct:.1f}%")
+                                            else:
+                                                terminal_output.append(f"[DATASET STATS] Final count: Not available (checking prepared dataset...)")
+                                            if training_stats.get("dropped_long"):
+                                                terminal_output.append(f"[DATASET STATS] Dropped (too long): {training_stats['dropped_long']}")
+                                            if training_stats.get("dropped_zero_tokens"):
+                                                terminal_output.append(f"[DATASET STATS] Dropped (zero tokens): {training_stats['dropped_zero_tokens']}")
+                                            if training_stats.get("total_dropped"):
+                                                dropped_pct = (training_stats['total_dropped'] / training_stats['original_count'] * 100) if training_stats.get('original_count') else 0
+                                                terminal_output.append(f"[DATASET STATS] Total dropped: {training_stats['total_dropped']} ({dropped_pct:.1f}%)")
+                                            # Show train_on_inputs status if we can check the config
+                                            terminal_output.append(f"[DATASET STATS] train_on_inputs: True (set to maximize retention)")
+                                            terminal_output.append(f"[DATASET STATS] ========================================")
+                                            st.session_state[terminal_output_key] = terminal_output
+                                        
+                                        terminal_output.append(f"[TRAINING LOG] Last 20 lines:")
+                                        for line in stdout_filtered.strip().split("\n")[-20:]:
+                                            if line.strip():
+                                                terminal_output.append(f"[TRAINING] {line[:200]}")
+                                    else:
+                                        terminal_output.append(f"[TRAINING LOG] No training log found yet - training may not have started")
+                                        
+                                        # If process is running but no logs, check for errors in other locations
+                                        if ssh_training_running:
+                                            terminal_output.append(f"[DIAGNOSTICS] Process detected but no logs - checking for errors...")
                                             
-                                            terminal_output.append(f"[TRAINING LOG] Last 20 lines:")
-                                            for line in stdout_filtered.strip().split("\n")[-20:]:
-                                                if line.strip():
-                                                    terminal_output.append(f"[TRAINING] {line[:200]}")
-                                        else:
-                                            terminal_output.append(f"[TRAINING LOG] No training log found yet - training may not have started")
+                                            # Check if the log file is being created but is empty (process might be starting)
+                                            check_log_size_cmd = [
+                                                "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
+                                                f"root@{ssh_host}",
+                                                "test -f /workspace/output/training/training.log && wc -l /workspace/output/training/training.log || echo 'log_not_exists'"
+                                            ]
+                                            log_size_result = subprocess.run(check_log_size_cmd, capture_output=True, text=True, timeout=15)
+                                            if "log_not_exists" not in log_size_result.stdout and log_size_result.stdout.strip():
+                                                log_info = log_size_result.stdout.strip()
+                                                terminal_output.append(f"[DIAGNOSTICS] Log file status: {log_info}")
+                                                
+                                                # If log exists but has 0 lines, process might have just started
+                                                if "0 " in log_info or " 0 " in log_info:
+                                                    terminal_output.append(f"[INFO] Log file exists but is empty - training may be initializing")
                                             
-                                            # If process is running but no logs, check for errors in other locations
-                                            if ssh_training_running:
-                                                terminal_output.append(f"[DIAGNOSTICS] Process detected but no logs - checking for errors...")
-                                                
-                                                # Check if the log file is being created but is empty (process might be starting)
-                                                check_log_size_cmd = [
-                                                    "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
-                                                    f"root@{ssh_host}",
-                                                    "test -f /workspace/output/training/training.log && wc -l /workspace/output/training/training.log || echo 'log_not_exists'"
-                                                ]
-                                                log_size_result = subprocess.run(check_log_size_cmd, capture_output=True, text=True, timeout=15)
-                                                if "log_not_exists" not in log_size_result.stdout and log_size_result.stdout.strip():
-                                                    log_info = log_size_result.stdout.strip()
-                                                    terminal_output.append(f"[DIAGNOSTICS] Log file status: {log_info}")
-                                                    
-                                                    # If log exists but has 0 lines, process might have just started
-                                                    if "0 " in log_info or " 0 " in log_info:
-                                                        terminal_output.append(f"[INFO] Log file exists but is empty - training may be initializing")
-                                                
-                                                # Check if process might have failed immediately - look for any output in /tmp or other common locations
+                                            # Check if process might have failed immediately - look for any output in /tmp or other common locations
+                                            # This is a non-critical diagnostic check, so handle timeouts gracefully
+                                            try:
                                                 check_tmp_output_cmd = [
                                                     "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
                                                     f"root@{ssh_host}",
                                                     "ls -lht /tmp/*.log /tmp/*.out /tmp/*.err 2>/dev/null | head -3 || echo 'no_tmp_output'"
                                                 ]
-                                                tmp_output_result = subprocess.run(check_tmp_output_cmd, capture_output=True, text=True, timeout=15)
+                                                tmp_output_result = subprocess.run(check_tmp_output_cmd, capture_output=True, text=True, timeout=10)
                                                 if "no_tmp_output" not in tmp_output_result.stdout and tmp_output_result.stdout.strip():
                                                     tmp_filtered = filter_malloc_warnings(tmp_output_result.stdout)
                                                     terminal_output.append(f"[DIAGNOSTICS] Found output files in /tmp: {tmp_filtered.strip()}")
-                                                
-                                                # Check if we can see the process's file descriptors to see if it's writing
-                                                check_process_fds_cmd = [
-                                                    "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
-                                                    f"root@{ssh_host}",
-                                                    "ps aux | grep -E '(accelerate|axolotl|train)' | grep -v grep | awk '{print $2}' | head -1 | xargs -I {} sh -c 'if [ -n \"{}\" ]; then ls -l /proc/{}/fd/ 2>/dev/null | grep -E \"(training.log|stdout|stderr)\" || echo \"no_fds\"; else echo \"no_pid\"; fi'"
-                                                ]
-                                                process_fds_result = subprocess.run(check_process_fds_cmd, capture_output=True, text=True, timeout=15)
-                                                if process_fds_result.stdout and "no_fds" not in process_fds_result.stdout and "no_pid" not in process_fds_result.stdout:
-                                                    fds_filtered = filter_malloc_warnings(process_fds_result.stdout)
-                                                    terminal_output.append(f"[DIAGNOSTICS] Process file descriptors: {fds_filtered.strip()}")
-                                        
-                                        # Check debug.log if it exists
-                                        terminal_output.append(f"[SSH] Checking debug.log for errors...")
-                                        debug_log_cmd = [
-                                            "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
-                                            f"root@{ssh_host}",
-                                            "if [ -f /workspace/output/training/debug.log ]; then tail -30 /workspace/output/training/debug.log; else echo 'no_debug_log'; fi"
-                                        ]
-                                        debug_result = subprocess.run(debug_log_cmd, capture_output=True, text=True, timeout=15)
-                                        debug_log_content = None
-                                        if "no_debug_log" not in debug_result.stdout and debug_result.stdout.strip():
-                                            stdout_filtered = filter_malloc_warnings(debug_result.stdout)
-                                            debug_log_content = stdout_filtered
-                                            terminal_output.append(f"[DEBUG LOG] Last 30 lines:")
-                                            for line in stdout_filtered.strip().split("\n")[-10:]:
-                                                if line.strip():
-                                                    terminal_output.append(f"[DEBUG] {line}")
-                                        
-                                        # Get training logs
-                                        terminal_output.append(f"[SSH] Retrieving training logs...")
-                                        log_command = (
-                                            "if [ -f /workspace/output/training/training.log ]; then "
-                                            "tail -50 /workspace/output/training/training.log; "
-                                            "elif [ -f /workspace/axolotl/training.log ]; then "
-                                            "tail -50 /workspace/axolotl/training.log; "
-                                            "elif [ -f /workspace/output/training/debug.log ]; then "
-                                            "tail -50 /workspace/output/training/debug.log; "
-                                            "else echo 'no_logs'; fi"
-                                        )
-                                        log_cmd = [
-                                            "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
-                                            f"root@{ssh_host}",
-                                            log_command
-                                        ]
+                                            except subprocess.TimeoutExpired:
+                                                # Timeout is non-critical - just skip this diagnostic check
+                                                pass
+                                            except Exception as e:
+                                                # Other errors are also non-critical
+                                                pass
+                                            
+                                            # Check if we can see the process's file descriptors to see if it's writing
+                                            check_process_fds_cmd = [
+                                                "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
+                                                f"root@{ssh_host}",
+                                                "ps aux | grep -E '(accelerate|axolotl|train)' | grep -v grep | awk '{print $2}' | head -1 | xargs -I {} sh -c 'if [ -n \"{}\" ]; then ls -l /proc/{}/fd/ 2>/dev/null | grep -E \"(training.log|stdout|stderr)\" || echo \"no_fds\"; else echo \"no_pid\"; fi'"
+                                            ]
+                                            process_fds_result = subprocess.run(check_process_fds_cmd, capture_output=True, text=True, timeout=15)
+                                            if process_fds_result.stdout and "no_fds" not in process_fds_result.stdout and "no_pid" not in process_fds_result.stdout:
+                                                fds_filtered = filter_malloc_warnings(process_fds_result.stdout)
+                                                terminal_output.append(f"[DIAGNOSTICS] Process file descriptors: {fds_filtered.strip()}")
+                                    
+                                    # Check debug.log if it exists
+                                    terminal_output.append(f"[SSH] Checking debug.log for errors...")
+                                    debug_log_cmd = [
+                                        "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
+                                        f"root@{ssh_host}",
+                                        "if [ -f /workspace/output/training/debug.log ]; then tail -30 /workspace/output/training/debug.log; else echo 'no_debug_log'; fi"
+                                    ]
+                                    debug_result = subprocess.run(debug_log_cmd, capture_output=True, text=True, timeout=15)
+                                    debug_log_content = None
+                                    if "no_debug_log" not in debug_result.stdout and debug_result.stdout.strip():
+                                        stdout_filtered = filter_malloc_warnings(debug_result.stdout)
+                                        debug_log_content = stdout_filtered
+                                        terminal_output.append(f"[DEBUG LOG] Last 30 lines:")
+                                        for line in stdout_filtered.strip().split("\n")[-10:]:
+                                            if line.strip():
+                                                terminal_output.append(f"[DEBUG] {line}")
+                                    
+                                    # Get training logs
+                                    terminal_output.append(f"[SSH] Retrieving training logs...")
+                                    st.session_state[terminal_output_key] = terminal_output
+                                    log_command = (
+                                        "if [ -f /workspace/output/training/training.log ]; then "
+                                        "tail -50 /workspace/output/training/training.log; "
+                                        "elif [ -f /workspace/axolotl/training.log ]; then "
+                                        "tail -50 /workspace/axolotl/training.log; "
+                                        "elif [ -f /workspace/output/training/debug.log ]; then "
+                                        "tail -50 /workspace/output/training/debug.log; "
+                                        "else echo 'no_logs'; fi"
+                                    )
+                                    log_cmd = [
+                                        "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
+                                        "-o", "ServerAliveInterval=5", "-o", "ServerAliveCountMax=2",
+                                        f"root@{ssh_host}",
+                                        log_command
+                                    ]
+                                    try:
+                                        terminal_output.append(f"[SSH] Attempting to retrieve logs (timeout: 15s)...")
+                                        st.session_state[terminal_output_key] = terminal_output
                                         log_result = subprocess.run(log_cmd, capture_output=True, text=True, timeout=15)
-                                        if "no_logs" not in log_result.stdout and log_result.stdout.strip():
-                                            stdout_filtered = filter_malloc_warnings(log_result.stdout)
-                                            # Get more lines to find the actual error (not just the wrapper)
-                                            log_lines = stdout_filtered.strip().split("\n")
+                                    except subprocess.TimeoutExpired:
+                                        terminal_output.append(f"[WARNING] Log retrieval timed out after 15 seconds")
+                                        terminal_output.append(f"[INFO] Log file may be very large or SSH connection is slow")
+                                        terminal_output.append(f"[INFO] Training may still be initializing - logs will appear once training starts")
+                                        st.session_state[terminal_output_key] = terminal_output
+                                        log_result = type('obj', (object,), {'stdout': 'no_logs', 'returncode': 1})()
+                                    except Exception as e:
+                                        terminal_output.append(f"[ERROR] Log retrieval failed: {str(e)}")
+                                        st.session_state[terminal_output_key] = terminal_output
+                                        log_result = type('obj', (object,), {'stdout': 'no_logs', 'returncode': 1})()
+                                    if "no_logs" not in log_result.stdout and log_result.stdout.strip():
+                                        stdout_filtered = filter_malloc_warnings(log_result.stdout)
+                                        # Get more lines to find the actual error (not just the wrapper)
+                                        log_lines = stdout_filtered.strip().split("\n")
+                                        # Append to existing training_logs_content if it exists, otherwise create new
+                                        if training_logs_content:
+                                            training_logs_content = training_logs_content + "\n" + "\n".join(log_lines)
+                                        else:
                                             training_logs_content = "\n".join(log_lines)
+                                        
+                                        # Extract dataset statistics from logs
+                                        dataset_stats = extract_dataset_stats(training_logs_content)
+                                        if dataset_stats:
+                                            terminal_output.append(f"[DATASET STATS] ========================================")
+                                            if dataset_stats.get("original_count"):
+                                                terminal_output.append(f"[DATASET STATS] Original samples: {dataset_stats['original_count']}")
+                                            if dataset_stats.get("final_count"):
+                                                terminal_output.append(f"[DATASET STATS] Final training samples: {dataset_stats['final_count']}")
+                                            if dataset_stats.get("dropped_long"):
+                                                terminal_output.append(f"[DATASET STATS] Dropped (too long): {dataset_stats['dropped_long']}")
+                                            if dataset_stats.get("dropped_zero_tokens"):
+                                                terminal_output.append(f"[DATASET STATS] Dropped (zero tokens): {dataset_stats['dropped_zero_tokens']}")
+                                            if dataset_stats.get("total_dropped"):
+                                                dropped_pct = (dataset_stats['total_dropped'] / dataset_stats['original_count'] * 100) if dataset_stats.get('original_count') else 0
+                                                terminal_output.append(f"[DATASET STATS] Total dropped: {dataset_stats['total_dropped']} ({dropped_pct:.1f}%)")
+                                            terminal_output.append(f"[DATASET STATS] ========================================")
+                                        
+                                        # Verify LoRA mode is active
+                                        lora_verification_key = f"lora_verified_{instance_id}"
+                                        if lora_verification_key not in st.session_state:
+                                            import re
+                                            lora_indicators = []
                                             
-                                            # Extract dataset statistics from logs
-                                            dataset_stats = extract_dataset_stats(training_logs_content)
-                                            if dataset_stats:
-                                                terminal_output.append(f"[DATASET STATS] ========================================")
-                                                if dataset_stats.get("original_count"):
-                                                    terminal_output.append(f"[DATASET STATS] Original samples: {dataset_stats['original_count']}")
-                                                if dataset_stats.get("final_count"):
-                                                    terminal_output.append(f"[DATASET STATS] Final training samples: {dataset_stats['final_count']}")
-                                                if dataset_stats.get("dropped_long"):
-                                                    terminal_output.append(f"[DATASET STATS] Dropped (too long): {dataset_stats['dropped_long']}")
-                                                if dataset_stats.get("dropped_zero_tokens"):
-                                                    terminal_output.append(f"[DATASET STATS] Dropped (zero tokens): {dataset_stats['dropped_zero_tokens']}")
-                                                if dataset_stats.get("total_dropped"):
-                                                    dropped_pct = (dataset_stats['total_dropped'] / dataset_stats['original_count'] * 100) if dataset_stats.get('original_count') else 0
-                                                    terminal_output.append(f"[DATASET STATS] Total dropped: {dataset_stats['total_dropped']} ({dropped_pct:.1f}%)")
-                                                terminal_output.append(f"[DATASET STATS] ========================================")
+                                            # Check logs for LoRA indicators
+                                            if training_logs_content:
+                                                log_lower = training_logs_content.lower()
+                                                
+                                                # Check for trainable parameters (LoRA shows much smaller trainable vs total)
+                                                trainable_params_match = re.search(r'trainable params[:\s]+([\d,]+)', log_lower, re.IGNORECASE)
+                                                all_params_match = re.search(r'all params[:\s]+([\d,]+)', log_lower, re.IGNORECASE)
+                                                
+                                                if trainable_params_match and all_params_match:
+                                                    try:
+                                                        trainable = int(trainable_params_match.group(1).replace(',', ''))
+                                                        all_params = int(all_params_match.group(1).replace(',', ''))
+                                                        if all_params > 0:
+                                                            trainable_pct = (trainable / all_params) * 100
+                                                            if trainable_pct < 5:  # LoRA typically trains <5% of parameters
+                                                                lora_indicators.append(f"✓ Trainable params: {trainable:,} ({trainable_pct:.2f}% of {all_params:,}) - indicates LoRA mode")
+                                                            else:
+                                                                lora_indicators.append(f"⚠ Trainable params: {trainable:,} ({trainable_pct:.2f}% of {all_params:,}) - may not be LoRA")
+                                                    except:
+                                                        pass
+                                                
+                                                # Check for PEFT/LoRA mentions
+                                                if any(term in log_lower for term in ['peft', 'lora', 'low-rank', 'adapter']):
+                                                    lora_indicators.append("✓ Found PEFT/LoRA mentions in logs")
+                                                
+                                                # Check for LoRA module names
+                                                if re.search(r'lora\.(a|b)', log_lower):
+                                                    lora_indicators.append("✓ Found LoRA module references (lora.a/lora.b)")
                                             
-                                            # Show last 20 lines in terminal
-                                            display_lines = log_lines[-20:] if len(log_lines) > 20 else log_lines
-                                            terminal_output.append(f"[TRAINING LOGS] Last {len(display_lines)} lines:")
+                                            # Check config file for LoRA parameters
+                                            if ssh_host:
+                                                try:
+                                                    check_config_cmd = [
+                                                        "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
+                                                        f"root@{ssh_host}",
+                                                        "cd /workspace/data && python3 << 'PYTHON_EOF'\n"
+                                                        "import yaml\n"
+                                                        "try:\n"
+                                                        "    with open('axolotl_config.yaml', 'r') as f:\n"
+                                                        "        config = yaml.safe_load(f) or {}\n"
+                                                        "    \n"
+                                                        "    # Check for LoRA parameters\n"
+                                                        "    has_lora_r = config.get('lora_r') is not None\n"
+                                                        "    has_lora_alpha = config.get('lora_alpha') is not None\n"
+                                                        "    adapter_val = config.get('adapter')\n"
+                                                        "    has_valid_adapter_path = adapter_val and isinstance(adapter_val, str) and adapter_val.startswith('/')\n"
+                                                        "    merge_lora = config.get('merge_lora', True)\n"
+                                                        "    save_merged_lora = config.get('save_merged_lora', True)\n"
+                                                        "    \n"
+                                                        "    # LoRA mode is enabled if lora_* parameters are set (Axolotl infers from these)\n"
+                                                        "    # OR if there's a valid adapter path (for incremental training)\n"
+                                                        "    is_lora_mode = (has_lora_r and has_lora_alpha) or has_valid_adapter_path\n"
+                                                        "    \n"
+                                                        "    print('LORA_CONFIG_CHECK:')\n"
+                                                        "    print(f'lora_r={config.get(\"lora_r\")}')\n"
+                                                        "    print(f'lora_alpha={config.get(\"lora_alpha\")}')\n"
+                                                        "    print(f'adapter={adapter_val}')\n"
+                                                        "    print(f'merge_lora={merge_lora}')\n"
+                                                        "    print(f'save_merged_lora={save_merged_lora}')\n"
+                                                        "    print(f'has_lora_params={has_lora_r and has_lora_alpha}')\n"
+                                                        "    print(f'is_lora_mode={is_lora_mode}')\n"
+                                                        "except Exception as e:\n"
+                                                        "    print(f'ERROR: {str(e)}')\n"
+                                                        "PYTHON_EOF"
+                                                    ]
+                                                    config_check_result = subprocess.run(check_config_cmd, capture_output=True, text=True, timeout=15)
+                                                    if config_check_result.returncode == 0:
+                                                        config_output = config_check_result.stdout.strip()
+                                                        if "LORA_CONFIG_CHECK:" in config_output:
+                                                            for line in config_output.split("\n"):
+                                                                if "=" in line and "LORA_CONFIG_CHECK" not in line:
+                                                                    if "is_lora_mode=True" in line:
+                                                                        lora_indicators.append("✓ Config confirms LoRA mode is enabled")
+                                                                    elif "lora_r=" in line and "None" not in line:
+                                                                        lora_r_val = line.split("=")[1].strip()
+                                                                        lora_indicators.append(f"✓ Config has lora_r={lora_r_val}")
+                                                                    elif "adapter=" in line and "None" not in line and "/" in line:
+                                                                        adapter_path = line.split("=")[1].strip()
+                                                                        lora_indicators.append(f"✓ Config has adapter path: {adapter_path}")
+                                                                    elif "merge_lora=False" in line:
+                                                                        lora_indicators.append("✓ Config has merge_lora: false (adapters will be saved separately)")
+                                                except:
+                                                    pass
+                                            
+                                            # Display LoRA verification results
+                                            if lora_indicators:
+                                                terminal_output.append(f"[LoRA VERIFICATION] ========================================")
+                                                for indicator in lora_indicators:
+                                                    terminal_output.append(f"[LoRA VERIFICATION] {indicator}")
+                                                terminal_output.append(f"[LoRA VERIFICATION] ========================================")
+                                                st.session_state[lora_verification_key] = True
+                                            elif training_logs_content and len(training_logs_content) > 1000:
+                                                # Only show warning if we have substantial logs but no LoRA indicators
+                                                terminal_output.append(f"[LoRA VERIFICATION] ⚠ No clear LoRA indicators found in logs yet")
+                                                terminal_output.append(f"[LoRA VERIFICATION] This may be normal if training just started")
+                                        st.session_state[terminal_output_key] = list(terminal_output)  # Save after dataset stats
+                                        st.session_state[f"{terminal_output_key}_updated"] = datetime.now().isoformat()
+                                        
+                                        # Show new log lines in terminal (avoid duplicates by tracking last seen line)
+                                        last_log_key = f"last_training_log_line_{instance_id}"
+                                        last_seen_line = st.session_state.get(last_log_key, "")
+                                        
+                                        # Find where we left off (only add new lines that aren't already displayed)
+                                        new_lines_start_idx = 0
+                                        if last_seen_line:
+                                            try:
+                                                # Find the index of the last seen line
+                                                for i, line in enumerate(log_lines):
+                                                    if line.strip() == last_seen_line.strip():
+                                                        new_lines_start_idx = i + 1
+                                                        break
+                                            except:
+                                                new_lines_start_idx = 0
+                                        
+                                        # Get new lines (or all lines if this is first time)
+                                        new_lines = log_lines[new_lines_start_idx:] if new_lines_start_idx > 0 else log_lines[-50:]  # Show last 50 on first load
+                                        
+                                        if new_lines:
+                                            terminal_output.append(f"[TRAINING LOGS] {len(new_lines)} new line(s) (showing last 50):")
+                                            # Show last 50 lines to avoid overwhelming the terminal
+                                            display_lines = new_lines[-50:] if len(new_lines) > 50 else new_lines
                                             for line in display_lines:
                                                 if line.strip():
                                                     terminal_output.append(f"[TRAINING] {line}")
-                                
-                                    # Check for errors in training logs and debug logs before checking status
-                                    training_error = None
-                                    # Combine onstart logs, training logs, and debug logs for error detection and stats
-                                    all_logs_content = ""
-                                    if training_logs_content:
-                                        all_logs_content = training_logs_content
-                                    if debug_log_content:
-                                        if all_logs_content:
-                                            all_logs_content = all_logs_content + "\n" + debug_log_content
+                                            # Update last seen line
+                                            if log_lines:
+                                                st.session_state[last_log_key] = log_lines[-1]
                                         else:
-                                            all_logs_content = debug_log_content
-                                    
+                                            terminal_output.append(f"[TRAINING LOGS] No new log lines since last check")
+                                        
+                                        st.session_state[terminal_output_key] = terminal_output
+                                    else:
+                                        terminal_output.append(f"[INFO] No training logs found yet")
+                                        st.session_state[terminal_output_key] = terminal_output
+                                
+                                # Check for errors in training logs and debug logs before checking status
+                                training_error = None
+                                # Combine onstart logs, training logs, and debug logs for error detection and stats
+                                # training_logs_content is set earlier in the code (around line 2990 or 3169)
+                                # Make sure we have the latest training_logs_content
+                                all_logs_content = ""
+                                # Use training_logs_content if it was set (from either the earlier check or the later retrieval)
+                                if training_logs_content:
+                                    all_logs_content = training_logs_content
+                                # Also check if we got logs from the later log retrieval (this overwrites training_logs_content)
+                                # So if training_logs_content exists, it should already have the latest content
+                                if debug_log_content:
                                     if all_logs_content:
+                                        all_logs_content = all_logs_content + "\n" + debug_log_content
+                                    else:
+                                        all_logs_content = debug_log_content
+                                
+                                # Debug: Log what we have for completion detection
+                                terminal_output.append(f"[DEBUG] all_logs_content length: {len(all_logs_content) if all_logs_content else 0}")
+                                if all_logs_content:
+                                    # Check if completion indicators are present
+                                    has_completed = "training completed" in all_logs_content.lower()
+                                    has_saved = "model successfully saved" in all_logs_content.lower()
+                                    terminal_output.append(f"[DEBUG] Completion indicators: has_completed={has_completed}, has_saved={has_saved}")
+                                    
+                                    # If both completion indicators are present, force status to completed
+                                    if has_completed and has_saved:
+                                        terminal_output.append(f"[DEBUG] Both completion indicators detected - forcing status to 'completed'")
+                                        status_val = "completed"
+                                        training_status["status"] = "completed"
+                                        active_job["training_status"] = training_status
+                                        training_manager._save_job(active_job)
+                                        terminal_output.append(f"[DEBUG] Status forced to 'completed' based on log indicators")
+                                        # Note: Transition to Phase 4 will happen in the completion check below
+                                st.session_state[terminal_output_key] = terminal_output
+                                
+                                if all_logs_content:
                                         # Look for common error patterns - prioritize actual errors over wrapper errors
                                         # Prioritize specific errors that we can fix
                                         priority_error_patterns = [
@@ -3057,6 +4416,7 @@ def render():
                                             "ValueError",
                                             "KeyError",
                                             "TypeError",
+                                            "IndexError",
                                             "OSError",
                                             "Traceback (most recent call last)",
                                             "Error:",
@@ -3107,12 +4467,100 @@ def render():
                                             # Go forward to find the end of the error (usually 10-15 lines)
                                             end = min(len(lines), last_error_idx + 15)
                                             training_error = "\n".join(lines[start:end])
-                                    
-                                    training_status = training_manager.check_training_status(instance_id)
-                                    
-                                    # Ensure training_status is a dict
-                                    if training_status is None:
-                                        training_status = {}
+                                            
+                                            # Check for specific error types and provide guidance
+                                            import re
+                                            is_oom_error = False
+                                            if "OutOfMemoryError" in training_error or "out of memory" in training_error.lower() or "CUDA out of memory" in training_error:
+                                                is_oom_error = True
+                                                terminal_output.append(f"[ERROR] ⚠️ CUDA Out of Memory Error detected!")
+                                                
+                                                # Extract memory information from error
+                                                memory_info = {}
+                                                # Try to extract: "Tried to allocate X GiB"
+                                                alloc_match = re.search(r'tried to allocate ([\d.]+)\s*(GiB|MiB)', training_error, re.IGNORECASE)
+                                                if alloc_match:
+                                                    memory_info['requested'] = f"{alloc_match.group(1)} {alloc_match.group(2)}"
+                                                
+                                                # Try to extract: "GPU 0 has a total capacity of X GiB"
+                                                total_match = re.search(r'total capacity of ([\d.]+)\s*(GiB|MiB)', training_error, re.IGNORECASE)
+                                                if total_match:
+                                                    memory_info['total'] = f"{total_match.group(1)} {total_match.group(2)}"
+                                                
+                                                # Try to extract: "X GiB is free"
+                                                free_match = re.search(r'([\d.]+)\s*(GiB|MiB)\s+is free', training_error, re.IGNORECASE)
+                                                if free_match:
+                                                    memory_info['free'] = f"{free_match.group(1)} {free_match.group(2)}"
+                                                
+                                                # Try to extract process memory usage
+                                                process_matches = re.findall(r'Process \d+ has ([\d.]+)\s*(GiB|MiB)', training_error, re.IGNORECASE)
+                                                if process_matches:
+                                                    memory_info['other_processes'] = [f"{m[0]} {m[1]}" for m in process_matches]
+                                                
+                                                # Provide detailed information
+                                                if memory_info:
+                                                    terminal_output.append(f"[INFO] Memory Status:")
+                                                    if 'requested' in memory_info:
+                                                        terminal_output.append(f"  • Requested: {memory_info['requested']}")
+                                                    if 'total' in memory_info:
+                                                        terminal_output.append(f"  • Total GPU: {memory_info['total']}")
+                                                    if 'free' in memory_info:
+                                                        terminal_output.append(f"  • Free: {memory_info['free']}")
+                                                    if 'other_processes' in memory_info:
+                                                        terminal_output.append(f"  • Other processes using: {', '.join(memory_info['other_processes'])}")
+                                                
+                                                terminal_output.append(f"[ACTION] Solutions:")
+                                                terminal_output.append(f"  1. Reduce batch_size in training config (try 1 or 2)")
+                                                terminal_output.append(f"  2. Reduce gradient_accumulation_steps")
+                                                terminal_output.append(f"  3. Enable gradient_checkpointing if not already enabled")
+                                                terminal_output.append(f"  4. Use a smaller model or enable LoRA with lower rank")
+                                                terminal_output.append(f"  5. Kill other GPU processes if they're not needed")
+                                                terminal_output.append(f"  6. Try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True")
+                                                
+                                            else:
+                                                terminal_output.append(f"[ERROR] Error detected in training logs")
+                                            
+                                            st.session_state[terminal_output_key] = list(terminal_output)  # Save after error detection
+                                            st.session_state[f"{terminal_output_key}_updated"] = datetime.now().isoformat()
+                                else:
+                                    # No SSH host available - try to get it from API
+                                    terminal_output.append(f"[INFO] SSH host not available - attempting to retrieve from API...")
+                                    try:
+                                        updated_job_status = training_manager.get_job_status(instance_id)
+                                        if updated_job_status and not updated_job_status.get("error"):
+                                            ssh_host_from_api = updated_job_status.get("ssh_host")
+                                            ssh_port_from_api = updated_job_status.get("ssh_port", 22)
+                                            if ssh_host_from_api:
+                                                active_job["ssh_host"] = ssh_host_from_api
+                                                active_job["ssh_port"] = ssh_port_from_api
+                                                training_manager._save_job(active_job)
+                                                terminal_output.append(f"[SUCCESS] Retrieved SSH info from API: {ssh_host_from_api}:{ssh_port_from_api}")
+                                                st.session_state[terminal_output_key] = terminal_output
+                                                st.rerun()  # Rerun to use the new SSH info
+                                            else:
+                                                terminal_output.append(f"[WARNING] SSH host still not available from API - instance may still be initializing")
+                                                terminal_output.append(f"[INFO] You may need to wait for the instance to fully start, or check the instance status in Vast.ai")
+                                    except Exception as e:
+                                        terminal_output.append(f"[WARNING] Could not retrieve SSH info from API: {str(e)}")
+                                    st.session_state[terminal_output_key] = terminal_output
+                                
+                                # Get fresh job status from manager FIRST (this updates the job with latest info from API)
+                                # This ensures we have the most up-to-date status before checking training
+                                updated_job_status = training_manager.get_job_status(instance_id)
+                                if updated_job_status and not updated_job_status.get("error"):
+                                    # Update active_job with fresh data (including status, SSH info, etc.)
+                                    active_job.update(updated_job_status)
+                                    # Also update the active_jobs list so it's reflected in the UI
+                                    for idx, job in enumerate(active_jobs):
+                                        if job.get("instance_id") == instance_id:
+                                            active_jobs[idx] = active_job
+                                            break
+                                
+                                training_status = training_manager.check_training_status(instance_id)
+                                
+                                # Ensure training_status is a dict
+                                if training_status is None:
+                                    training_status = {}
                                     
                                     # Override status if we found errors in logs
                                     if training_error and training_status.get("status") != "completed":
@@ -3120,11 +4568,15 @@ def render():
                                         # Extract a concise error message
                                         error_lines = training_error.split("\n")
                                         for line in reversed(error_lines):
-                                            if any(keyword in line for keyword in ["Error", "Exception", "AttributeError", "ModuleNotFoundError", "ImportError"]):
+                                            if any(keyword in line for keyword in ["Error", "Exception", "AttributeError", "ModuleNotFoundError", "ImportError", "OutOfMemoryError"]):
                                                 training_status["failure_reason"] = line.strip()
                                                 break
                                         if "failure_reason" not in training_status:
-                                            training_status["failure_reason"] = "Training error detected in logs (see training logs above)"
+                                            # Check if it's an OOM error
+                                            if "OutOfMemoryError" in training_error or "out of memory" in training_error.lower() or "CUDA out of memory" in training_error:
+                                                training_status["failure_reason"] = "CUDA Out of Memory Error - GPU memory exhausted"
+                                            else:
+                                                training_status["failure_reason"] = "Training error detected in logs (see training logs above)"
                                     
                                     # If SSH check shows training is running but status is unknown, set it to training
                                     if ssh_training_running is not None and ssh_training_running:
@@ -3135,25 +4587,79 @@ def render():
                                     active_job["training_status"] = training_status
                                     training_manager._save_job(active_job)
                                     
+                                    # Reload job again to get any status updates from get_job_status
+                                    updated_job_status = training_manager.get_job_status(instance_id)
+                                    if updated_job_status and not updated_job_status.get("error"):
+                                        # Update active_job with fresh data
+                                        active_job.update(updated_job_status)
+                                    
                                     status_val = training_status.get("status", "unknown")
+                                    terminal_output.append(f"[DEBUG] Initial status_val from training_status: {status_val}")
+                                    st.session_state[terminal_output_key] = list(terminal_output)  # Save after status determination
+                                    st.session_state[f"{terminal_output_key}_updated"] = datetime.now().isoformat()
                                     
                                     # Check for completion indicators in logs BEFORE checking for preprocessing
                                     # This ensures completion takes priority over preprocessing detection
                                     if all_logs_content:
-                                        completion_indicators = [
-                                            "training completed", "model successfully saved", "saving trained model",
-                                            "checkpoint-", "train_loss", "eval_loss", "train_runtime", "epoch"
+                                        # Strong completion indicators (definitive)
+                                        strong_completion_indicators = [
+                                            "training completed",
+                                            "model successfully saved",
+                                            "saving trained model"
                                         ]
-                                        is_completed = any(indicator in all_logs_content.lower() for indicator in completion_indicators)
+                                        
+                                        # Check for strong indicators
+                                        has_strong_indicator = any(indicator in all_logs_content.lower() for indicator in strong_completion_indicators)
+                                        # Check for both completion AND saved indicators (most definitive)
+                                        has_both_indicators = "training completed" in all_logs_content.lower() and "model successfully saved" in all_logs_content.lower()
+                                        # Also check that no process is running (process has exited)
+                                        process_exited = not ssh_training_running if ssh_training_running is not None else False
+                                        
+                                        terminal_output.append(f"[DEBUG] Completion check: has_strong_indicator={has_strong_indicator}, has_both_indicators={has_both_indicators}, process_exited={process_exited}, status_val={status_val}")
+                                        terminal_output.append(f"[DEBUG] all_logs_content length: {len(all_logs_content) if all_logs_content else 0}")
+                                        terminal_output.append(f"[DEBUG] ssh_training_running: {ssh_training_running}")
+                                        st.session_state[terminal_output_key] = terminal_output
+                                        
+                                        # If we have both indicators, consider it completed even if process hasn't exited yet
+                                        # (process might still be cleaning up or the check might be delayed)
+                                        # Priority: has_both_indicators > (has_strong_indicator and process_exited)
+                                        if has_both_indicators:
+                                            is_completed = True
+                                            terminal_output.append(f"[DEBUG] Both completion indicators found - treating as completed regardless of process status")
+                                        else:
+                                            is_completed = has_strong_indicator and process_exited
+                                        
+                                        terminal_output.append(f"[DEBUG] is_completed={is_completed}, status_val={status_val}")
+                                        st.session_state[terminal_output_key] = terminal_output
                                         
                                         if is_completed and status_val != "completed":
-                                            # Override status to completed if we see completion indicators
+                                            # Override status to completed if we see completion indicators and process has exited
+                                            terminal_output.append(f"[INFO] ✓ Detected training completion from logs (process has exited)")
+                                            terminal_output.append(f"[INFO] Strong indicator found: {[ind for ind in strong_completion_indicators if ind in all_logs_content.lower()]}")
+                                            st.session_state[terminal_output_key] = terminal_output
                                             status_val = "completed"
                                             training_status["status"] = "completed"
                                             active_job["training_status"] = training_status
                                             training_manager._save_job(active_job)
+                                            terminal_output.append(f"[INFO] ✓ Status updated to 'completed' and saved to job")
+                                            terminal_output.append(f"[INFO] status_val is now: {status_val}")
+                                            st.session_state[terminal_output_key] = terminal_output
+                                        elif status_val == "completed":
+                                            terminal_output.append(f"[DEBUG] Status already set to 'completed' - proceeding to queue transition check...")
+                                            st.session_state[terminal_output_key] = terminal_output
+                                        else:
+                                            terminal_output.append(f"[DEBUG] Completion not detected: is_completed={is_completed}, status_val={status_val}")
+                                            st.session_state[terminal_output_key] = terminal_output
+                                    else:
+                                        terminal_output.append(f"[DEBUG] Completion check skipped: all_logs_content is empty")
+                                        st.session_state[terminal_output_key] = terminal_output
+                                    
+                                    # Save status before showing it - ensure we save after completion detection
+                                    st.session_state[terminal_output_key] = terminal_output
                                     
                                     terminal_output.append(f"[INFO] Training status: {status_val}")
+                                    terminal_output.append(f"[DEBUG] About to check if status_val == 'completed'...")
+                                    st.session_state[terminal_output_key] = terminal_output
                                     
                                     # Add detailed diagnostics - use SSH check results if available, otherwise fall back to training_status
                                     
@@ -3198,16 +4704,134 @@ def render():
                                             
                                             # Check if preprocessing/training is actually happening (only if not completed)
                                             if not is_completed:
+                                                # Check for active training step progress first (most specific)
+                                                import re
+                                                training_step_patterns = [
+                                                    r'\|\s+\d+/\d+\s+\|',  # Progress bar format: "| 1/393 |" or "| 2/393 |"
+                                                    r'\d+/\d+\s+\[',  # Progress bar format: "1/393 [" or "2/393 ["
+                                                    r'step\s+\d+/\d+',  # "step 1/393", "step 2/393"
+                                                    r'step\s+\d+',  # "step 1", "step 2"
+                                                    r'epoch\s+\d+.*loss',  # "epoch 1 loss: 0.5"
+                                                    r'loss.*step',  # "loss: 0.5 at step 1"
+                                                    r'train.*loss.*\d+\.\d+',  # "train_loss: 0.5234"
+                                                    r'eval.*loss.*\d+\.\d+',  # "eval_loss: 0.5234"
+                                                ]
+                                                is_training_active = False
+                                                if all_logs_content:
+                                                    for pattern in training_step_patterns:
+                                                        if re.search(pattern, all_logs_content, re.IGNORECASE):
+                                                            is_training_active = True
+                                                            break
+                                                
+                                                # Check for preprocessing indicators
                                                 preprocessing_indicators = ["tokenizing", "preprocessing", "dropping", "saving the dataset", "sample packing"]
                                                 is_preprocessing = any(indicator in all_logs_content.lower() if all_logs_content else False for indicator in preprocessing_indicators)
                                                 
-                                                if is_preprocessing:
+                                                # Check if preprocessing is complete (look for 100% completion)
+                                                preprocessing_complete = False
+                                                if all_logs_content:
+                                                    # Check if we see 100% completion for preprocessing steps
+                                                    preprocessing_complete_patterns = [
+                                                        r'dropping.*100%',
+                                                        r'saving the dataset.*100%',
+                                                        r'maximum number of steps set at',  # This appears after preprocessing
+                                                    ]
+                                                    for pattern in preprocessing_complete_patterns:
+                                                        if re.search(pattern, all_logs_content, re.IGNORECASE):
+                                                            preprocessing_complete = True
+                                                            break
+                                                
+                                                # Check for model loading indicators (after preprocessing, before training starts)
+                                                model_loading_indicators = ["loading checkpoint", "loading model", "loading tokenizer", "memory usage after model load"]
+                                                is_model_loading = any(indicator in all_logs_content.lower() if all_logs_content else False for indicator in model_loading_indicators)
+                                                
+                                                # Check if model loading is complete (checkpoint shards loaded)
+                                                model_loading_complete = False
+                                                if all_logs_content:
+                                                    # Look for "Loading checkpoint shards: 100%" which indicates model loading is done
+                                                    if re.search(r'loading checkpoint shards.*100%', all_logs_content, re.IGNORECASE):
+                                                        model_loading_complete = True
+                                                
+                                                if is_training_active:
+                                                    # Extract step information if available - try multiple formats
+                                                    step_match = None
+                                                    # Try progress bar format first: "| 1/393 |" or "1/393 ["
+                                                    step_match = re.search(r'\|\s+(\d+)/(\d+)\s+\|', all_logs_content)
+                                                    if not step_match:
+                                                        step_match = re.search(r'(\d+)/(\d+)\s+\[', all_logs_content)
+                                                    # Try standard step format: "step 1/393"
+                                                    if not step_match:
+                                                        step_match = re.search(r'step\s+(\d+)/(\d+)', all_logs_content, re.IGNORECASE)
+                                                    
+                                                    if step_match:
+                                                        current_step = int(step_match.group(1))
+                                                        total_steps = int(step_match.group(2))
+                                                        
+                                                        # Extract epoch information if available
+                                                        epoch_match = re.search(r"'epoch':\s*([\d.]+)", all_logs_content)
+                                                        current_epoch = None
+                                                        if epoch_match:
+                                                            current_epoch = float(epoch_match.group(1))
+                                                        
+                                                        # Calculate time estimates
+                                                        # Try to extract time per step from progress bar: "33.88s/it"
+                                                        time_per_step_match = re.search(r'\[.*?([\d.]+)s/it\]', all_logs_content)
+                                                        time_per_step = None
+                                                        if time_per_step_match:
+                                                            time_per_step = float(time_per_step_match.group(1))
+                                                        
+                                                        # Build status message
+                                                        status_msg = f"[INFO] ✓ Training is active - Step {current_step}/{total_steps}"
+                                                        if current_epoch is not None:
+                                                            # Calculate estimated total epochs
+                                                            if current_step > 0:
+                                                                steps_per_epoch = current_step / current_epoch
+                                                                estimated_total_epochs = total_steps / steps_per_epoch
+                                                                status_msg += f" (Epoch {current_epoch:.2f}, ~{estimated_total_epochs:.1f} epochs total)"
+                                                        
+                                                        # Add time estimate
+                                                        if time_per_step:
+                                                            remaining_steps = total_steps - current_step
+                                                            remaining_seconds = remaining_steps * time_per_step
+                                                            remaining_hours = remaining_seconds / 3600
+                                                            status_msg += f" | Est. remaining: {remaining_hours:.1f} hours"
+                                                        
+                                                        terminal_output.append(status_msg)
+                                                    else:
+                                                        terminal_output.append(f"[INFO] ✓ Training is active - training steps detected in logs")
+                                                    terminal_output.append(f"[INFO] Check the training logs above to see current progress and loss values.")
+                                                    # Mark that we detected active training
+                                                    status_val = "training"
+                                                    training_status["status"] = "training"
+                                                    active_job["training_status"] = training_status
+                                                    training_manager._save_job(active_job)
+                                                elif model_loading_complete or (is_model_loading and preprocessing_complete):
+                                                    # Model loading is complete or in progress after preprocessing - prioritize this
+                                                    if model_loading_complete:
+                                                        terminal_output.append(f"[INFO] ✓ Model loading completed - training should start soon.")
+                                                        terminal_output.append(f"[INFO] Check the training logs above to see when training steps begin.")
+                                                    else:
+                                                        terminal_output.append(f"[INFO] ✓ Model is loading - training will begin once initialization is complete.")
+                                                        terminal_output.append(f"[INFO] Check the training logs above to see when model loading completes.")
+                                                    status_val = "training"
+                                                    training_status["status"] = "training"
+                                                    active_job["training_status"] = training_status
+                                                    training_manager._save_job(active_job)
+                                                elif is_preprocessing and not preprocessing_complete:
                                                     terminal_output.append(f"[INFO] ✓ Training is active - preprocessing data (tokenizing, preparing dataset).")
                                                     terminal_output.append(f"[INFO] This is normal and can take several minutes depending on dataset size.")
                                                     terminal_output.append(f"[INFO] Check the logs above to see preprocessing progress.")
                                                     # Mark that we detected preprocessing so we don't show "unclear" message later
                                                     status_val = "training"  # Override status to training when preprocessing is detected
                                                     # Update training_status to reflect this
+                                                    training_status["status"] = "training"
+                                                    active_job["training_status"] = training_status
+                                                    training_manager._save_job(active_job)
+                                                elif is_model_loading:
+                                                    terminal_output.append(f"[INFO] ✓ Model loading completed - training should start soon.")
+                                                    terminal_output.append(f"[INFO] Training will begin once model initialization is complete.")
+                                                    terminal_output.append(f"[INFO] Check the training logs above to see when training steps begin.")
+                                                    status_val = "training"
                                                     training_status["status"] = "training"
                                                     active_job["training_status"] = training_status
                                                     training_manager._save_job(active_job)
@@ -3219,20 +4843,109 @@ def render():
                                                     terminal_output.append(f"[INFO] If training doesn't start within a few minutes, check the logs manually via SSH.")
                                         # If completed, the status check above should have already set it to "completed"
                                     
-                                    if status_val == "completed":
+                                    # Check status_val after all the completion detection logic
+                                    terminal_output.append(f"[DEBUG] ========================================")
+                                    terminal_output.append(f"[DEBUG] Final status_val: '{status_val}'")
+                                    terminal_output.append(f"[DEBUG] Will check queue transition: {status_val == 'completed'}")
+                                    terminal_output.append(f"[DEBUG] status_val type: {type(status_val).__name__}")
+                                    terminal_output.append(f"[DEBUG] status_val == 'completed': {status_val == 'completed'}")
+                                    # Force save before checking
+                                    st.session_state[terminal_output_key] = terminal_output
+                                    
+                                    # CRITICAL: Check if status_val is actually "completed" and trigger queue transition
+                                    if str(status_val) == "completed":
+                                        terminal_output.append(f"[QUEUE] ========================================")
+                                        terminal_output.append(f"[QUEUE] ✓ Status is 'completed' - ENTERING QUEUE TRANSITION")
+                                        st.session_state[terminal_output_key] = terminal_output
+                                        terminal_output.append(f"[DEBUG] ✓ Status is 'completed' - entering queue transition block")
+                                        st.session_state[terminal_output_key] = terminal_output
+                                        terminal_output.append(f"[SUCCESS] ✓ Training completed!")
+                                        terminal_output.append(f"[QUEUE] Checking if queue transition is needed...")
+                                        st.session_state[terminal_output_key] = terminal_output
+                                        
+                                        # Verify adapter files are saved
+                                        terminal_output.append(f"[VERIFY] Checking if LoRA adapter files are saved...")
+                                        st.session_state[terminal_output_key] = terminal_output
+                                        
+                                        # Get SSH info for adapter verification
+                                        ssh_host = active_job.get("ssh_host")
+                                        ssh_port = active_job.get("ssh_port", 22)
+                                        if not ssh_host:
+                                            job_status = training_manager.get_job_status(instance_id)
+                                            ssh_host = job_status.get("ssh_host")
+                                            ssh_port = job_status.get("ssh_port", 22)
+                                        
+                                        if ssh_host:
+                                            check_adapter_files_cmd = [
+                                                "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
+                                                f"root@{ssh_host}",
+                                                """bash -c '
+                                                    adapter_found=false
+                                                    if [ -f /workspace/output/training/adapter/adapter_config.json ]; then
+                                                        echo "adapter_location:/workspace/output/training/adapter"
+                                                        ls -lh /workspace/output/training/adapter/ | head -10
+                                                        adapter_found=true
+                                                    elif [ -f /workspace/output/training/adapter_config.json ]; then
+                                                        echo "adapter_location:/workspace/output/training"
+                                                        ls -lh /workspace/output/training/adapter* 2>/dev/null | head -10
+                                                        adapter_found=true
+                                                    fi
+                                                    if [ "$adapter_found" = false ]; then
+                                                        echo "adapter_not_found"
+                                                        echo "Checking for any adapter files..."
+                                                        find /workspace/output -name "adapter_config.json" -o -name "adapter_model.bin" -o -name "adapter_model.safetensors" 2>/dev/null | head -10
+                                                    fi
+                                                '"""
+                                            ]
+                                            adapter_check_result = subprocess.run(check_adapter_files_cmd, capture_output=True, text=True, timeout=15)
+                                            if "adapter_location:" in adapter_check_result.stdout:
+                                                adapter_loc = [line for line in adapter_check_result.stdout.split('\n') if 'adapter_location:' in line][0].split('adapter_location:')[1].strip()
+                                                terminal_output.append(f"[VERIFY] ✓ LoRA adapter files found at: {adapter_loc}")
+                                                # Show file listing
+                                                for line in adapter_check_result.stdout.split('\n'):
+                                                    if line.strip() and 'adapter_location:' not in line:
+                                                        terminal_output.append(f"[VERIFY]   {line}")
+                                            elif "adapter_not_found" in adapter_check_result.stdout:
+                                                terminal_output.append(f"[WARNING] ⚠ LoRA adapter files not found in expected locations!")
+                                                terminal_output.append(f"[WARNING]   Checked: /workspace/output/training/adapter/ and /workspace/output/training/")
+                                                # Show what was found
+                                                for line in adapter_check_result.stdout.split('\n'):
+                                                    if line.strip() and 'adapter_not_found' not in line and 'Checking' not in line:
+                                                        terminal_output.append(f"[VERIFY]   {line}")
+                                            else:
+                                                terminal_output.append(f"[VERIFY] Could not verify adapter files (check timed out or failed)")
+                                        
+                                        st.session_state[terminal_output_key] = terminal_output
+                                        
+                                        # Training completed - advance to Phase 4 (single job mode, no queue transitions)
+                                        terminal_output.append(f"[SUCCESS] ========================================")
                                         terminal_output.append(f"[SUCCESS] Training completed!")
+                                        terminal_output.append(f"[SUCCESS] ========================================")
+                                        terminal_output.append(f"[INFO] Advancing to Phase 4: Finalize (downloading weights)")
+                                        terminal_output.append(f"[INFO] No queue transitions - single job mode")
                                         
-                                        # Check if there are more jobs in the queue
-                                        job_queue = active_job.get("job_queue")
-                                        current_job_index = active_job.get("current_job_index")
+                                        # Auto-advance to Phase 4 (no queue/job serialization)
+                                        # Save terminal output before transition
+                                        st.session_state[terminal_output_key] = terminal_output
+                                        # Advance to Phase 4
+                                        st.session_state[phase_key] = 4
+                                        # Trigger rerun to show Phase 4
+                                        st.rerun()
                                         
-                                        if job_queue and current_job_index is not None and current_job_index + 1 < len(job_queue):
+                                        # NOTE: Queue transition code removed - we no longer serialize jobs
+                                        # This code should not be reached, but keeping for safety
+                                        if False:
+                                            terminal_output.append(f"[QUEUE] ========================================")
+                                            terminal_output.append(f"[QUEUE] ✓ Starting queue transition from job {current_job_index + 1} to job {current_job_index + 2}...")
+                                            st.session_state[terminal_output_key] = terminal_output
+                                            
                                             # More jobs in queue - merge adapter from completed job into next job
                                             next_job_index = current_job_index + 1
                                             next_job = job_queue[next_job_index]
                                             
                                             terminal_output.append(f"[QUEUE] Job {current_job_index + 1} complete. Starting job {next_job_index + 1}/{len(job_queue)}...")
                                             terminal_output.append(f"[MERGE] Merging adapter from job {current_job_index + 1} into job {next_job_index + 1}...")
+                                            st.session_state[terminal_output_key] = terminal_output
                                             
                                             # Rename files on instance to bring next job's files to the front
                                             try:
@@ -3373,11 +5086,13 @@ def render():
                                                             f"import yaml\n"
                                                             f"import sys\n"
                                                             f"try:\n"
-                                                            f"    with open('axolotl_config_{next_job_index}.yaml', 'r') as f:\n"
+                                                            f"    # Job 1 (index 0) = no suffix, Job 2+ (index 1+) = _{index} suffix\n"
+                                                            f"    config_filename = 'axolotl_config.yaml' if {next_job_index} == 0 else f'axolotl_config_{next_job_index}.yaml'\n"
+                                                            f"    with open(config_filename, 'r') as f:\n"
                                                             f"        config = yaml.safe_load(f) or {{}}\n"
                                                             f"    old_adapter = config.get('adapter', 'none')\n"
                                                             f"    config['adapter'] = '/workspace/data/previous_adapter_{current_job_index}'\n"
-                                                            f"    with open('axolotl_config_{next_job_index}.yaml', 'w') as f:\n"
+                                                            f"    with open(config_filename, 'w') as f:\n"
                                                             f"        yaml.dump(config, f, default_flow_style=False, sort_keys=False)\n"
                                                             f"    print(f'Config updated: adapter set to /workspace/data/previous_adapter_{current_job_index}')\n"
                                                             f"    print(f'Previous adapter value: {{old_adapter}}')\n"
@@ -3411,18 +5126,65 @@ def render():
                                                         terminal_output.append(f"[MERGE] Step 4: Skipping adapter merge (no adapter found from job {current_job_index + 1})")
                                                         terminal_output.append(f"[MERGE]   Job {next_job_index + 1} will train from base model")
                                                     
-                                                    # Step 5: Clean up old active files and rename next job's files to active names
-                                                    terminal_output.append(f"[SSH] Cleaning up old active files and activating job {next_job_index + 1} files...")
-                                                    rename_cmd = [
-                                                        "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
-                                                        f"root@{ssh_host}",
-                                                        f"cd /workspace/data && "
-                                                        f"rm -f axolotl_config.yaml training_data.jsonl && "
-                                                        f"mv axolotl_config_{next_job_index}.yaml axolotl_config.yaml && "
-                                                        f"mv training_data_{next_job_index}.jsonl training_data.jsonl && "
-                                                        f"echo 'Files renamed successfully'"
-                                                    ]
+                                                    # Step 5: Clean up old active files and activate next job's files
+                                                    # Naming scheme: Job 1 (index 0) = no suffix, Job 2+ (index 1+) = _{index} suffix
+                                                    terminal_output.append(f"[SSH] ========================================")
+                                                    terminal_output.append(f"[SSH] Step 5: Cleaning up old active files and activating job {next_job_index + 1} files...")
+                                                    terminal_output.append(f"[SSH]   Current active files (job {current_job_index + 1}): axolotl_config.yaml, training_data.jsonl")
+                                                    
+                                                    if next_job_index == 0:
+                                                        # Job 1: Files should already be axolotl_config.yaml and training_data.jsonl (no suffix)
+                                                        terminal_output.append(f"[SSH]   Job 1: Files should already be active (no suffix needed)")
+                                                        terminal_output.append(f"[SSH]   Just removing previous job files and verifying job 1 files exist...")
+                                                        rename_cmd = [
+                                                            "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
+                                                            f"root@{ssh_host}",
+                                                            f"cd /workspace/data && "
+                                                            f"echo 'Step 1: Removing previous job active files...' && "
+                                                            f"rm -f axolotl_config.yaml training_data.jsonl && "
+                                                            f"echo 'Step 2: Verifying job 1 files exist (they should have been uploaded without suffix)...' && "
+                                                            f"if [ -f axolotl_config.yaml ] && [ -f training_data.jsonl ]; then "
+                                                            f"  ls -la axolotl_config.yaml training_data.jsonl && "
+                                                            f"  echo 'Job 1 files are ready'; "
+                                                            f"else "
+                                                            f"  echo 'ERROR: Job 1 files missing!'; "
+                                                            f"  exit 1; "
+                                                            f"fi"
+                                                        ]
+                                                    else:
+                                                        # Job 2+: Files are uploaded with _{next_job_index} suffix, need to activate them
+                                                        terminal_output.append(f"[SSH]   Files to activate (job {next_job_index + 1}): axolotl_config_{next_job_index}.yaml → axolotl_config.yaml")
+                                                        terminal_output.append(f"[SSH]   Files to activate (job {next_job_index + 1}): training_data_{next_job_index}.jsonl → training_data.jsonl")
+                                                        rename_cmd = [
+                                                            "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
+                                                            f"root@{ssh_host}",
+                                                            f"cd /workspace/data && "
+                                                            f"echo '=== File Rename Operation ===' && "
+                                                            f"echo 'Step 1: Removing old active files (job {current_job_index + 1})...' && "
+                                                            f"ls -la axolotl_config.yaml training_data.jsonl 2>/dev/null | head -5 && "
+                                                            f"rm -f axolotl_config.yaml training_data.jsonl && "
+                                                            f"echo 'Step 2: Activating job {next_job_index + 1} files (removing _{next_job_index} suffix)...' && "
+                                                            f"ls -la axolotl_config_{next_job_index}.yaml training_data_{next_job_index}.jsonl 2>/dev/null | head -5 && "
+                                                            f"mv axolotl_config_{next_job_index}.yaml axolotl_config.yaml && "
+                                                            f"mv training_data_{next_job_index}.jsonl training_data.jsonl && "
+                                                            f"echo 'Step 3: Verifying new active files...' && "
+                                                            f"ls -la axolotl_config.yaml training_data.jsonl 2>/dev/null | head -5 && "
+                                                            f"echo 'Files renamed successfully'"
+                                                        ]
+                                                    st.session_state[terminal_output_key] = terminal_output
                                                     rename_result = subprocess.run(rename_cmd, capture_output=True, text=True, timeout=30)
+                                                    
+                                                    # Log the rename operation output
+                                                    if rename_result.stdout:
+                                                        stdout_filtered = filter_malloc_warnings(rename_result.stdout)
+                                                        for line in stdout_filtered.strip().split("\n"):
+                                                            if line.strip() and "Files renamed successfully" not in line:
+                                                                terminal_output.append(f"[SSH]   {line}")
+                                                    if rename_result.stderr:
+                                                        stderr_filtered = filter_malloc_warnings(rename_result.stderr)
+                                                        if stderr_filtered.strip():
+                                                            terminal_output.append(f"[SSH]   stderr: {stderr_filtered.strip()}")
+                                                    st.session_state[terminal_output_key] = terminal_output
                                                     
                                                     if rename_result.returncode == 0:
                                                         terminal_output.append(f"[SUCCESS] Files renamed: Job {next_job_index + 1} files are now active")
@@ -3472,21 +5234,7 @@ def render():
                                                         if remaining_before_start > 0:
                                                             # There are still processes - kill them (shouldn't happen if previous job completed, but safety check)
                                                             terminal_output.append(f"[WARNING] Found {remaining_before_start} process(es) still running - stopping them...")
-                                                            kill_training_cmd = [
-                                                                "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
-                                                                f"root@{ssh_host}",
-                                                                "pkill -9 -f accelerate || true; "
-                                                                "pkill -9 -f axolotl || true; "
-                                                                "ps aux | grep -E 'python.*train|python.*axolotl|python.*accelerate' | grep -v grep | awk '{print $2}' | xargs -r kill -9 || true; "
-                                                                "sleep 2; "
-                                                                "remaining=$(ps aux | grep -E 'accelerate|axolotl|train' | grep -v grep | wc -l); "
-                                                                "echo 'Processes stopped. Remaining: '$remaining"
-                                                            ]
-                                                            kill_result = subprocess.run(kill_training_cmd, capture_output=True, text=True, timeout=30)
-                                                            if kill_result.returncode == 0:
-                                                                stdout_filtered = filter_malloc_warnings(kill_result.stdout)
-                                                                if stdout_filtered.strip():
-                                                                    terminal_output.append(f"[SSH] {stdout_filtered.strip()}")
+                                                            kill_all_training_processes(ssh_host, ssh_port, terminal_output)
                                                         else:
                                                             terminal_output.append(f"[SSH] ✓ No training processes running - safe to start job {next_job_index + 1}")
                                                         
@@ -3575,6 +5323,13 @@ def render():
                                                         training_manager._save_job(active_job)
                                                         
                                                         terminal_output.append(f"[INFO] Training in progress for job {next_job_index + 1}...")
+                                                        terminal_output.append(f"[QUEUE] ========================================")
+                                                        terminal_output.append(f"[QUEUE] Queue transition complete!")
+                                                        terminal_output.append(f"[QUEUE] Job {next_job_index + 1}/{len(job_queue)} is now running.")
+                                                        terminal_output.append(f"[QUEUE] Use 'Check Training Status' to monitor progress.")
+                                                        terminal_output.append(f"[QUEUE] ========================================")
+                                                        st.session_state[terminal_output_key] = terminal_output
+                                                        st.rerun()
                                                         
                                                         # Stay in Phase 3 - training is now running
                                                         st.session_state[terminal_output_key] = terminal_output
@@ -3588,23 +5343,101 @@ def render():
                                                     terminal_output.append(f"[ERROR] SSH host not available. Cannot rename files.")
                                             except Exception as e:
                                                 terminal_output.append(f"[ERROR] Failed to activate next job: {str(e)}")
-                                                terminal_output.append(f"[INFO] All jobs complete. Proceeding to Phase 4...")
-                                                # Fall through to Phase 4
-                                                st.session_state[phase_key] = 4
+                                                terminal_output.append(f"[ERROR] Exception details: {str(e)}")
+                                                import traceback
+                                                terminal_output.append(f"[ERROR] Traceback: {traceback.format_exc()[:500]}")
                                                 st.session_state[terminal_output_key] = terminal_output
-                                                st.rerun()
-                                            else:
-                                                # All jobs complete - move to Phase 4
-                                                terminal_output.append(f"[INFO] All jobs in queue complete!")
-                                                terminal_output.append(f"[INFO] Phase 3 complete!")
-                                                
-                                                # Auto-advance to phase 4
-                                                st.session_state[phase_key] = 4
-                                                # Clear terminal for next phase
-                                                st.session_state[terminal_output_key] = []
                                                 st.rerun()
                                     elif status_val == "training":
                                         terminal_output.append(f"[INFO] Training is actively running...")
+                                        
+                                        # Check for errors in logs even if training appears to be running
+                                        # (training might be about to fail, or error occurred during preprocessing)
+                                        if training_error and ssh_host:
+                                            # Check if it's a multipack sampler error (this can happen during preprocessing)
+                                            is_multipack_error = False
+                                            if all_logs_content:
+                                                has_index_error = "IndexError" in all_logs_content or "list index out of range" in all_logs_content.lower()
+                                                has_batches_ref = "batches[-1]" in all_logs_content or "generate_batches" in all_logs_content
+                                                has_multipack = "multipack" in all_logs_content.lower() or "samplers/multipack" in all_logs_content.lower() or "/multipack.py" in all_logs_content or "multipack.py" in all_logs_content
+                                                
+                                                if has_index_error and has_batches_ref and has_multipack:
+                                                    is_multipack_error = True
+                                                    terminal_output.append(f"[WARNING] Detected multipack sampler error in logs - training will likely fail soon")
+                                                    terminal_output.append(f"[ACTION] Attempting to fix config proactively...")
+                                                    st.session_state[terminal_output_key] = list(terminal_output)
+                                                    st.session_state[f"{terminal_output_key}_updated"] = datetime.now().isoformat()
+                                                    
+                                                    # Trigger the multipack fix (we'll reuse the same fix logic)
+                                                    # Import the fix code inline to avoid duplication
+                                                    try:
+                                                        # Use the same fix logic as in the "failed" branch
+                                                        terminal_output.append(f"[ACTION] Detected multipack sampler IndexError - checking if data survived filtering...")
+                                                        st.session_state[terminal_output_key] = list(terminal_output)
+                                                        st.session_state[f"{terminal_output_key}_updated"] = datetime.now().isoformat()
+                                                        
+                                                        # Check train_on_inputs and data survival, then fix
+                                                        # (This will be handled by the same code block below)
+                                                        # For now, just trigger the fix directly
+                                                        fix_multipack_remote_cmd = (
+                                                            f"cd /workspace/data && "
+                                                            f"python3 << 'PYTHON_EOF'\n"
+                                                            f"import yaml\n"
+                                                            f"import sys\n"
+                                                            f"try:\n"
+                                                            f"    with open('axolotl_config.yaml', 'r') as f:\n"
+                                                            f"        config = yaml.safe_load(f) or {{}}\n"
+                                                            f"    \n"
+                                                            f"    fixed = False\n"
+                                                            f"    \n"
+                                                            f"    # ALWAYS ensure train_on_inputs is True to maximize sample retention\n"
+                                                            f"    if not config.get('train_on_inputs', True):\n"
+                                                            f"        config['train_on_inputs'] = True\n"
+                                                            f"        fixed = True\n"
+                                                            f"        print('Set train_on_inputs=True to maximize sample retention')\n"
+                                                            f"    \n"
+                                                            f"    # Disable multipack sampler (safest fix)\n"
+                                                            f"    if config.get('sample_packing', True):\n"
+                                                            f"        config['sample_packing'] = False\n"
+                                                            f"        fixed = True\n"
+                                                            f"        print('Disabled sample_packing (multipack sampler)')\n"
+                                                            f"    \n"
+                                                            f"    if fixed:\n"
+                                                            f"        with open('axolotl_config.yaml', 'w') as f:\n"
+                                                            f"            yaml.dump(config, f, default_flow_style=False, sort_keys=False)\n"
+                                                            f"        print('Config fixed successfully for multipack sampler error')\n"
+                                                            f"    else:\n"
+                                                            f"        print('Config already adjusted')\n"
+                                                            f"except Exception as e:\n"
+                                                            f"    print(f'Error: {{e}}', file=sys.stderr)\n"
+                                                            f"    sys.exit(1)\n"
+                                                            f"PYTHON_EOF"
+                                                        )
+                                                        fix_multipack_cmd = [
+                                                            "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
+                                                            f"root@{ssh_host}",
+                                                            fix_multipack_remote_cmd
+                                                        ]
+                                                        fix_multipack_result = subprocess.run(fix_multipack_cmd, capture_output=True, text=True, timeout=30)
+                                                        if fix_multipack_result.returncode == 0 and "fixed successfully" in fix_multipack_result.stdout:
+                                                            terminal_output.append(f"[SUCCESS] Config file fixed for multipack sampler error!")
+                                                            terminal_output.append(f"[INFO] Changes: Disabled sample_packing, set train_on_inputs=True")
+                                                            terminal_output.append(f"[INFO] ⚠️ Training is still running but will likely fail. Stop training and restart with 'Redo Phase' to use the fixed config.")
+                                                            st.session_state[terminal_output_key] = list(terminal_output)
+                                                            st.session_state[f"{terminal_output_key}_updated"] = datetime.now().isoformat()
+                                                        elif fix_multipack_result.returncode == 0:
+                                                            terminal_output.append(f"[INFO] Config check completed: {fix_multipack_result.stdout.strip()}")
+                                                            st.session_state[terminal_output_key] = list(terminal_output)
+                                                            st.session_state[f"{terminal_output_key}_updated"] = datetime.now().isoformat()
+                                                        else:
+                                                            error_msg = fix_multipack_result.stderr or fix_multipack_result.stdout
+                                                            terminal_output.append(f"[WARNING] Could not fix config: {error_msg[:200]}")
+                                                            st.session_state[terminal_output_key] = list(terminal_output)
+                                                            st.session_state[f"{terminal_output_key}_updated"] = datetime.now().isoformat()
+                                                    except Exception as e:
+                                                        terminal_output.append(f"[WARNING] Error attempting to fix config: {str(e)}")
+                                                        st.session_state[terminal_output_key] = list(terminal_output)
+                                                        st.session_state[f"{terminal_output_key}_updated"] = datetime.now().isoformat()
                                     elif status_val == "failed":
                                         terminal_output.append(f"[ERROR] Training failed!")
                                         failure_reason = training_status.get("failure_reason", "Unknown error")
@@ -3631,22 +5464,43 @@ def render():
                                                     f"    with open('axolotl_config.yaml', 'r') as f:\n"
                                                     f"        config = yaml.safe_load(f) or {{}}\n"
                                                     f"    \n"
-                                                    f"    # Remove adapter field if it's set to a string (not a valid path)\n"
-                                                    f"    # For new LoRA training, adapter should not be set - lora_* parameters are enough\n"
+                                                    f"    fixed = False\n"
+                                                    f"    \n"
+                                                    f"    # Handle adapter field: Always remove adapter: 'lora' as it causes path interpretation issues\n"
+                                                    f"    # Axolotl will infer LoRA mode from lora_* parameters\n"
                                                     f"    if 'adapter' in config:\n"
                                                     f"        adapter_val = config['adapter']\n"
                                                     f"        # If adapter is set to a string (not a path), remove it\n"
                                                     f"        if isinstance(adapter_val, str) and adapter_val != 'lora' and not adapter_val.startswith('/'):\n"
                                                     f"            del config['adapter']\n"
+                                                    f"            fixed = True\n"
                                                     f"            print('Removed invalid adapter field')\n"
                                                     f"        elif adapter_val == 'lora':\n"
-                                                    f"            # 'lora' as string is interpreted as path - remove it\n"
+                                                    f"            # Always remove adapter: 'lora' - Axolotl will infer from lora_* parameters\n"
                                                     f"            del config['adapter']\n"
+                                                    f"            fixed = True\n"
                                                     f"            print('Removed adapter: lora (lora_* parameters are sufficient)')\n"
                                                     f"    \n"
-                                                    f"    with open('axolotl_config.yaml', 'w') as f:\n"
-                                                    f"        yaml.dump(config, f, default_flow_style=False, sort_keys=False)\n"
-                                                    f"    print('Config fixed successfully')\n"
+                                                    f"    # CRITICAL: Remove lora_model_dir if it's set to output_dir (causes Axolotl to try loading from there)\n"
+                                                    f"    # lora_model_dir should only be set to a valid adapter path (for incremental training)\n"
+                                                    f"    output_dir = config.get('output_dir', '')\n"
+                                                    f"    lora_model_dir = config.get('lora_model_dir', '')\n"
+                                                    f"    adapter_val = config.get('adapter', '')\n"
+                                                    f"    \n"
+                                                    f"    # If lora_model_dir is set to output_dir, always remove it (unless there's a valid adapter path)\n"
+                                                    f"    if lora_model_dir == output_dir:\n"
+                                                    f"        # Only keep it if adapter is set to a valid path (incremental training)\n"
+                                                    f"        if not adapter_val or not isinstance(adapter_val, str) or not adapter_val.startswith('/'):\n"
+                                                    f"            del config['lora_model_dir']\n"
+                                                    f"            fixed = True\n"
+                                                    f"            print('Removed lora_model_dir (was pointing to output_dir - causes adapter loading errors)')\n"
+                                                    f"    \n"
+                                                    f"    if fixed:\n"
+                                                    f"        with open('axolotl_config.yaml', 'w') as f:\n"
+                                                    f"            yaml.dump(config, f, default_flow_style=False, sort_keys=False)\n"
+                                                    f"        print('Config fixed successfully')\n"
+                                                    f"    else:\n"
+                                                    f"        print('Config already correct')\n"
                                                     f"except Exception as e:\n"
                                                     f"    print(f'Error: {{e}}', file=sys.stderr)\n"
                                                     f"    sys.exit(1)\n"
@@ -3870,6 +5724,274 @@ def render():
                                                     terminal_output.append(f"[WARNING] Could not fix config: {error_msg[:200]}")
                                             except Exception as e:
                                                 terminal_output.append(f"[WARNING] Error attempting to fix config: {str(e)}")
+                                        
+                                        # Check if it's a multipack sampler IndexError (batch configuration issue)
+                                        # Check for IndexError with multipack sampler (can be in file path or error message)
+                                        # Make the condition more lenient - check if it's an IndexError with batches reference
+                                        # First check in all_logs_content (has more context including file paths)
+                                        is_multipack_error = False
+                                        if all_logs_content:
+                                            has_index_error = "IndexError" in all_logs_content or "list index out of range" in all_logs_content.lower()
+                                            has_batches_ref = "batches[-1]" in all_logs_content or "generate_batches" in all_logs_content
+                                            has_multipack = "multipack" in all_logs_content.lower() or "samplers/multipack" in all_logs_content.lower() or "/multipack.py" in all_logs_content or "multipack.py" in all_logs_content
+                                            
+                                            if has_index_error and has_batches_ref and has_multipack:
+                                                is_multipack_error = True
+                                                terminal_output.append(f"[DEBUG] Detected multipack error in all_logs_content")
+                                        
+                                        # Also check in training_error (extracted error)
+                                        if not is_multipack_error and training_error:
+                                            has_index_error = "IndexError" in training_error or "list index out of range" in training_error.lower()
+                                            has_batches_ref = "batches[-1]" in training_error or "generate_batches" in training_error
+                                            has_multipack = "multipack" in training_error.lower() or "samplers/multipack" in training_error.lower() or "/multipack.py" in training_error or "multipack.py" in training_error
+                                            
+                                            if has_index_error and has_batches_ref and has_multipack:
+                                                is_multipack_error = True
+                                                terminal_output.append(f"[DEBUG] Detected multipack error in training_error")
+                                        
+                                        if is_multipack_error:
+                                            terminal_output.append(f"[ACTION] Detected multipack sampler IndexError - checking if data survived filtering...")
+                                            st.session_state[terminal_output_key] = terminal_output  # Save immediately so user sees the message
+                                            
+                                            # First, check if train_on_inputs is set correctly (this is critical for sample retention)
+                                            check_train_on_inputs_cmd = [
+                                                "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
+                                                f"root@{ssh_host}",
+                                                "cd /workspace/data && python3 << 'PYTHON_EOF'\n"
+                                                "import yaml\n"
+                                                "try:\n"
+                                                "    with open('axolotl_config.yaml', 'r') as f:\n"
+                                                "        config = yaml.safe_load(f) or {}\n"
+                                                "    train_on_inputs = config.get('train_on_inputs', None)\n"
+                                                "    print(f'{train_on_inputs}')\n"
+                                                "except Exception as e:\n"
+                                                "    print(f'error: {e}')\n"
+                                                "PYTHON_EOF"
+                                            ]
+                                            train_on_inputs_set = None
+                                            try:
+                                                train_on_inputs_result = subprocess.run(check_train_on_inputs_cmd, capture_output=True, text=True, timeout=10)
+                                                if train_on_inputs_result.returncode == 0:
+                                                    output = train_on_inputs_result.stdout.strip()
+                                                    if output == "True":
+                                                        train_on_inputs_set = True
+                                                        terminal_output.append(f"[DIAGNOSTIC] ✓ train_on_inputs is set to True (maximizes sample retention)")
+                                                    elif output == "False":
+                                                        train_on_inputs_set = False
+                                                        terminal_output.append(f"[DIAGNOSTIC] ✗ WARNING: train_on_inputs is False - this may cause samples to be dropped!")
+                                                        terminal_output.append(f"[DIAGNOSTIC]   Setting train_on_inputs=True is critical to prevent filtering out samples.")
+                                                    elif output == "None":
+                                                        train_on_inputs_set = None
+                                                        terminal_output.append(f"[DIAGNOSTIC] ⚠ train_on_inputs is not set in config - will be set to True")
+                                                    else:
+                                                        terminal_output.append(f"[DIAGNOSTIC] Could not determine train_on_inputs setting: {output}")
+                                            except Exception as e:
+                                                        terminal_output.append(f"[DIAGNOSTIC] Could not check train_on_inputs setting: {str(e)}")
+                                            st.session_state[terminal_output_key] = terminal_output  # Save after train_on_inputs check
+                                            
+                                            # Initialize variables for data survival check
+                                            data_survived = None  # None = unknown, True = yes, False = no
+                                            survived_count = 0
+                                            
+                                            # First, check if data actually survived filtering
+                                            check_survived_cmd = [
+                                                "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
+                                                f"root@{ssh_host}",
+                                                "python3 << 'PYTHON_EOF'\n"
+                                                "import os\n"
+                                                "import json\n"
+                                                "# Check multiple possible locations for prepared dataset\n"
+                                                "locations = [\n"
+                                                "    '/workspace/axolotl/prepared_data/train.jsonl',\n"
+                                                "    '/workspace/data/prepared_data/train.jsonl',\n"
+                                                "    '/workspace/output/prepared_data/train.jsonl',\n"
+                                                "    '/workspace/axolotl/data/train.jsonl',\n"
+                                                "]\n"
+                                                "count = 0\n"
+                                                "found_path = None\n"
+                                                "for path in locations:\n"
+                                                "    if os.path.exists(path):\n"
+                                                "        found_path = path\n"
+                                                "        with open(path, 'r') as f:\n"
+                                                "            count = sum(1 for line in f if line.strip())\n"
+                                                "        break\n"
+                                                "# Also try to find any train.jsonl file\n"
+                                                "if count == 0:\n"
+                                                "    import subprocess\n"
+                                                "    result = subprocess.run(['find', '/workspace', '-name', 'train.jsonl', '-type', 'f', '2>/dev/null'], capture_output=True, text=True, timeout=5)\n"
+                                                "    if result.returncode == 0 and result.stdout.strip():\n"
+                                                "        found_path = result.stdout.strip().split('\\n')[0]\n"
+                                                "        with open(found_path, 'r') as f:\n"
+                                                "            count = sum(1 for line in f if line.strip())\n"
+                                                "print(f'{count}|{found_path or \"not_found\"}')\n"
+                                                "PYTHON_EOF"
+                                            ]
+                                            try:
+                                                survived_result = subprocess.run(check_survived_cmd, capture_output=True, text=True, timeout=15)
+                                                if survived_result.returncode == 0 and '|' in survived_result.stdout:
+                                                    parts = survived_result.stdout.strip().split('|')
+                                                    if len(parts) == 2:
+                                                        survived_count = int(parts[0]) if parts[0].isdigit() else 0
+                                                        dataset_path = parts[1] if parts[1] != 'not_found' else None
+                                                        data_survived = survived_count > 0
+                                                        
+                                                        if survived_count > 0:
+                                                            terminal_output.append(f"[DIAGNOSTIC] ✓ Data survived filtering: {survived_count} samples found in prepared dataset")
+                                                            if dataset_path:
+                                                                terminal_output.append(f"[DIAGNOSTIC]   Dataset location: {dataset_path}")
+                                                            terminal_output.append(f"[DIAGNOSTIC] The error is likely a batch configuration issue, not data filtering.")
+                                                            terminal_output.append(f"[DIAGNOSTIC] The multipack sampler cannot create batches with current batch_size/sequence_len settings.")
+                                                        else:
+                                                            terminal_output.append(f"[DIAGNOSTIC] ✗ WARNING: No data survived filtering!")
+                                                            terminal_output.append(f"[DIAGNOSTIC] The prepared dataset is empty or not found.")
+                                                            terminal_output.append(f"[DIAGNOSTIC] This means all {training_stats.get('original_count', 'original')} samples were filtered out.")
+                                                            terminal_output.append(f"[DIAGNOSTIC] Possible causes:")
+                                                            terminal_output.append(f"[DIAGNOSTIC]   - All sequences are too long for sequence_len setting")
+                                                            terminal_output.append(f"[DIAGNOSTIC]   - All samples have zero trainable tokens (check train_on_inputs setting)")
+                                                            terminal_output.append(f"[DIAGNOSTIC]   - Dataset format issues")
+                                            except Exception as e:
+                                                terminal_output.append(f"[DIAGNOSTIC] Could not check if data survived: {str(e)}")
+                                                data_survived = None  # Unknown
+                                            st.session_state[terminal_output_key] = terminal_output  # Save after data survival check
+                                            
+                                            terminal_output.append(f"[ACTION] Attempting to fix config by adjusting batch configuration...")
+                                            st.session_state[terminal_output_key] = terminal_output  # Save before fix attempt
+                                            if data_survived is False:
+                                                terminal_output.append(f"[INFO] Since no data survived, will try to fix filtering settings (increase sequence_len, enable train_on_inputs).")
+                                            elif data_survived is True:
+                                                terminal_output.append(f"[INFO] Data survived filtering - will fix batch configuration (disable sample_packing, adjust batch size).")
+                                            else:
+                                                terminal_output.append(f"[INFO] Could not determine if data survived - will try both batch config and filtering fixes.")
+                                            try:
+                                                
+                                                fix_multipack_remote_cmd = (
+                                                    f"cd /workspace/data && "
+                                                    f"python3 << 'PYTHON_EOF'\n"
+                                                    f"import yaml\n"
+                                                    f"import sys\n"
+                                                    f"try:\n"
+                                                    f"    with open('axolotl_config.yaml', 'r') as f:\n"
+                                                    f"        config = yaml.safe_load(f) or {{}}\n"
+                                                    f"    \n"
+                                                    f"    fixed = False\n"
+                                                    f"    \n"
+                                                    f"    # ALWAYS ensure train_on_inputs is True to maximize sample retention\n"
+                                                    f"    # This is critical - prevents dropping samples where input has no trainable tokens\n"
+                                                    f"    if not config.get('train_on_inputs', True):\n"
+                                                    f"        config['train_on_inputs'] = True\n"
+                                                    f"        fixed = True\n"
+                                                    f"        print('Set train_on_inputs=True to maximize sample retention')\n"
+                                                )
+                                                
+                                                # If no data survived (or unknown), try to fix filtering issues
+                                                if data_survived is False:
+                                                    fix_multipack_remote_cmd += (
+                                                        f"    \n"
+                                                        f"    # No data survived - fix filtering issues\n"
+                                                        f"    # Option 1: Increase sequence length to retain more samples\n"
+                                                        f"    current_seq_len = config.get('sequence_len', 2048)\n"
+                                                        f"    if current_seq_len < 4096:\n"
+                                                        f"        config['sequence_len'] = 4096\n"
+                                                        f"        fixed = True\n"
+                                                        f"        print(f'Increased sequence_len from {{current_seq_len}} to 4096 to retain more samples')\n"
+                                                        f"    \n"
+                                                        f"    # Option 2: Disable sample packing for small/empty datasets\n"
+                                                        f"    if config.get('sample_packing', True):\n"
+                                                        f"        config['sample_packing'] = False\n"
+                                                        f"        fixed = True\n"
+                                                        f"        print('Disabled sample_packing (no data survived filtering)')\n"
+                                                    )
+                                                elif data_survived is True:
+                                                    # Data survived - fix batch configuration
+                                                    fix_multipack_remote_cmd += (
+                                                        f"    \n"
+                                                        f"    # Data survived - fix batch configuration\n"
+                                                        f"    # Option 1: Disable multipack sampler (safest fix)\n"
+                                                        f"    if config.get('sample_packing', True):\n"
+                                                        f"        config['sample_packing'] = False\n"
+                                                        f"        fixed = True\n"
+                                                        f"        print('Disabled sample_packing (multipack sampler)')\n"
+                                                        f"    \n"
+                                                        f"    # Option 2: Reduce batch size if it's too large\n"
+                                                        f"    current_batch = config.get('micro_batch_size', 4)\n"
+                                                        f"    if current_batch > 2:\n"
+                                                        f"        config['micro_batch_size'] = 2\n"
+                                                        f"        # Increase gradient accumulation to maintain effective batch size\n"
+                                                        f"        current_grad_accum = config.get('gradient_accumulation_steps', 4)\n"
+                                                        f"        config['gradient_accumulation_steps'] = current_grad_accum * 2\n"
+                                                        f"        fixed = True\n"
+                                                        f"        print(f'Reduced micro_batch_size from {{current_batch}} to 2, increased gradient_accumulation_steps to {{config[\"gradient_accumulation_steps\"]}}')\n"
+                                                        f"    \n"
+                                                        f"    # Option 3: Reduce sequence length if it's very long\n"
+                                                        f"    current_seq_len = config.get('sequence_len', 2048)\n"
+                                                        f"    if current_seq_len > 2048:\n"
+                                                        f"        config['sequence_len'] = 2048\n"
+                                                        f"        fixed = True\n"
+                                                        f"        print(f'Reduced sequence_len from {{current_seq_len}} to 2048')\n"
+                                                    )
+                                                else:
+                                                    # Unknown if data survived - try both fixes
+                                                    fix_multipack_remote_cmd += (
+                                                        f"    \n"
+                                                        f"    # Unknown if data survived - try both fixes\n"
+                                                        f"    # Disable multipack sampler (safest fix for batch issues)\n"
+                                                        f"    if config.get('sample_packing', True):\n"
+                                                        f"        config['sample_packing'] = False\n"
+                                                        f"        fixed = True\n"
+                                                        f"        print('Disabled sample_packing (multipack sampler)')\n"
+                                                        f"    \n"
+                                                        f"    # Increase sequence length if it's small (to retain more samples)\n"
+                                                        f"    current_seq_len = config.get('sequence_len', 2048)\n"
+                                                        f"    if current_seq_len < 4096:\n"
+                                                        f"        config['sequence_len'] = 4096\n"
+                                                        f"        fixed = True\n"
+                                                        f"        print(f'Increased sequence_len from {{current_seq_len}} to 4096 to retain more samples')\n"
+                                                    )
+                                                
+                                                fix_multipack_remote_cmd += (
+                                                    f"    \n"
+                                                    f"    if fixed:\n"
+                                                    f"        with open('axolotl_config.yaml', 'w') as f:\n"
+                                                    f"            yaml.dump(config, f, default_flow_style=False, sort_keys=False)\n"
+                                                    f"        print('Config fixed successfully for multipack sampler error')\n"
+                                                    f"    else:\n"
+                                                    f"        print('Config already adjusted')\n"
+                                                    f"except Exception as e:\n"
+                                                    f"    print(f'Error: {{e}}', file=sys.stderr)\n"
+                                                    f"    sys.exit(1)\n"
+                                                    f"PYTHON_EOF"
+                                                )
+                                                fix_multipack_cmd = [
+                                                    "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
+                                                    f"root@{ssh_host}",
+                                                    fix_multipack_remote_cmd
+                                                ]
+                                                fix_multipack_result = subprocess.run(fix_multipack_cmd, capture_output=True, text=True, timeout=30)
+                                                if fix_multipack_result.returncode == 0 and "fixed successfully" in fix_multipack_result.stdout:
+                                                    terminal_output.append(f"[SUCCESS] Config file fixed for multipack sampler error!")
+                                                    terminal_output.append(f"[INFO] Changes made:")
+                                                    terminal_output.append(f"[INFO]   • Set train_on_inputs=True (ensures all samples survive filtering)")
+                                                    if data_survived is False:
+                                                        terminal_output.append(f"[INFO]   • Increased sequence_len to 4096 (to retain more samples)")
+                                                        terminal_output.append(f"[INFO]   • Disabled sample_packing (no data survived)")
+                                                    elif data_survived is True:
+                                                        terminal_output.append(f"[INFO]   • Disabled sample_packing (multipack sampler issue)")
+                                                        terminal_output.append(f"[INFO]   • Adjusted batch size if needed")
+                                                    else:
+                                                        terminal_output.append(f"[INFO]   • Disabled sample_packing")
+                                                        terminal_output.append(f"[INFO]   • Adjusted sequence_len and batch settings")
+                                                    terminal_output.append(f"[INFO] You can now click 'Redo Phase' to restart training with the corrected config.")
+                                                    st.session_state[terminal_output_key] = terminal_output
+                                                elif fix_multipack_result.returncode == 0:
+                                                    terminal_output.append(f"[INFO] Config check completed: {fix_multipack_result.stdout.strip()}")
+                                                    st.session_state[terminal_output_key] = terminal_output
+                                                else:
+                                                    error_msg = fix_multipack_result.stderr or fix_multipack_result.stdout
+                                                    terminal_output.append(f"[WARNING] Could not fix config: {error_msg[:200]}")
+                                                    st.session_state[terminal_output_key] = terminal_output
+                                            except Exception as e:
+                                                terminal_output.append(f"[WARNING] Error attempting to fix config: {str(e)}")
+                                                st.session_state[terminal_output_key] = terminal_output
                                         else:
                                             # Final else for the training_error and ssh_host check (no fixable errors or no SSH)
                                             if training_error:
@@ -3885,95 +6007,364 @@ def render():
                                         terminal_output.append(f"[INFO] Training status unclear.")
                                         terminal_output.append(f"[INFO] Press 'Check Training Status' button again to refresh.")
                                     
-                                    st.session_state[terminal_output_key] = terminal_output
+                                    # Always save and rerun at the end to ensure terminal updates
+                                    # CRITICAL: Save terminal output IMMEDIATELY before any final operations
+                                    st.session_state[terminal_output_key] = list(terminal_output)  # Save current state first
+                                    st.session_state[f"{terminal_output_key}_updated"] = datetime.now().isoformat()
+                                    
+                                    terminal_output.append(f"[{datetime.now().strftime('%H:%M:%S')}] Status check complete.")
+                                    
+                                    # If status is completed and there are more jobs, add a note about auto-transition
+                                    if status_val == "completed":
+                                        job_queue = active_job.get("job_queue")
+                                        current_job_index = active_job.get("current_job_index")
+                                        if job_queue and current_job_index is not None and current_job_index + 1 < len(job_queue):
+                                            terminal_output.append(f"[INFO] Queue transition will happen automatically on next status check.")
+                                            terminal_output.append(f"[INFO] The next job will start automatically when you click 'Check Training Status' again.")
+                                    
+                                    # CRITICAL: Save terminal output before rerun - ensure it's a fresh list
+                                    # Create a fresh copy to avoid any reference issues - this ensures Streamlit detects the change
+                                    final_output = [line for line in terminal_output]  # List comprehension creates new list
+                                    st.session_state[terminal_output_key] = final_output  # Save to session state
+                                    # Force Streamlit to recognize the change by updating a timestamp AND version counter
+                                    st.session_state[f"{terminal_output_key}_updated"] = datetime.now().isoformat()
+                                    # Increment version counter to force re-render
+                                    current_version = st.session_state.get(f"{terminal_output_key}_version", 0)
+                                    st.session_state[f"{terminal_output_key}_version"] = current_version + 1
+                                    
+                                    # Debug: Verify save (only if debug is enabled)
+                                    if st.session_state.get("debug_terminal", False):
+                                        saved_length = len(st.session_state.get(terminal_output_key, []))
+                                        terminal_output.append(f"[DEBUG] Terminal saved: {saved_length} lines, key: {terminal_output_key}")
+                                        st.session_state[terminal_output_key] = list(terminal_output)
+                                        st.session_state[f"{terminal_output_key}_updated"] = datetime.now().isoformat()
+                                    
+                                    # CRITICAL: Use st.rerun() to force Streamlit to re-execute the entire script
+                                    # This will cause the terminal display (line ~2695) to re-read from session_state
+                                    # and show all the updates we just saved
                                     st.rerun()
-                                except Exception as e:
-                                    error_msg = str(e)
-                                    terminal_output.append(f"[ERROR] {error_msg}")
-                                    st.session_state[terminal_output_key] = terminal_output
-                                    st.error(f"Error: {error_msg}")
+                            except Exception as e:
+                                import traceback
+                                error_msg = str(e)
+                                error_traceback = traceback.format_exc()
+                                # Ensure terminal_output is initialized
+                                if terminal_output_key not in st.session_state:
+                                    st.session_state[terminal_output_key] = []
+                                terminal_output = list(st.session_state[terminal_output_key])
+                                terminal_output.append(f"[ERROR] {error_msg}")
+                                terminal_output.append(f"[ERROR] Traceback: {error_traceback[:500]}")
+                                st.session_state[terminal_output_key] = terminal_output
+                                st.error(f"Error: {error_msg}")
+                                # Ensure we rerun to show error
+                                st.rerun()
                     
-                    with col2:
+                    with col3:
                         if st.button("🗑️ Clear Terminal", key="clear_terminal_phase3", help="Clear terminal output"):
                             st.session_state[terminal_output_key] = []
                             st.rerun()
                     
+                    with col4:
+                        # Force advance button - only show if there's a queue or if we're on the last job
+                        job_queue = active_job.get("job_queue")
+                        current_job_index = active_job.get("current_job_index")
+                        has_more_jobs = job_queue and current_job_index is not None and current_job_index + 1 < len(job_queue)
+                        is_last_job = job_queue and current_job_index is not None and current_job_index + 1 >= len(job_queue)
+                        
+                        if has_more_jobs or is_last_job:
+                            # Use active_job.get directly to avoid UnboundLocalError
+                            force_advance_confirm_key = f"force_advance_confirm_{active_job.get('instance_id', 'unknown')}"
+                            
+                            if st.session_state.get(force_advance_confirm_key, False):
+                                st.warning("⚠️ **Force Advance Confirmation**")
+                                st.markdown("""
+                                **Only use this if:**
+                                - The training log shows the job has completed
+                                - The program isn't advancing automatically
+                                - You've verified the training process has stopped
+                                
+                                **This will:**
+                                - Force transition to the next job (if available), OR
+                                - Force advance to Finalize phase (if this is the last job)
+                                """)
+                                
+                                col_confirm1, col_confirm2 = st.columns(2)
+                                with col_confirm1:
+                                    if st.button("✅ Confirm Force Advance", key="confirm_force_advance", type="primary"):
+                                        try:
+                                            terminal_output.append(f"[{datetime.now().strftime('%H:%M:%S')}] ⚡ FORCE ADVANCE triggered by user")
+                                            
+                                            if has_more_jobs:
+                                                terminal_output.append(f"[FORCE] Forcing queue transition from job {current_job_index + 1} to job {current_job_index + 2}...")
+                                                terminal_output.append(f"[FORCE] WARNING: This bypasses normal completion checks. Ensure job {current_job_index + 1} is actually complete!")
+                                                st.session_state[terminal_output_key] = terminal_output
+                                                
+                                                # Manually set status to completed to trigger queue transition
+                                                # We'll reuse the queue transition logic from the status check
+                                                active_job["training_status"] = {"status": "completed", "forced": True}
+                                                training_manager._save_job(active_job)
+                                                
+                                                # Trigger a status check which will detect "completed" and run queue transition
+                                                st.session_state["trigger_status_check"] = True
+                                                st.session_state[force_advance_confirm_key] = False
+                                                st.rerun()
+                                            elif is_last_job:
+                                                terminal_output.append(f"[FORCE] Forcing advance to Finalize phase...")
+                                                terminal_output.append(f"[FORCE] WARNING: This bypasses normal completion checks. Ensure training is actually complete!")
+                                                st.session_state[terminal_output_key] = terminal_output
+                                                
+                                                # Advance to Phase 4
+                                                st.session_state[phase_key] = 4
+                                                st.session_state[terminal_output_key] = []
+                                                st.session_state[force_advance_confirm_key] = False
+                                                st.rerun()
+                                        except Exception as e:
+                                            terminal_output.append(f"[ERROR] Force advance failed: {str(e)}")
+                                            st.session_state[terminal_output_key] = terminal_output
+                                            st.error(f"Error: {str(e)}")
+                                            st.session_state[force_advance_confirm_key] = False
+                                
+                                with col_confirm2:
+                                    if st.button("❌ Cancel", key="cancel_force_advance"):
+                                        st.session_state[force_advance_confirm_key] = False
+                                        st.rerun()
+                            else:
+                                if has_more_jobs:
+                                    if st.button("⚡ Force Next Job", key="force_advance_button", type="secondary", help="Force advance to next job (use only if log shows completion but program isn't advancing)"):
+                                        st.session_state[force_advance_confirm_key] = True
+                                        st.rerun()
+                                elif is_last_job:
+                                    if st.button("⚡ Force Finalize", key="force_finalize_button", type="secondary", help="Force advance to Finalize phase (use only if log shows completion but program isn't advancing)"):
+                                        st.session_state[force_advance_confirm_key] = True
+                                        st.rerun()
+                    
                     with col3:
-                        if st.button("🔄 Redo Phase", key="redo_phase_3", type="secondary"):
-                            try:
-                                instance_id = active_job.get("instance_id")
-                                
-                                # Clear terminal output
-                                terminal_output = []
-                                terminal_output.append(f"[{datetime.now().strftime('%H:%M:%S')}] Redoing Phase 3 - killing processes and cleaning up...")
-                                
-                                # Get SSH info - prefer saved SSH details from job over API
-                                ssh_host = active_job.get("ssh_host")
-                                ssh_port = active_job.get("ssh_port", 22)
-                                
-                                # If not in job, get from API
-                                if not ssh_host:
-                                    job_status = training_manager.get_job_status(instance_id)
-                                    ssh_host = job_status.get("ssh_host")
-                                    ssh_port = job_status.get("ssh_port", 22)
-                                    # Save to job for future use
-                                    if ssh_host:
-                                        active_job["ssh_host"] = ssh_host
-                                        active_job["ssh_port"] = ssh_port
-                                        training_manager._save_job(active_job)
-                                
-                                if ssh_host:
-                                    terminal_output.append(f"[SSH] Connecting to {ssh_host}:{ssh_port}")
-                                    import subprocess
+                        confirm_key_phase3 = f"confirm_redo_phase_3_{active_job.get('instance_id')}"
+                        if confirm_key_phase3 not in st.session_state:
+                            st.session_state[confirm_key_phase3] = False
+                        
+                        if st.session_state[confirm_key_phase3]:
+                            if st.button("✅ Confirm Redo Phase 3", key="confirm_redo_phase_3_btn", type="primary"):
+                                try:
+                                    instance_id = active_job.get("instance_id")
                                     
-                                    # Step 1: Kill all training-related processes
-                                    terminal_output.append(f"[SSH] Killing training processes...")
-                                    # Build kill command as a single string for SSH
-                                    kill_command = (
-                                        "pkill -9 -f accelerate || true; "
-                                        "pkill -9 -f axolotl || true; "
-                                        "ps aux | grep -E 'python.*train|python.*axolotl|python.*accelerate' | grep -v grep | awk '{print $2}' | xargs -r kill -9 || true; "
-                                        "ps aux | grep '/workspace/axolotl' | grep -v grep | awk '{print $2}' | xargs -r kill -9 || true; "
-                                        "sleep 2; "
-                                        "remaining=$(ps aux | grep -E 'accelerate|axolotl|train' | grep -v grep | wc -l); "
-                                        "echo 'Processes killed. Remaining training processes: '$remaining"
-                                    )
-                                    kill_cmd = [
-                                        "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
-                                        f"root@{ssh_host}",
-                                        kill_command
-                                    ]
-                                    kill_result = subprocess.run(kill_cmd, capture_output=True, text=True, timeout=30)
-                                    stdout_filtered = filter_malloc_warnings(kill_result.stdout)
-                                    stderr_filtered = filter_malloc_warnings(kill_result.stderr)
-                                    if kill_result.returncode == 0:
-                                        terminal_output.append(f"[SSH] Training processes killed successfully")
-                                        if stdout_filtered.strip():
-                                            terminal_output.append(f"[SSH] {stdout_filtered}")
+                                    # Clear terminal output
+                                    st.session_state[terminal_output_key] = []
+                                    terminal_output = []
+                                    terminal_output.append(f"[{datetime.now().strftime('%H:%M:%S')}] Redoing Phase 3 - killing processes and cleaning up...")
+                                    
+                                    # Get SSH info - check for port override first
+                                    ssh_host = active_job.get("ssh_host")
+                                    ssh_port_override = active_job.get("ssh_port_override")
+                                    
+                                    # Use port override if provided, otherwise use saved port
+                                    if ssh_port_override:
+                                        ssh_port = ssh_port_override
+                                        terminal_output.append(f"[INFO] Using SSH port override: {ssh_port}")
                                     else:
-                                        terminal_output.append(f"[WARNING] Some processes may still be running")
-                                        if stderr_filtered.strip():
-                                            terminal_output.append(f"[SSH] {stderr_filtered[:200]}")
+                                        ssh_port = active_job.get("ssh_port", 22)
                                     
-                                    # Step 2: Delete artifacts in output directory
-                                    terminal_output.append(f"[SSH] Deleting artifacts in output directory...")
+                                    # If not in job, get from API
+                                    if not ssh_host:
+                                        job_status = training_manager.get_job_status(instance_id)
+                                        ssh_host = job_status.get("ssh_host")
+                                        api_ssh_port = job_status.get("ssh_port", 22)
+                                        
+                                        # Use port override if provided, otherwise use API port
+                                        if ssh_port_override:
+                                            ssh_port = ssh_port_override
+                                            terminal_output.append(f"[INFO] Using SSH port override: {ssh_port} (instead of API port: {api_ssh_port})")
+                                        else:
+                                            ssh_port = api_ssh_port
+                                        
+                                        # Save to job for future use
+                                        if ssh_host:
+                                            active_job["ssh_host"] = ssh_host
+                                            active_job["ssh_port"] = ssh_port
+                                            training_manager._save_job(active_job)
+                                    
+                                    if ssh_host:
+                                        terminal_output.append(f"[SSH] Connecting to {ssh_host}:{ssh_port}")
+                                        import subprocess
+                                        
+                                        # Step 1: Kill all training-related processes
+                                        terminal_output.append(f"[SSH] Killing all training processes...")
+                                        processes_killed = kill_all_training_processes(ssh_host, ssh_port, terminal_output)
+                                        
+                                        # CRITICAL: Do not proceed if processes are still running
+                                        if not processes_killed:
+                                            terminal_output.append(f"[ERROR] ⚠️ CRITICAL: Training processes are still running!")
+                                            terminal_output.append(f"[ERROR] Cannot start new training while old processes are active.")
+                                            terminal_output.append(f"[ERROR] Please wait a moment and try 'Redo Phase' again, or manually kill processes via SSH.")
+                                            st.session_state[terminal_output_key] = terminal_output
+                                            st.error("❌ Cannot proceed: Training processes are still running. Please try 'Redo Phase' again.")
+                                            st.stop()
+                                        else:
+                                            terminal_output.append(f"[SSH] ✓ All processes confirmed killed - safe to proceed")
+                                    
+                                    # Step 2: Forcefully delete output directories and recreate them
+                                    terminal_output.append(f"[SSH] Forcefully deleting output directories...")
                                     cleanup_cmd = [
                                         "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
                                         f"root@{ssh_host}",
-                                        "rm -rf /workspace/output/training/* && echo 'Artifacts deleted'"
+                                        "echo 'Deleting output directory...' && rm -rf /workspace/output 2>&1 && echo 'Output directory deleted' && mkdir -p /workspace/output/training && echo 'Directories recreated' && ls -la /workspace/output/ 2>&1 && echo 'Output directories forcefully deleted and recreated'"
                                     ]
                                     cleanup_result = subprocess.run(cleanup_cmd, capture_output=True, text=True, timeout=30)
                                     if cleanup_result.returncode == 0:
-                                        terminal_output.append(f"[SSH] Output directory cleaned successfully")
+                                        terminal_output.append(f"[SSH] ✓ Output directories forcefully deleted and recreated")
                                         stdout_filtered = filter_malloc_warnings(cleanup_result.stdout)
                                         if stdout_filtered.strip():
-                                            terminal_output.append(f"[SSH] {stdout_filtered}")
+                                            for line in stdout_filtered.strip().split("\n"):
+                                                if line.strip() and "forcefully" not in line.lower() and "Deleting" not in line:
+                                                    terminal_output.append(f"[SSH]   {line}")
                                     else:
                                         stderr_filtered = filter_malloc_warnings(cleanup_result.stderr)
-                                        terminal_output.append(f"[WARNING] Cleanup may have failed: {stderr_filtered[:200]}")
+                                        stdout_filtered = filter_malloc_warnings(cleanup_result.stdout)
+                                        terminal_output.append(f"[ERROR] Cleanup command failed (return code: {cleanup_result.returncode})")
+                                        if stderr_filtered.strip():
+                                            terminal_output.append(f"[ERROR] stderr: {stderr_filtered[:300]}")
+                                        if stdout_filtered.strip():
+                                            terminal_output.append(f"[ERROR] stdout: {stdout_filtered[:300]}")
+                                        # Try to verify if deletion actually happened despite error
+                                        verify_cmd = [
+                                            "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
+                                            f"root@{ssh_host}",
+                                            "if [ -d /workspace/output ]; then echo 'DIRECTORY_EXISTS' && ls -la /workspace/output/; else echo 'DIRECTORY_DELETED'; fi"
+                                        ]
+                                        verify_result = subprocess.run(verify_cmd, capture_output=True, text=True, timeout=10)
+                                        if verify_result.returncode == 0:
+                                            verify_output = verify_result.stdout.strip()
+                                            if "DIRECTORY_DELETED" in verify_output:
+                                                terminal_output.append(f"[SSH] ✓ Verification: Directory was deleted (recreation may have failed)")
+                                            else:
+                                                terminal_output.append(f"[SSH] ⚠️ Verification: Directory still exists - deletion may have failed")
+                                                terminal_output.append(f"[SSH]   {verify_output}")
                                     
-                                    # Step 2.5: Fix tokenizer type in config if it's incorrect (e.g., "Gemma" instead of "GemmaTokenizer")
-                                    terminal_output.append(f"[SSH] Checking and fixing tokenizer type in config...")
+                                    # Step 2.4: Analyze config and suggest batch size optimization
+                                    terminal_output.append(f"[SSH] Analyzing training config for optimization...")
+                                    try:
+                                        # Read current config
+                                        read_config_cmd = [
+                                            "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
+                                            f"root@{ssh_host}",
+                                            "cd /workspace/data && python3 << 'PYTHON_EOF'\n"
+                                            "import yaml\n"
+                                            "import sys\n"
+                                            "try:\n"
+                                            "    with open('axolotl_config.yaml', 'r') as f:\n"
+                                            "        config = yaml.safe_load(f) or {}\n"
+                                            "    \n"
+                                            "    # Extract key parameters\n"
+                                            "    micro_batch_size = config.get('micro_batch_size', 1)\n"
+                                            "    gradient_accumulation_steps = config.get('gradient_accumulation_steps', 1)\n"
+                                            "    num_epochs = config.get('num_epochs', 10)\n"
+                                            "    effective_batch_size = micro_batch_size * gradient_accumulation_steps\n"
+                                            "    \n"
+                                            "    print(f'CURRENT_CONFIG:')\n"
+                                            "    print(f'micro_batch_size={micro_batch_size}')\n"
+                                            "    print(f'gradient_accumulation_steps={gradient_accumulation_steps}')\n"
+                                            "    print(f'effective_batch_size={effective_batch_size}')\n"
+                                            "    print(f'num_epochs={num_epochs}')\n"
+                                            "except Exception as e:\n"
+                                            "    print(f'ERROR: {e}', file=sys.stderr)\n"
+                                            "    sys.exit(1)\n"
+                                            "PYTHON_EOF"
+                                        ]
+                                        config_read_result = subprocess.run(read_config_cmd, capture_output=True, text=True, timeout=15)
+                                        
+                                        if config_read_result.returncode == 0:
+                                            # Parse config output
+                                            current_micro_batch = 1
+                                            current_grad_accum = 1
+                                            current_epochs = 10
+                                            
+                                            for line in config_read_result.stdout.split('\n'):
+                                                if 'micro_batch_size=' in line:
+                                                    current_micro_batch = int(line.split('=')[1])
+                                                elif 'gradient_accumulation_steps=' in line:
+                                                    current_grad_accum = int(line.split('=')[1])
+                                                elif 'num_epochs=' in line:
+                                                    current_epochs = int(line.split('=')[1])
+                                            
+                                            terminal_output.append(f"[INFO] Current config:")
+                                            terminal_output.append(f"  • micro_batch_size: {current_micro_batch}")
+                                            terminal_output.append(f"  • gradient_accumulation_steps: {current_grad_accum}")
+                                            terminal_output.append(f"  • effective_batch_size: {current_micro_batch * current_grad_accum}")
+                                            terminal_output.append(f"  • num_epochs: {current_epochs}")
+                                            
+                                            # Check GPU memory to suggest optimal batch size
+                                            check_memory_cmd = [
+                                                "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
+                                                f"root@{ssh_host}",
+                                                "nvidia-smi --query-gpu=memory.total,memory.used,memory.free --format=csv,noheader,nounits 2>/dev/null | head -1"
+                                            ]
+                                            memory_result = subprocess.run(check_memory_cmd, capture_output=True, text=True, timeout=10)
+                                            
+                                            suggested_batch_size = current_micro_batch
+                                            memory_info = "Unable to check"
+                                            
+                                            if memory_result.returncode == 0 and memory_result.stdout.strip():
+                                                try:
+                                                    parts = memory_result.stdout.strip().split(',')
+                                                    if len(parts) >= 3:
+                                                        total_mb = int(parts[0].strip())
+                                                        used_mb = int(parts[1].strip())
+                                                        free_mb = int(parts[2].strip())
+                                                        total_gb = total_mb / 1024
+                                                        used_gb = used_mb / 1024
+                                                        free_gb = free_mb / 1024
+                                                        usage_percent = (used_mb / total_mb) * 100
+                                                        
+                                                        memory_info = f"Total: {total_gb:.1f} GiB, Used: {used_gb:.1f} GiB ({usage_percent:.1f}%), Free: {free_gb:.1f} GiB"
+                                                        
+                                                        # Suggest batch size based on free memory
+                                                        # Rough estimate: each batch_size increase uses ~2-4 GiB for 4B model
+                                                        if free_gb > 20 and current_micro_batch < 4:
+                                                            # Can safely increase to 4
+                                                            suggested_batch_size = min(4, current_micro_batch * 2)
+                                                        elif free_gb > 10 and current_micro_batch < 3:
+                                                            # Can increase to 3
+                                                            suggested_batch_size = min(3, current_micro_batch + 1)
+                                                        elif free_gb > 5 and current_micro_batch < 2:
+                                                            # Can increase to 2
+                                                            suggested_batch_size = 2
+                                                        
+                                                        terminal_output.append(f"[INFO] GPU Memory: {memory_info}")
+                                                        
+                                                        if suggested_batch_size > current_micro_batch:
+                                                            speedup_estimate = suggested_batch_size / current_micro_batch
+                                                            terminal_output.append(f"[OPTIMIZATION] 💡 Suggested micro_batch_size: {suggested_batch_size} (current: {current_micro_batch})")
+                                                            terminal_output.append(f"[OPTIMIZATION] Estimated speedup: ~{speedup_estimate:.1f}x faster training")
+                                                            terminal_output.append(f"[OPTIMIZATION] This will be applied when restarting training")
+                                                            
+                                                            # Store suggestion for later use
+                                                            st.session_state[f"optimize_batch_size_{instance_id}"] = suggested_batch_size
+                                                        else:
+                                                            terminal_output.append(f"[INFO] Current batch size is optimal for available memory")
+                                                except:
+                                                    pass
+                                            
+                                            terminal_output.append(f"[INFO] Memory check: {memory_info}")
+                                        else:
+                                            terminal_output.append(f"[WARNING] Could not read config: {config_read_result.stderr[:200]}")
+                                    except Exception as e:
+                                        terminal_output.append(f"[WARNING] Config analysis failed: {str(e)}")
+                                    
+                                    # Step 2.5: Fix config issues (tokenizer type, sample_packing, batch size optimization, etc.)
+                                    terminal_output.append(f"[SSH] Checking and fixing config issues...")
+                                    
+                                    # Check if we have a suggested batch size optimization
+                                    suggested_batch_size = st.session_state.get(f"optimize_batch_size_{instance_id}")
+                                    batch_size_update = ""
+                                    if suggested_batch_size:
+                                        batch_size_update = (
+                                            f"    # Optimize batch size for better performance\n"
+                                            f"    old_batch_size = config.get('micro_batch_size', 1)\n"
+                                            f"    if old_batch_size < {suggested_batch_size}:\n"
+                                            f"        config['micro_batch_size'] = {suggested_batch_size}\n"
+                                            f"        fixed = True\n"
+                                            f"        print(f'Optimized micro_batch_size: {{old_batch_size}} -> {suggested_batch_size}')\n"
+                                        )
+                                    
                                     fix_tokenizer_remote_cmd_redo = (
                                         f"cd /workspace/data && "
                                         f"python3 << 'PYTHON_EOF'\n"
@@ -3982,6 +6373,70 @@ def render():
                                         f"try:\n"
                                         f"    with open('axolotl_config.yaml', 'r') as f:\n"
                                         f"        config = yaml.safe_load(f) or {{}}\n"
+                                        f"    \n"
+                                        f"    fixed = False\n"
+                                        f"    \n"
+                                        f"    # ALWAYS disable sample_packing to prevent multipack sampler errors\n"
+                                        f"    if config.get('sample_packing', False):\n"
+                                        f"        config['sample_packing'] = False\n"
+                                        f"        fixed = True\n"
+                                        f"        print('Disabled sample_packing to prevent multipack sampler errors')\n"
+                                        f"    \n"
+                                        f"    # ALWAYS ensure train_on_inputs is True to maximize sample retention\n"
+                                        f"    if not config.get('train_on_inputs', True):\n"
+                                        f"        config['train_on_inputs'] = True\n"
+                                        f"        fixed = True\n"
+                                        f"        print('Set train_on_inputs=True to maximize sample retention')\n"
+                                        f"    \n"
+                                        f"    # Fix adapter/lora_model_dir issue: Remove adapter if set to 'lora' or null\n"
+                                        f"    # Remove lora_model_dir if it points to output_dir without a valid adapter path\n"
+                                        f"    adapter_val = config.get('adapter')\n"
+                                        f"    output_dir = config.get('output_dir', '')\n"
+                                        f"    lora_model_dir = config.get('lora_model_dir', '')\n"
+                                        f"    \n"
+                                        f"    # If adapter is 'lora' (string) or null/None, remove it\n"
+                                        f"    if adapter_val == 'lora' or adapter_val is None:\n"
+                                        f"        if 'adapter' in config:\n"
+                                        f"            del config['adapter']\n"
+                                        f"            fixed = True\n"
+                                        f"            print('Removed adapter field (will infer from lora_* parameters)')\n"
+                                        f"    \n"
+                                        f"    # CRITICAL: Remove lora_model_dir if it's set to output_dir (causes Axolotl to try loading from there)\n"
+                                        f"    # lora_model_dir should only be set to a valid adapter path (for incremental training)\n"
+                                        f"    # If lora_model_dir is set to output_dir, always remove it (unless there's a valid adapter path)\n"
+                                        f"    if lora_model_dir == output_dir:\n"
+                                        f"        # Only keep it if adapter is set to a valid path (incremental training)\n"
+                                        f"        if not adapter_val or adapter_val == 'lora' or adapter_val is None or not isinstance(adapter_val, str) or not adapter_val.startswith('/'):\n"
+                                        f"            if 'lora_model_dir' in config:\n"
+                                        f"                del config['lora_model_dir']\n"
+                                        f"                fixed = True\n"
+                                        f"                print('Removed lora_model_dir (was pointing to output_dir - causes adapter loading errors)')\n"
+                                        f"    \n"
+                                        f"    # Ensure lora_* parameters are set so Axolotl can infer LoRA mode\n"
+                                        f"    # These are required when adapter field is not set (for new training)\n"
+                                        f"    if not adapter_val or adapter_val == 'lora' or adapter_val is None:\n"
+                                        f"        if 'lora_r' not in config:\n"
+                                        f"            config['lora_r'] = 8\n"
+                                        f"            fixed = True\n"
+                                        f"            print('Set lora_r=8 (default)')\n"
+                                        f"        if 'lora_alpha' not in config:\n"
+                                        f"            config['lora_alpha'] = 16\n"
+                                        f"            fixed = True\n"
+                                        f"            print('Set lora_alpha=16 (default)')\n"
+                                        f"        if 'lora_dropout' not in config:\n"
+                                        f"            config['lora_dropout'] = 0.05\n"
+                                        f"            fixed = True\n"
+                                        f"            print('Set lora_dropout=0.05 (default)')\n"
+                                        f"        if 'lora_target_modules' not in config:\n"
+                                        f"            config['lora_target_modules'] = ['q_proj', 'v_proj', 'k_proj', 'o_proj', 'gate_proj', 'up_proj', 'down_proj']\n"
+                                        f"            fixed = True\n"
+                                        f"            print('Set lora_target_modules (default)')\n"
+                                        f"        if 'lora_out_dir' not in config and output_dir:\n"
+                                        f"            config['lora_out_dir'] = f'{{output_dir}}/adapter'\n"
+                                        f"            fixed = True\n"
+                                        f"            print(f'Set lora_out_dir={{output_dir}}/adapter')\n"
+                                        f"    \n"
+                                        f"{batch_size_update}"
                                         f"    \n"
                                         f"    # Fix tokenizer type if it's incorrect\n"
                                         f"    tokenizer_type = config.get('tokenizer_type', '')\n"
@@ -4001,6 +6456,7 @@ def render():
                                         f"        print('Fixed: Phi -> PhiTokenizer')\n"
                                         f"    elif 'qwen' in base_model and tokenizer_type == 'Qwen':\n"
                                         f"        config['tokenizer_type'] = 'Qwen2Tokenizer'\n"
+                                        f"        fixed = True\n"
                                         f"        print('Fixed: Qwen -> Qwen2Tokenizer')\n"
                                         f"    \n"
                                         f"    # Also fix model_type if needed\n"
@@ -4010,14 +6466,19 @@ def render():
                                         f"        if 'gemma-3' in base_model or 'gemma3' in base_model:\n"
                                         f"            if 'model_type' in config:\n"
                                         f"                del config['model_type']\n"
+                                        f"                fixed = True\n"
                                         f"                print('Removed model_type for Gemma 3 (auto-detect)')\n"
                                         f"        elif 'GemmaForCausalLM' not in model_type:\n"
                                         f"            config['model_type'] = 'GemmaForCausalLM'\n"
+                                        f"            fixed = True\n"
                                         f"            print('Fixed model_type: -> GemmaForCausalLM')\n"
                                         f"    \n"
-                                        f"    with open('axolotl_config.yaml', 'w') as f:\n"
-                                        f"        yaml.dump(config, f, default_flow_style=False, sort_keys=False)\n"
-                                        f"    print('Config file updated successfully')\n"
+                                        f"    if fixed:\n"
+                                        f"        with open('axolotl_config.yaml', 'w') as f:\n"
+                                        f"            yaml.dump(config, f, default_flow_style=False, sort_keys=False)\n"
+                                        f"        print('Config file updated successfully')\n"
+                                        f"    else:\n"
+                                        f"        print('Config already correct')\n"
                                         f"except Exception as e:\n"
                                         f"    print(f'Error: {{e}}', file=sys.stderr)\n"
                                         f"    sys.exit(1)\n"
@@ -4031,13 +6492,17 @@ def render():
                                     fix_result = subprocess.run(fix_tokenizer_cmd, capture_output=True, text=True, timeout=30)
                                     if fix_result.returncode == 0:
                                         stdout_filtered = filter_malloc_warnings(fix_result.stdout)
-                                        if "Fixed" in fix_result.stdout or "updated successfully" in fix_result.stdout:
-                                            terminal_output.append(f"[SUCCESS] Tokenizer type fixed: {stdout_filtered}")
+                                        if "Fixed" in fix_result.stdout or "updated successfully" in fix_result.stdout or "Optimized" in fix_result.stdout:
+                                            terminal_output.append(f"[SUCCESS] Config updated: {stdout_filtered}")
+                                            if suggested_batch_size:
+                                                terminal_output.append(f"[SUCCESS] ✓ Batch size optimized to {suggested_batch_size} for faster training")
                                         else:
-                                            terminal_output.append(f"[INFO] Tokenizer type already correct")
+                                            terminal_output.append(f"[INFO] Config already correct")
+                                            if suggested_batch_size:
+                                                terminal_output.append(f"[INFO] Batch size optimization will be applied")
                                     else:
                                         error_msg = fix_result.stderr or fix_result.stdout
-                                        terminal_output.append(f"[WARNING] Could not fix tokenizer type: {error_msg[:200]}")
+                                        terminal_output.append(f"[WARNING] Could not update config: {error_msg[:200]}")
                                     
                                     # Step 2.6: Regenerate and re-upload config file with correct model name
                                     terminal_output.append(f"[INFO] Regenerating config file with correct model mapping...")
@@ -4491,115 +6956,243 @@ REMOTE_SCRIPT"""
                                         f"root@{ssh_host}",
                                         ssh_command
                                     ]
+                                    terminal_output.append(f"[DEBUG] Executing training command via SSH on port: {ssh_port}")
+                                    terminal_output.append(f"[DEBUG] SSH command: ssh -p {ssh_port} root@{ssh_host}")
                                     try:
                                         restart_result = subprocess.run(restart_cmd, capture_output=True, text=True, timeout=5)
+                                        terminal_output.append(f"[DEBUG] Training restart command return code: {restart_result.returncode}")
+                                        
                                         if restart_result.returncode == 0:
                                             terminal_output.append(f"[SSH] Training command executed")
                                             if restart_result.stdout:
                                                 stdout_filtered = filter_malloc_warnings(restart_result.stdout)
-                                                if stdout_filtered.strip():
-                                                    terminal_output.append(f"[SSH] {stdout_filtered}")
+                                                # Show all output, not just filtered
+                                                for line in stdout_filtered.strip().split("\n"):
+                                                    if line.strip():
+                                                        terminal_output.append(f"[SSH] {line[:200]}")
                                         else:
                                             # Even if return code is non-zero, the process might have started
-                                            terminal_output.append(f"[SSH] Training command sent (checking process status...)")
+                                            terminal_output.append(f"[SSH] Training command sent (return code: {restart_result.returncode}, checking process status...)")
+                                            if restart_result.stdout:
+                                                stdout_filtered = filter_malloc_warnings(restart_result.stdout)
+                                                for line in stdout_filtered.strip().split("\n"):
+                                                    if line.strip():
+                                                        terminal_output.append(f"[STDOUT] {line[:200]}")
                                             if restart_result.stderr:
                                                 stderr_filtered = filter_malloc_warnings(restart_result.stderr)
-                                                if stderr_filtered.strip():
-                                                    terminal_output.append(f"[SSH] Command stderr: {stderr_filtered[:200]}")
+                                                # Show all stderr output
+                                                for line in stderr_filtered.strip().split("\n"):
+                                                    if line.strip():
+                                                        terminal_output.append(f"[STDERR] {line[:200]}")
                                     except subprocess.TimeoutExpired:
                                         # Timeout is expected - the process is running in background
                                         terminal_output.append(f"[SSH] Training command sent (timeout expected for background process)")
+                                    except Exception as e:
+                                        terminal_output.append(f"[ERROR] Exception while executing training restart command: {str(e)}")
+                                        import traceback
+                                        terminal_output.append(f"[ERROR] Traceback: {traceback.format_exc()[:300]}")
                                     
                                     # Wait a moment and then check if the process actually started and if logs are being written
                                     import time
                                     time.sleep(3)
                                     
                                     # Quick check to see if log file is being created
-                                    quick_log_check_cmd = [
-                                        "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
-                                        f"root@{ssh_host}",
-                                        "test -f /workspace/output/training/training.log && (wc -l /workspace/output/training/training.log && tail -10 /workspace/output/training/training.log) || echo 'log_not_created'"
-                                    ]
-                                    quick_log_check = subprocess.run(quick_log_check_cmd, capture_output=True, text=True, timeout=10)
-                                    if "log_not_created" not in quick_log_check.stdout:
-                                        log_output = quick_log_check.stdout.strip()
-                                        # Split into lines count and content
-                                        lines = log_output.split('\n')
-                                        if len(lines) > 0:
-                                            log_lines = lines[0]
-                                            terminal_output.append(f"[SSH] Log file created: {log_lines}")
-                                            if len(lines) > 1:
-                                                log_content = '\n'.join(lines[1:])
-                                                if log_content.strip():
-                                                    terminal_output.append(f"[SSH] Recent log content:")
-                                                    for line in log_content.strip().split('\n')[:5]:
-                                                        if line.strip():
-                                                            terminal_output.append(f"[SSH]   {line[:200]}")
-                                    else:
-                                        terminal_output.append(f"[WARNING] Log file not created yet - training may not have started")
-                                        
-                                        # Check if there are any Python processes that might have failed
-                                        check_python_errors_cmd = [
+                                    try:
+                                        quick_log_check_cmd = [
                                             "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
                                             f"root@{ssh_host}",
-                                            "ps aux | grep python | grep -E '(axolotl|accelerate|train)' | grep -v grep | head -3 || echo 'no_python_process'"
+                                            "test -f /workspace/output/training/training.log && (wc -l /workspace/output/training/training.log && tail -20 /workspace/output/training/training.log) || echo 'log_not_created'"
                                         ]
-                                        python_process_check = subprocess.run(check_python_errors_cmd, capture_output=True, text=True, timeout=10)
-                                        if "no_python_process" not in python_process_check.stdout and python_process_check.stdout.strip():
-                                            terminal_output.append(f"[DIAGNOSTICS] Found Python processes:")
-                                            for line in python_process_check.stdout.strip().split('\n')[:3]:
-                                                if line.strip():
-                                                    terminal_output.append(f"[DIAGNOSTICS]   {line[:200]}")
+                                        quick_log_check = subprocess.run(quick_log_check_cmd, capture_output=True, text=True, timeout=10)
+                                        if "log_not_created" not in quick_log_check.stdout:
+                                            log_output = quick_log_check.stdout.strip()
+                                            # Split into lines count and content
+                                            lines = log_output.split('\n')
+                                            if len(lines) > 0:
+                                                log_lines = lines[0]
+                                                terminal_output.append(f"[SSH] Log file created: {log_lines}")
+                                                if len(lines) > 1:
+                                                    log_content = '\n'.join(lines[1:])
+                                                    if log_content.strip():
+                                                        terminal_output.append(f"[SSH] Recent log content (showing more lines):")
+                                                        for line in log_content.strip().split('\n'):
+                                                            if line.strip():
+                                                                terminal_output.append(f"[SSH]   {line[:200]}")
+                                        else:
+                                            terminal_output.append(f"[WARNING] Log file not created yet - training may not have started")
+                                            
+                                            # Check if there are any Python processes that might have failed
+                                            check_python_errors_cmd = [
+                                                "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
+                                                f"root@{ssh_host}",
+                                                "ps aux | grep python | grep -E '(axolotl|accelerate|train)' | grep -v grep | head -5 || echo 'no_python_process'"
+                                            ]
+                                            python_process_check = subprocess.run(check_python_errors_cmd, capture_output=True, text=True, timeout=10)
+                                            if "no_python_process" not in python_process_check.stdout and python_process_check.stdout.strip():
+                                                terminal_output.append(f"[DIAGNOSTICS] Found Python processes:")
+                                                for line in python_process_check.stdout.strip().split('\n'):
+                                                    if line.strip():
+                                                        terminal_output.append(f"[DIAGNOSTICS]   {line[:200]}")
+                                            else:
+                                                terminal_output.append(f"[DIAGNOSTICS] No Python training processes found")
+                                    except subprocess.TimeoutExpired:
+                                        terminal_output.append(f"[WARNING] Log check timed out")
+                                    except Exception as e:
+                                        terminal_output.append(f"[WARNING] Could not check log file: {str(e)}")
                                     
                                     # Always check if process started, regardless of command result
                                     terminal_output.append(f"[SSH] Verifying training process started...")
                                     
                                     # Wait a moment and verify training process is running
-                                    verify_cmd = [
-                                        "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
-                                        f"root@{ssh_host}",
-                                        "sleep 3 && ps aux | grep -E '(accelerate|axolotl)' | grep -v grep | head -2 || echo 'no_process'"
-                                    ]
-                                    verify_result = subprocess.run(verify_cmd, capture_output=True, text=True, timeout=15)
-                                    if "no_process" not in verify_result.stdout:
-                                        stdout_filtered = filter_malloc_warnings(verify_result.stdout)
-                                        terminal_output.append(f"[SSH] Training process found:")
-                                        for line in stdout_filtered.strip().split("\n")[:2]:
-                                            if line.strip():
-                                                terminal_output.append(f"[SSH]   {line[:150]}")
-                                        terminal_output.append(f"[SUCCESS] Phase 3 redo complete - training restarted")
+                                    try:
+                                        verify_cmd = [
+                                            "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
+                                            f"root@{ssh_host}",
+                                            "sleep 3 && ps aux | grep -E '(accelerate|axolotl)' | grep -v grep | head -2 || echo 'no_process'"
+                                        ]
+                                        verify_result = subprocess.run(verify_cmd, capture_output=True, text=True, timeout=15)
                                         
-                                        # Reset training status
-                                        active_job["training_status"] = {"status": "training", "restarted": True}
-                                        training_manager._save_job(active_job)
-                                    else:
+                                        if "no_process" not in verify_result.stdout:
+                                            stdout_filtered = filter_malloc_warnings(verify_result.stdout)
+                                            terminal_output.append(f"[SSH] Training process found:")
+                                            for line in stdout_filtered.strip().split("\n")[:2]:
+                                                if line.strip():
+                                                    terminal_output.append(f"[SSH]   {line[:150]}")
+                                            terminal_output.append(f"[SUCCESS] Phase 3 redo complete - training restarted")
+                                            
+                                            # Reset training status
+                                            active_job["training_status"] = {"status": "training", "restarted": True}
+                                            training_manager._save_job(active_job)
+                                        else:
+                                            # Process not found - check logs for more details
                                             terminal_output.append(f"[WARNING] Training command executed but process not found yet")
+                                            
+                                            # Check training log for errors
+                                            check_log_cmd = [
+                                                "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
+                                                f"root@{ssh_host}",
+                                                "tail -50 /workspace/output/training/training.log 2>/dev/null || echo 'no_log'"
+                                            ]
+                                            log_check = subprocess.run(check_log_cmd, capture_output=True, text=True, timeout=15)
+                                            if "no_log" not in log_check.stdout:
+                                                log_output = filter_malloc_warnings(log_check.stdout)
+                                                terminal_output.append(f"[WARNING] Last log output (showing more lines for debugging):")
+                                                for line in log_output.strip().split("\n"):
+                                                    if line.strip():
+                                                        terminal_output.append(f"[LOG] {line[:200]}")
+                                            else:
+                                                terminal_output.append(f"[WARNING] Training log file not found at /workspace/output/training/training.log")
+                                            
                                             terminal_output.append(f"[INFO] Training may still be starting. Use 'Check Training Status' to verify.")
                                             terminal_output.append(f"[INFO] Check /workspace/output/training/training.log for details")
                                             # Reset training status so "Start Training" button appears if training didn't start
                                             active_job["training_status"] = {"status": "not_started", "message": "Training command sent but process not verified"}
                                             training_manager._save_job(active_job)
+                                    except subprocess.TimeoutExpired:
+                                        terminal_output.append(f"[WARNING] Process verification timed out - training may still be starting")
+                                        terminal_output.append(f"[INFO] Check training status again in a few moments")
+                                    except Exception as e:
+                                        terminal_output.append(f"[WARNING] Could not verify training process: {str(e)}")
+                                        terminal_output.append(f"[INFO] Training command was sent - check status to verify training started")
                                 
-                                st.session_state[terminal_output_key] = terminal_output
+                                    st.session_state[terminal_output_key] = terminal_output
+                                    st.session_state[confirm_key_phase3] = False
+                                    st.rerun()
+                                except Exception as e:
+                                    error_msg = str(e)
+                                    terminal_output.append(f"[ERROR] Failed to redo Phase 3: {error_msg}")
+                                    # Reset training status so "Start Training" button appears after error
+                                    active_job["training_status"] = {"status": "not_started", "error": error_msg}
+                                    training_manager._save_job(active_job)
+                                    st.session_state[terminal_output_key] = terminal_output
+                                    st.session_state[confirm_key_phase3] = False
+                                    st.error(f"Error: {error_msg}")
+                            if st.button("❌ Cancel", key="cancel_redo_phase_3"):
+                                st.session_state[confirm_key_phase3] = False
                                 st.rerun()
-                            except Exception as e:
-                                error_msg = str(e)
-                                terminal_output.append(f"[ERROR] Failed to redo Phase 3: {error_msg}")
-                                # Reset training status so "Start Training" button appears after error
-                                active_job["training_status"] = {"status": "not_started", "error": error_msg}
-                                training_manager._save_job(active_job)
-                                st.session_state[terminal_output_key] = terminal_output
-                                st.error(f"Error: {error_msg}")
+                        else:
+                            if st.button("🔄 Redo Phase", key="redo_phase_3", type="secondary", help="Kill training processes, clean up, and restart training. This will clear the terminal and restart training from scratch."):
+                                st.session_state[confirm_key_phase3] = True
+                                st.rerun()
                     
                     with col4:
                         training_status = active_job.get("training_status", {})
-                        if training_status.get("status") == "completed":
-                            st.success("✅ Training completed! Click 'Next Phase' to finalize.")
+                        status_from_job = training_status.get("status")
+                        
+                        # Also check if completion indicators are in logs (even if status hasn't updated yet)
+                        completion_detected_in_logs = False
+                        terminal_output_for_check = st.session_state.get(terminal_output_key, [])
+                        if terminal_output_for_check:
+                            terminal_text = "\n".join(terminal_output_for_check).lower()
+                            has_completed_log = "training completed" in terminal_text
+                            has_saved_log = "model successfully saved" in terminal_text
+                            completion_detected_in_logs = has_completed_log and has_saved_log
+                        
+                        # Show button if status is completed OR if completion is detected in logs
+                        if status_from_job == "completed" or completion_detected_in_logs:
+                            if completion_detected_in_logs and status_from_job != "completed":
+                                st.warning("⚠️ Training completion detected in logs. Click to advance to Phase 4.")
+                            else:
+                                st.success("✅ Training completed! Click 'Next Phase' to finalize.")
+                            
                             if st.button("➡️ Next Phase", key="next_phase_3", type="primary"):
+                                # Ensure status is set to completed
+                                if status_from_job != "completed":
+                                    training_status["status"] = "completed"
+                                    active_job["training_status"] = training_status
+                                    # Also update job status to completed
+                                    active_job["status"] = "completed"
+                                    training_manager._save_job(active_job)
+                                
+                                # Get the phase_key to ensure we're using the right one
+                                instance_id = active_job.get("instance_id")
+                                phase_key = f"training_phase_{instance_id}"
+                                
+                                # Set phase to 4 - use session state directly
                                 st.session_state[phase_key] = 4
+                                
                                 # Clear terminal for next phase
                                 st.session_state[terminal_output_key] = []
+                                
+                                # Force rerun to show Phase 4
                                 st.rerun()
+                    
+                    # CRITICAL: Display terminal AFTER all button handlers have run
+                    # This ensures the terminal reads the UPDATED session state values
+                    # Read from session state to get latest updates
+                    terminal_updated_key = f"{terminal_output_key}_updated"
+                    terminal_version_key = f"{terminal_output_key}_version"
+                    
+                    # Read version counter - this creates a dependency
+                    terminal_version = st.session_state.get(terminal_version_key, 0)
+                    
+                    # Read the actual terminal output
+                    raw_output = st.session_state.get(terminal_output_key, [])
+                    
+                    # Read timestamp
+                    terminal_timestamp = st.session_state.get(terminal_updated_key, None)
+                    
+                    # Create a completely fresh list copy
+                    current_terminal_output = list(raw_output) if raw_output else []
+                    
+                    # Use version in display to force dependency tracking
+                    version_suffix = f"v{terminal_version}"
+                    
+                    # Update the placeholder with terminal content
+                    with terminal_placeholder.container():
+                        if current_terminal_output:
+                            # Keep only last 200 lines
+                            display_output = current_terminal_output[-200:] if len(current_terminal_output) > 200 else current_terminal_output
+                            output_text = "\n".join(display_output)
+                            st.code(output_text, language="text")
+                            if len(current_terminal_output) > 200:
+                                st.caption(f"Showing last 200 of {len(current_terminal_output)} lines")
+                            # Show version in caption - this creates the dependency
+                            if len(current_terminal_output) > 0:
+                                timestamp_display = terminal_timestamp[:19] if terminal_timestamp else 'never'
+                                st.caption(f"📊 Total: {len(current_terminal_output)} lines | {version_suffix} | Updated: {timestamp_display}")
+                        else:
+                            st.info(f"Terminal is empty. Click 'Check Training Status.' ({version_suffix})")
                 
                 # Phase 4: Finalize
                 elif current_phase == 4:
@@ -4660,22 +7253,22 @@ REMOTE_SCRIPT"""
                                 # If we can't retrieve logs, that's okay - we'll show what we have
                                 pass
                         
-                        # Also check for stored stats in job results
-                        if job_queue:
-                            for job_idx, job_item in enumerate(job_queue):
-                                job_results_path = Path(f"models/{model_name}/training/queue/job_{job_idx + 1}_results")
-                                if job_results_path.exists():
-                                    # Check for any stored stats files
-                                    stats_files = list(job_results_path.glob("*stats*.json"))
-                                    for stats_file in stats_files:
-                                        try:
-                                            import json
-                                            with open(stats_file, 'r') as f:
-                                                stored_stats = json.load(f)
-                                                if stored_stats:
-                                                    all_stats.append(stored_stats)
-                                        except:
-                                            pass
+                        # Also check for stored stats in job results (single job mode)
+                        if job_queue and len(job_queue) > 0:
+                            # Single job - check for stats in standard location
+                            job_results_path = Path(f"models/{model_name}/training/queue/job_results")
+                            if job_results_path.exists():
+                                # Check for any stored stats files
+                                stats_files = list(job_results_path.glob("*stats*.json"))
+                                for stats_file in stats_files:
+                                    try:
+                                        import json
+                                        with open(stats_file, 'r') as f:
+                                            stored_stats = json.load(f)
+                                            if stored_stats:
+                                                all_stats.append(stored_stats)
+                                    except:
+                                        pass
                         
                         # Display statistics
                         if all_stats:
@@ -5087,9 +7680,22 @@ REMOTE_SCRIPT"""
                             st.warning(f"⚠️ **Important:** The Vast.ai instance ({instance_id[:8]}...) may still be running. Check Vast.ai and stop or destroy it manually to stop charges.")
                     else:
                         # Allow going back to Phase 3 to redo training if needed
-                        if st.button("🔄 Redo Phase 3", key="redo_phase_3_from_4", type="secondary", help="Go back to Phase 3 to restart training"):
-                            st.session_state[phase_key] = 3
-                            st.rerun()
+                        confirm_key_phase3_from4 = f"confirm_redo_phase_3_from_4_{active_job.get('instance_id')}"
+                        if confirm_key_phase3_from4 not in st.session_state:
+                            st.session_state[confirm_key_phase3_from4] = False
+                        
+                        if st.session_state[confirm_key_phase3_from4]:
+                            if st.button("✅ Confirm Go Back to Phase 3", key="confirm_redo_phase_3_from_4_btn", type="primary"):
+                                st.session_state[phase_key] = 3
+                                st.session_state[confirm_key_phase3_from4] = False
+                                st.rerun()
+                            if st.button("❌ Cancel", key="cancel_redo_phase_3_from_4"):
+                                st.session_state[confirm_key_phase3_from4] = False
+                                st.rerun()
+                        else:
+                            if st.button("🔄 Redo Phase 3", key="redo_phase_3_from_4", type="secondary", help="Go back to Phase 3 to restart training. This will return you to the training phase."):
+                                st.session_state[confirm_key_phase3_from4] = True
+                                st.rerun()
                 
             except Exception as e:
                 st.warning(f"Could not load training jobs: {str(e)}")
@@ -5097,84 +7703,30 @@ REMOTE_SCRIPT"""
                 with st.expander("Error Details", expanded=False):
                     st.code(traceback.format_exc())
         
-        # Troubleshooting section - at bottom, collapsed by default
+        # Debug Info section - at bottom, collapsed by default
         st.markdown("---")
-        with st.expander("🔧 Troubleshooting & Debug Info", expanded=False):
-            st.write(f"**Debug Info:**")
-            st.write(f"- Queue directory exists: {queue_dir.exists() if queue_dir else False}")
-            st.write(f"- Queue directory path: `{queue_dir}`")
-            st.write(f"- Files detected: {len(queued_files)}")
-            st.write(f"- has_training_data: {has_training_data}")
-            
-            if len(queued_files) > 0:
-                st.write(f"**Detected Files:**")
-                for f in queued_files:
-                    st.write(f"  - {f.get('filename', 'unknown')}")
+        with st.expander("🔍 Debug Info", expanded=False):
+            # Only show debug info if there's an active job
+            if active_job:
+                terminal_output_key = f"terminal_output_{active_job.get('instance_id')}"
+                current_terminal_output = list(st.session_state.get(terminal_output_key, []))
+                last_10_lines = current_terminal_output[-10:] if len(current_terminal_output) >= 10 else current_terminal_output
+                st.json({
+                    "terminal_output_key": terminal_output_key,
+                    "has_key": terminal_output_key in st.session_state,
+                    "instance_id": active_job.get("instance_id"),
+                    "terminal_length": len(current_terminal_output),
+                    "last_10_lines": last_10_lines,
+                    "session_state_keys": [k for k in st.session_state.keys() if "terminal" in k.lower()][:10]
+                })
+                # Show last lines to see what's actually in the terminal
+                if last_10_lines:
+                    st.text("Last 10 lines in terminal:")
+                    for i, line in enumerate(last_10_lines, 1):
+                        line_num = len(current_terminal_output) - len(last_10_lines) + i
+                        st.text(f"{line_num}: {line[:100]}")
             else:
-                st.write("**No files detected. Checking directory contents...**")
-                if queue_dir and queue_dir.exists():
-                    all_files = list(queue_dir.iterdir())
-                    st.write(f"Files in directory ({len(all_files)}):")
-                    for f in all_files:
-                        st.write(f"  - {f.name} ({'file' if f.is_file() else 'dir'})")
-                        if f.name.endswith('_metadata.json'):
-                            try:
-                                import json as json_module
-                                with open(f, 'r', encoding='utf-8') as mf:
-                                    meta = json_module.load(mf)
-                                    st.write(f"    Model: {meta.get('model')}, Filename: {meta.get('filename')}, Is YAML: {meta.get('is_yaml', False)}")
-                            except Exception as e:
-                                error_type = type(e).__name__
-                                st.write(f"    ❌ Error ({error_type}): {str(e)}")
-            
-            # Job reset options
-            st.markdown("---")
-            st.write("**Job Management:**")
-            if vast_api_key:
-                try:
-                    from utils.vast_training_manager import VastTrainingManager
-                    training_manager = VastTrainingManager(model_name, vast_api_key)
-                    all_jobs = training_manager.list_jobs()
-                    if all_jobs:
-                        st.write(f"**Found {len(all_jobs)} job(s) in database:**")
-                        for idx, job in enumerate(all_jobs):
-                            job_id = job.get("instance_id", "no-id")
-                            status = job.get("status", "unknown")
-                            finalized = job.get("finalized", False)
-                            dismissed = job.get("dismissed", False)
-                            st.write(f"  - Job {idx+1}: ID={job_id}, Status={status}, Finalized={finalized}, Dismissed={dismissed}")
-                        
-                        col1, col2 = st.columns(2)
-                        with col1:
-                            if st.button("🗑️ Dismiss All Jobs", key="dismiss_all_jobs", help="Mark all jobs as dismissed to start fresh"):
-                                try:
-                                    for job in all_jobs:
-                                        job["dismissed"] = True
-                                        job["dismissed_at"] = datetime.now().isoformat()
-                                        training_manager._save_job(job)
-                                    st.success("✅ All jobs dismissed. Refresh the page to see changes.")
-                                    st.rerun()
-                                except Exception as e:
-                                    st.error(f"Error: {str(e)}")
-                        with col2:
-                            if st.button("🔄 Clear All Job Data", key="clear_all_jobs", help="⚠️ WARNING: This will delete all job records (files remain safe)"):
-                                try:
-                                    # Delete the jobs file
-                                    jobs_file = training_manager.jobs_file
-                                    if jobs_file.exists():
-                                        jobs_file.unlink()
-                                        st.success("✅ All job data cleared. Refresh the page to see changes.")
-                                        st.rerun()
-                                    else:
-                                        st.info("No job file found to clear.")
-                                except Exception as e:
-                                    st.error(f"Error: {str(e)}")
-                    else:
-                        st.write("No jobs found in database.")
-                except Exception as e:
-                    st.write(f"Could not check job state: {str(e)}")
-            else:
-                st.info("Enter Vast.ai API key above to manage jobs.")
+                st.info("No active job - debug info will appear when a training job is active.")
     
     # Tab 2: Context Upload
     with tab2:

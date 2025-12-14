@@ -317,8 +317,9 @@ class AxolotlDataPrep:
             "tokenizer_type": tokenizer_type,
             "load_in_8bit": False,
             "load_in_4bit": True,  # Enable 4-bit quantization to reduce memory usage
-            # Note: Do not set "adapter" for new LoRA training - the lora_* parameters below are sufficient
-            # Axolotl will automatically use LoRA when lora_r, lora_alpha, etc. are present
+            # Note: Setting adapter to a path loads an existing adapter, but for new LoRA training,
+            # we should NOT set adapter (or set it to empty) - Axolotl will create adapters from lora_* parameters
+            # However, some Axolotl versions need explicit adapter setting to save adapters separately
             "strict": False,
             
             "datasets": [
@@ -334,10 +335,14 @@ class AxolotlDataPrep:
             "output_dir": output_dir,
             
             "sequence_len": 2048,
-            "sample_packing": True,
+            "sample_packing": False,  # Disabled by default to prevent multipack sampler errors
+            # sample_packing can cause IndexError with small datasets or certain batch configurations
+            # Enable only if you have a large dataset (>1000 samples) and understand the risks
             "pad_to_sequence_len": True,
             
-            "lora_model_dir": output_dir,
+            # lora_model_dir: Only set when loading a previous adapter (set below if previous_adapter_path exists)
+            # For new training, don't set lora_model_dir to output_dir as it causes Axolotl to try loading from there
+            "lora_out_dir": f"{output_dir}/adapter",  # Explicitly set adapter output directory
             "lora_r": lora_r,
             "lora_alpha": lora_alpha,
             "lora_dropout": lora_dropout,
@@ -373,6 +378,15 @@ class AxolotlDataPrep:
             "save_steps": 500,
             "eval_steps": 500,
             "save_total_limit": 3,
+            "save_strategy": "steps",  # Save at specific steps
+            "save_safetensors": True,  # Ensures LoRA weights are saved in .safetensors format
+            # LoRA adapter saving settings - prevent merging and ensure adapters are saved separately
+            # These settings work for both new training and incremental training (loading previous adapters)
+            "merge_lora": False,  # Critical: prevents merging LoRA into base model during save
+            # Note: merge_lora: false does NOT prevent loading previous adapters for incremental training
+            # It only prevents merging adapters into the base model when saving checkpoints
+            "save_merged_lora": False,  # Don't save merged copies
+            "lora_apply_dir": None,  # Prevent auto-merging on load (doesn't prevent loading adapters)
             "ddp_timeout": 180000000,
             "dataloader_num_workers": 4
         }
@@ -383,11 +397,24 @@ class AxolotlDataPrep:
             config["model_type"] = model_type
         
         # Load previous adapter if provided (for incremental training V2+)
-        # Axolotl will load this adapter and continue training from it
-        # Note: If previous_adapter_path is set, it will override the "lora" adapter type
+        # When previous_adapter_path is set, Axolotl will:
+        # 1. Load the adapter from that path
+        # 2. Continue training from those weights (incremental/cumulative training)
+        # 3. Save new adapters separately (due to merge_lora: false)
+        # The merge_lora: false setting does NOT interfere with loading - it only prevents merging during save
         if previous_adapter_path:
             config["adapter"] = previous_adapter_path
-        # If no previous adapter, the "adapter": "lora" in config above tells Axolotl to create a new LoRA adapter
+            # Also set lora_model_dir to the previous adapter path for explicit incremental training
+            # This ensures Axolotl knows to load and continue from this adapter
+            config["lora_model_dir"] = previous_adapter_path
+        else:
+            # For new LoRA training: Do NOT set adapter or lora_model_dir
+            # Axolotl will automatically infer LoRA mode from the lora_* parameters (lora_r, lora_alpha, etc.)
+            # Setting adapter or lora_model_dir causes Axolotl to try loading from those paths
+            # which results in "Can't find 'adapter_config.json'" errors
+            # The lora_out_dir parameter ensures adapters are saved to output_dir/adapter/
+            # Do not set adapter or lora_model_dir - let Axolotl infer from lora_* parameters
+            pass
         
         if output_path:
             import yaml

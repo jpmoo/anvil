@@ -140,10 +140,9 @@ class VastTrainingManager:
             with open(config_path, 'r') as f:
                 config = yaml.safe_load(f) or {}
             
-            # Fix adapter issue: if adapter is set to "lora" as a string (not a path), remove it
-            # Axolotl will infer LoRA from lora_* parameters, and "lora" as a string causes it to look for adapter files
+            # Fix adapter issue: Always remove adapter: "lora" as it causes Axolotl to treat it as a path
+            # Axolotl will automatically infer LoRA mode from lora_* parameters (lora_r, lora_alpha, etc.)
             if config.get("adapter") == "lora" and not Path(str(config.get("adapter", ""))).exists():
-                # Only remove if it's not a valid path (i.e., it's just the string "lora")
                 del config["adapter"]
                 self.logger.log("INFO", "Removed 'adapter: lora' from YAML config (LoRA will be inferred from lora_* parameters)")
             
@@ -197,8 +196,9 @@ class VastTrainingManager:
                     elif total_examples < 200:
                         # Small dataset: reduce validation set or disable sample packing
                         # Disable sample packing for small datasets as it can cause empty batch issues
-                        if config.get("sample_packing", False):
-                            config["sample_packing"] = False
+                        # CRITICAL: Always disable sample_packing regardless of current value
+                        config["sample_packing"] = False
+                        if config.get("sample_packing") != False:  # Log only if it was previously enabled
                             self.logger.log("INFO", f"Dataset has {total_examples} examples. Disabled sample_packing for stability with small datasets.")
                         # Ensure val_set_size results in at least min_eval_examples
                         min_val_size = min_eval_examples / total_examples
@@ -211,8 +211,16 @@ class VastTrainingManager:
                         if val_set_size < min_val_size:
                             config["val_set_size"] = min_val_size
                             self.logger.log("INFO", f"Adjusted val_set_size to {min_val_size:.3f} to ensure at least {min_eval_examples} eval examples.")
+                    
+                    # For all datasets, ALWAYS disable sample_packing to prevent multipack sampler errors
+                    # sample_packing can cause IndexError with certain batch configurations
+                    # CRITICAL: Always set to False explicitly, even if not in config (Axolotl may default to True)
+                    config["sample_packing"] = False
+                    if config.get("sample_packing") != False:  # Log only if it was previously enabled
+                        self.logger.log("INFO", f"Disabled sample_packing to prevent multipack sampler errors. Enable manually if needed for large datasets.")
             
             # YAML configs don't include datasets or paths - we need to set them
+            # Update paths and model settings in config to match remote paths and correct model
             # Update paths and model settings in config to match remote paths and correct model
             # Always set datasets (YAML won't include this)
             config["datasets"] = [{"path": "/workspace/data/training_data.jsonl", "type": "alpaca"}]
@@ -235,6 +243,10 @@ class VastTrainingManager:
                 # Override if it's explicitly False - user wants to maximize retention
                 config["train_on_inputs"] = True
                 self.logger.log("INFO", "Overrode train_on_inputs=False to True to maximize sample retention")
+            
+            # CRITICAL: Always ensure sample_packing is explicitly False before writing config
+            # This prevents multipack sampler IndexError issues
+            config["sample_packing"] = False
             
             # Write updated config back
             with open(config_path, 'w') as f:
@@ -320,8 +332,9 @@ class VastTrainingManager:
                     elif total_examples < 200:
                         # Small dataset: reduce validation set or disable sample packing
                         # Disable sample packing for small datasets as it can cause empty batch issues
-                        if config.get("sample_packing", False):
-                            config["sample_packing"] = False
+                        # CRITICAL: Always disable sample_packing regardless of current value
+                        config["sample_packing"] = False
+                        if config.get("sample_packing") != False:  # Log only if it was previously enabled
                             self.logger.log("INFO", f"Dataset has {total_examples} examples. Disabled sample_packing for stability with small datasets.")
                         # Ensure val_set_size results in at least min_eval_examples
                         min_val_size = min_eval_examples / total_examples
@@ -334,6 +347,10 @@ class VastTrainingManager:
                         if val_set_size < min_val_size:
                             config["val_set_size"] = min_val_size
                             self.logger.log("INFO", f"Adjusted val_set_size to {min_val_size:.3f} to ensure at least {min_eval_examples} eval examples.")
+            
+            # CRITICAL: Always ensure sample_packing is explicitly False to prevent multipack sampler errors
+            # This must be done before writing the config file
+            config["sample_packing"] = False
             
             # Write updated config back to file
             import yaml
@@ -351,90 +368,8 @@ class VastTrainingManager:
             "previous_adapter_path": previous_adapter_path  # Local path to previous adapter
         }
     
-    def create_training_script(self, package_info: Dict, hf_token: Optional[str] = None) -> str:
-        """
-        Create a minimal training script that waits for files to be uploaded via SCP
-        
-        Args:
-            package_info: Information from prepare_training_package()
-            hf_token: Optional Hugging Face token for gated models
-        
-        Returns:
-            Script content as string (minimal, without embedded files)
-        """
-        # Create a minimal script that sets up the environment and waits for files
-        # Files will be uploaded via SCP after instance is ready
-        # Note: HF token is set via env vars, no need to duplicate in script
-        
-        output_dir = package_info['config']['output_dir']
-        # Use double braces for literal braces in f-strings, and escape $ for bash variables
-        script = f"""#!/bin/bash
-set -e
-mkdir -p /workspace/data {output_dir}
-check_files() {{
-  if [ -f /workspace/data/training_data.jsonl ] && [ -f /workspace/data/axolotl_config.yaml ]; then
-    return 0
-  fi
-  for idx in 0 1 2 3 4 5 6 7 8 9; do
-    if [ -f /workspace/data/training_data_${{idx}}.jsonl ] && [ -f /workspace/data/axolotl_config_${{idx}}.yaml ]; then
-      return 0
-    fi
-  done
-  return 1
-}}
-cd /workspace
-# Check if axolotl is already installed and working
-AXOLOTL_INSTALLED=0
-if [ -d axolotl ]; then
- /opt/conda/bin/python -c "import axolotl" 2>/dev/null && AXOLOTL_INSTALLED=1 || python3 -c "import axolotl" 2>/dev/null && AXOLOTL_INSTALLED=1 || python -c "import axolotl" 2>/dev/null && AXOLOTL_INSTALLED=1 || true
-fi
-if [ ${{AXOLOTL_INSTALLED}} -eq 0 ]; then
- echo "Installing axolotl..."
- if [ ! -d axolotl ]; then
-  git clone https://github.com/OpenAccess-AI-Collective/axolotl.git || true
- fi
- cd axolotl
- /opt/conda/bin/pip install -e . || pip install -e . || true
-else
- echo "Axolotl already installed, skipping..."
- cd axolotl || (git clone https://github.com/OpenAccess-AI-Collective/axolotl.git && cd axolotl)
-fi
-# Check and install dependencies only if missing
-echo "Checking dependencies..."
-PYTHON_CMD="/opt/conda/bin/python"
-DEPS_INSTALLED=0
-${{PYTHON_CMD}} -c "import huggingface_hub, accelerate, peft, bitsandbytes" 2>/dev/null && DEPS_INSTALLED=1 || python3 -c "import huggingface_hub, accelerate, peft, bitsandbytes" 2>/dev/null && DEPS_INSTALLED=1 || python -c "import huggingface_hub, accelerate, peft, bitsandbytes" 2>/dev/null && DEPS_INSTALLED=1 || true
-if [ ${{DEPS_INSTALLED}} -eq 0 ]; then
- echo "Installing huggingface_hub, accelerate, peft, bitsandbytes..."
- ${{PYTHON_CMD}} -m pip install huggingface_hub accelerate peft bitsandbytes || python3 -m pip install huggingface_hub accelerate peft bitsandbytes || python -m pip install huggingface_hub accelerate peft bitsandbytes || true
-else
- echo "Dependencies already installed, skipping..."
-fi
-# Install flash-attn in background (optional optimization, not required for training)
-# This allows training to start faster while flash-attn installs in parallel
-FLASH_ATTN_INSTALLED=0
-${{PYTHON_CMD}} -c "import flash_attn" 2>/dev/null && FLASH_ATTN_INSTALLED=1 || python3 -c "import flash_attn" 2>/dev/null && FLASH_ATTN_INSTALLED=1 || python -c "import flash_attn" 2>/dev/null && FLASH_ATTN_INSTALLED=1 || true
-if [ ${{FLASH_ATTN_INSTALLED}} -eq 0 ]; then
- echo "Installing flash-attn in background (optional optimization, training will work without it)..."
- nohup ${{PYTHON_CMD}} -m pip install flash-attn --only-binary :all: > /tmp/flash_attn_install.log 2>&1 & || nohup python3 -m pip install flash-attn --only-binary :all: > /tmp/flash_attn_install.log 2>&1 & || nohup python -m pip install flash-attn --only-binary :all: > /tmp/flash_attn_install.log 2>&1 & || true
- echo "flash-attn installation started in background (check /tmp/flash_attn_install.log for progress)"
-else
- echo "flash-attn already installed, skipping..."
-fi
-t=900;e=0;f=0
-while [ ${{e}} -lt ${{t}} ];do
- if check_files;then f=1;break;fi
- sleep 5;e=$((e+5))
-done
-if [ ${{f}} -eq 0 ];then echo "Error: Files not found";exit 1;fi
-CF=""
-[ -f /workspace/data/axolotl_config.yaml ]&&CF=/workspace/data/axolotl_config.yaml
-if [ -z "${{CF}}" ];then for i in 0 1 2 3 4 5 6 7 8 9;do [ -f /workspace/data/axolotl_config_${{i}}.yaml ]&&CF=/workspace/data/axolotl_config_${{i}}.yaml&&break;done;fi
-[ -z "${{CF}}" ]&&(echo "Error: Config not found";exit 1)
-cd /workspace/axolotl
-/opt/conda/bin/python -m accelerate launch -m axolotl.cli.train "${{CF}}"||python3 -m accelerate launch -m axolotl.cli.train "${{CF}}"||python -m accelerate launch -m axolotl.cli.train "${{CF}}"
-"""
-        return script
+    # Note: create_training_script method removed - we no longer use onstart scripts
+    # All training is started manually via SSH on existing instances
     
     def launch_training_job(self,
                            gpu_name: Optional[str] = None,
@@ -503,95 +438,35 @@ cd /workspace/axolotl
             epochs = actual_epochs  # Use the calculated value
             self.logger.log("INFO", f"Using auto-calculated {epochs} epochs for training")
         
-        # If using existing instance, skip instance creation
-        if existing_instance_id:
-            instance_id = existing_instance_id
-            # Get instance info to extract offer details
-            try:
-                instance_status = self.vast_client.get_instance_status(instance_id)
-                # Extract offer_id from instance if available (for job tracking)
-                offer_id = instance_status.get("machine_id") or instance_status.get("offer_id") or "existing"
-                # Create a mock selected_offer dict from instance status for job_info
-                selected_offer = {
-                    "gpu_ram": instance_status.get("gpu_ram", 0),
-                    "dph_total": instance_status.get("dph_total", 0),
-                    "disk_space": instance_status.get("disk_space", disk_space),
-                    "geolocation": instance_status.get("geolocation"),
-                    "location": instance_status.get("location"),
-                    "country": instance_status.get("country"),
-                    "gpu_name": instance_status.get("gpu_name", "Unknown")
-                }
-            except:
-                offer_id = "existing"
-                # Create minimal mock selected_offer if we can't get instance status
-                selected_offer = {
-                    "gpu_ram": 0,
-                    "dph_total": 0,
-                    "disk_space": disk_space,
-                    "gpu_name": "Unknown"
-                }
-        else:
-            # Search for available offers
-            offers = self.vast_client.search_offers(
-                gpu_name=gpu_name,
-                min_gpu_ram=min_gpu_ram,
-                min_disk_space=disk_space,
-                max_price=max_price,
-                num_gpus=num_gpus
-            )
-            
-            if not offers:
-                raise Exception("No suitable GPU offers found on Vast.ai")
-            
-            # Select best offer (first one, already sorted by price)
-            selected_offer = offers[0]
-            offer_id = selected_offer.get("id") or selected_offer.get("offer_id")
-            
-            if not offer_id:
-                raise Exception(f"Invalid offer format: {selected_offer}")
-            
-            # Update adapter path in config if we uploaded a previous adapter
-            if package_info.get("remote_adapter_path"):
-                # Update the config file to use the remote adapter path
-                config_path = Path(package_info["config_path"])
-                if config_path.exists():
-                    import yaml
-                    with open(config_path, 'r') as f:
-                        config_data = yaml.safe_load(f)
-                    config_data["adapter"] = package_info["remote_adapter_path"]
-                    with open(config_path, 'w') as f:
-                        yaml.dump(config_data, f)
-            
-            # Create training script
-            training_script = self.create_training_script(package_info, hf_token=hf_token)
-            
-            # Create onstart command that will:
-            # 1. Install Axolotl
-            # 2. Upload training data (via SSH or volume mount)
-            # 3. Run training
-            onstart_cmd = training_script
-            
-            # Prepare environment variables
-            env_vars = {
-                "TZ": "UTC",
-                "MODEL_NAME": self.model_name
+        # We only support existing instances - instance_id must be provided
+        if not existing_instance_id:
+            raise Exception("Creating new instances is no longer supported. Please use an existing instance.")
+        
+        instance_id = existing_instance_id
+        # Get instance info to extract offer details
+        try:
+            instance_status = self.vast_client.get_instance_status(instance_id)
+            # Extract offer_id from instance if available (for job tracking)
+            offer_id = instance_status.get("machine_id") or instance_status.get("offer_id") or "existing"
+            # Create a mock selected_offer dict from instance status for job_info
+            selected_offer = {
+                "gpu_ram": instance_status.get("gpu_ram", 0),
+                "dph_total": instance_status.get("dph_total", 0),
+                "disk_space": instance_status.get("disk_space", disk_space),
+                "geolocation": instance_status.get("geolocation"),
+                "location": instance_status.get("location"),
+                "country": instance_status.get("country"),
+                "gpu_name": instance_status.get("gpu_name", "Unknown")
             }
-            # Add HF token if provided (for gated models like Gemma)
-            if hf_token:
-                env_vars["HF_TOKEN"] = hf_token
-                env_vars["HUGGING_FACE_HUB_TOKEN"] = hf_token
-            
-            # Launch instance with minimal script (files will be uploaded after instance is ready)
-            # Use smaller, often-cached image for faster startup
-            instance_info = self.vast_client.create_instance(
-                offer_id=str(offer_id),
-                image="pytorch/pytorch:2.1.0-cuda11.8-cudnn8-runtime",  # Smaller, often cached
-                disk_space=disk_space,
-                env_vars=env_vars,
-                onstart_cmd=onstart_cmd
-            )
-            
-            instance_id = instance_info.get("new_contract") or instance_info.get("id")
+        except:
+            offer_id = "existing"
+            # Create minimal mock selected_offer if we can't get instance status
+            selected_offer = {
+                "gpu_ram": 0,
+                "dph_total": 0,
+                "disk_space": disk_space,
+                "gpu_name": "Unknown"
+            }
         
         # Wait for instance to be ready, then upload files via SCP
         # Note: This requires SSH keys to be configured
@@ -694,11 +569,18 @@ cd /workspace/axolotl
             preserve_status = False
         
         # Get current instance status from Vast.ai
+        # Safety check: ensure instance_id exists in job
+        job_instance_id = job.get("instance_id")
+        if not job_instance_id:
+            self.logger.log("WARNING", f"Job missing instance_id, cannot check status")
+            job["error"] = "Job missing instance_id"
+            return job
+        
         try:
-            self.logger.log("INFO", f"Checking status for instance {job['instance_id']}")
-            api_response = self.vast_client.get_instance_status(job["instance_id"])
+            self.logger.log("INFO", f"Checking status for instance {job_instance_id}")
+            api_response = self.vast_client.get_instance_status(job_instance_id)
             job["vast_status"] = api_response
-            self.logger.log("INFO", f"Received API response for instance {job['instance_id']}", {
+            self.logger.log("INFO", f"Received API response for instance {job_instance_id}", {
                 "response_keys": list(api_response.keys())[:10]
             })
             
@@ -721,19 +603,23 @@ cd /workspace/axolotl
                 job["status"] = determined_status
             # else: keep the existing "launching" or "validated" status
             
-            # Update SSH info if available (for connection) - check multiple possible fields
-            ssh_host = (instance_status.get("ssh_host") or 
-                       instance_status.get("public_ipaddr") or
-                       instance_status.get("ipaddr") or
-                       instance_status.get("ssh_ip"))
-            ssh_port = (instance_status.get("ssh_port") or 
-                       instance_status.get("port") or 
-                       22)
+            # Update SSH info if available (for connection)
+            # Use get_instance_ssh_info for consistent SSH info extraction (prefers direct IP over gateway)
+            ssh_info = self.get_instance_ssh_info(job_instance_id)
+            ssh_host = ssh_info.get("host")
+            api_ssh_port = ssh_info.get("port", 22)
+            
+            # Preserve SSH port override if it exists (user-specified port takes precedence)
+            ssh_port_override = job.get("ssh_port_override")
+            if ssh_port_override:
+                ssh_port = ssh_port_override
+            else:
+                ssh_port = api_ssh_port
             
             if ssh_host:
                 job["ssh_host"] = ssh_host
-            if ssh_port:
-                job["ssh_port"] = ssh_port
+            # Always update port (either override or API port)
+            job["ssh_port"] = ssh_port
             
             # Update actual instance values from API response if available
             # GPU RAM (convert from MB to GB if present)
@@ -789,9 +675,9 @@ cd /workspace/axolotl
                         ssh_port = job.get("ssh_port")
                         
                         # Attempt to upload files
-                        print(f"[DEBUG] Attempting to upload training files to instance {job['instance_id']}")
+                        print(f"[DEBUG] Attempting to upload training files to instance {job_instance_id}")
                         upload_success = self.upload_training_files(
-                            job["instance_id"], 
+                            job_instance_id, 
                             package_info,
                             ssh_host=ssh_host,
                             ssh_port=ssh_port
@@ -836,7 +722,7 @@ cd /workspace/axolotl
             # Only check training status if instance is actually running (not loading/launching)
             if determined_status == "running" and vast_actual_status not in ["loading", "starting", "launching", "initializing", "booting"]:
                 try:
-                    training_status = self.check_training_status(job["instance_id"])
+                    training_status = self.check_training_status(job_instance_id)
                     if not training_status.get("error"):
                         training_status_val = training_status.get("status", "unknown")
                         
@@ -1181,7 +1067,6 @@ cd /workspace/axolotl
                     raise Exception(f"SSH connection test failed. Instance may not be ready yet. Error: {error_output[:200]}")
             
             # Ensure the target directory exists on the remote instance
-            # The onstart script should create it, but we'll create it here too to be safe
             mkdir_cmd = [
                 "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
                 f"root@{ssh_host}",
@@ -2038,23 +1923,8 @@ cd /workspace/axolotl
             except Exception as e:
                 warnings.append(f"Python check failed: {str(e)[:100]}")
             
-            # 7. Check if onstart script has completed (for existing instances, it should be done)
-            try:
-                check_onstart_cmd = [
-                    "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
-                    f"root@{ssh_host}",
-                    "ps aux | grep -E 'bash.*/.launch|onstart' | grep -v grep | head -1 || echo 'no_onstart'"
-                ]
-                onstart_result = subprocess.run(check_onstart_cmd, capture_output=True, text=True, timeout=10)
-                if "no_onstart" not in onstart_result.stdout and onstart_result.stdout.strip():
-                    # Onstart is still running - this is unusual for an existing instance that passed other checks
-                    warnings.append("Onstart script is still running. This is normal if the instance just started, but unusual for an existing instance. Training may be delayed until onstart completes.")
-                    details["onstart_running"] = True
-                else:
-                    details["onstart_running"] = False
-            except Exception as e:
-                # Don't fail validation if we can't check onstart status
-                pass
+            # Note: We no longer use onstart scripts - all training is started manually via SSH
+            # Removed onstart script checks since they're not relevant for existing instances
             
             # If we got here with no errors, instance is valid
             return {
@@ -2254,7 +2124,7 @@ cd /workspace/axolotl
             if log_result.returncode == 0 and log_result.stdout.strip() and "no_logs" not in log_result.stdout:
                 logs = log_result.stdout.strip()
             
-            # If no log file found, try to get output from the onstart script or any running processes
+            # If no log file found, try to get output from any running processes
             if not logs or len(logs) < 10:
                 # Check for output in /workspace/axolotl directory (where training runs)
                 check_axolotl_output_cmd = [
@@ -2279,13 +2149,11 @@ cd /workspace/axolotl
                 if axolotl_output_result.returncode == 0 and axolotl_output_result.stdout.strip():
                     logs = (logs + "\n\n=== Additional Output ===\n" + axolotl_output_result.stdout.strip()) if logs else axolotl_output_result.stdout.strip()
             
-            # Also try to get the last output from the onstart script if it's available
-            if onstart_logs and onstart_logs.strip() and "No onstart log file found" not in onstart_logs:
-                logs = (logs + "\n\n=== Onstart Script Output ===\n" + onstart_logs) if logs else onstart_logs
+            # Note: Removed onstart log checks since we no longer use onstart scripts
             
             # Also try to get output from stdout/stderr of running process
             if not logs or len(logs.strip()) < 10:
-                # Try to get output from onstart command or training process
+                # Try to get output from training process
                 output_cmd = [
                     "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
                     f"root@{ssh_host}",
@@ -2371,64 +2239,12 @@ cd /workspace/axolotl
             if weights_result.returncode == 0 and weights_result.stdout.strip():
                 weight_files = [f.strip() for f in weights_result.stdout.strip().split('\n') if f.strip()]
             
-            # Check if onstart script is still running (might be waiting for files)
-            check_onstart_cmd = [
-                "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
-                f"root@{ssh_host}",
-                "ps aux | grep -E '(onstart|bash.*onstart)' | grep -v grep || echo 'no_onstart'"
-            ]
-            onstart_result = subprocess.run(check_onstart_cmd, capture_output=True, text=True, timeout=15)
-            onstart_running = "no_onstart" not in onstart_result.stdout
-            onstart_process_info = onstart_result.stdout.strip() if onstart_running else None
-            
-            # Check what the onstart script is actually doing - look at recent output/logs
-            check_onstart_status_cmd = [
-                "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
-                f"root@{ssh_host}",
-                """bash -c '
-                    # Check if we're in the waiting loop
-                    if ps aux | grep -E "wait.*training_data.jsonl|Still waiting" | grep -v grep | head -1; then
-                        echo "status:waiting_for_files"
-                    # Check if installing dependencies
-                    elif ps aux | grep -E "pip install|git clone" | grep -v grep | head -1; then
-                        echo "status:installing"
-                    # Check if training has started
-                    elif ps aux | grep -E "axolotl|accelerate|train" | grep -v grep | head -1; then
-                        echo "status:training"
-                    else
-                        echo "status:unknown"
-                    fi
-                '"""
-            ]
-            onstart_status_result = subprocess.run(check_onstart_status_cmd, capture_output=True, text=True, timeout=15, shell=True)
-            onstart_status = "unknown"
-            if onstart_status_result.returncode == 0:
-                output = onstart_status_result.stdout.strip()
-                if "status:waiting_for_files" in output:
-                    onstart_status = "waiting_for_files"
-                elif "status:installing" in output:
-                    onstart_status = "installing"
-                elif "status:training" in output:
-                    onstart_status = "training"
-            
-            # Also check the actual onstart script output/logs if available
-            check_onstart_logs_cmd = [
-                "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
-                f"root@{ssh_host}",
-                """bash -c '
-                    # Try to find onstart output
-                    if [ -f /tmp/onstart.log ]; then
-                        tail -20 /tmp/onstart.log
-                    elif [ -f /var/log/vastai/onstart.log ]; then
-                        tail -20 /var/log/vastai/onstart.log
-                    else
-                        # Check if there's output in the process
-                        echo "No onstart log file found"
-                    fi
-                '"""
-            ]
-            onstart_logs_result = subprocess.run(check_onstart_logs_cmd, capture_output=True, text=True, timeout=15, shell=True)
-            onstart_logs = onstart_logs_result.stdout.strip() if onstart_logs_result.returncode == 0 else None
+            # Note: We no longer use onstart scripts - all training is started manually via SSH
+            # Set these to default values since onstart checks are not applicable
+            onstart_running = False
+            onstart_process_info = None
+            onstart_status = "not_applicable"
+            onstart_logs = None
             
             # Check if training files were uploaded (check if they exist on instance)
             check_files_cmd = [
@@ -2506,7 +2322,7 @@ cd /workspace/axolotl
                 if any(indicator in log_lower for indicator in training_indicators):
                     training_started = True
             
-            # Check if onstart is still running, training might not have started yet
+            # Check training status
             # But also check if preprocessing is happening (which is part of training)
             is_preprocessing = False
             if logs:
@@ -2515,21 +2331,11 @@ cd /workspace/axolotl
                                           "drop samples", "saving the dataset", "sample packing", "loading dataset"]
                 is_preprocessing = any(indicator in log_lower for indicator in preprocessing_indicators)
             
-            if training_running or (onstart_running and is_preprocessing):
+            if training_running or is_preprocessing:
                 # Training is actively running (either actual training or preprocessing)
                 status = "training"
                 if is_preprocessing and not training_running:
                     self.logger.log("INFO", f"Training preprocessing in progress on instance {instance_id}")
-            elif onstart_running and onstart_status == "installing":
-                status = "launching"
-                self.logger.log("INFO", f"Onstart script still installing dependencies on instance {instance_id}")
-            elif onstart_running and onstart_status == "waiting_for_files" and not training_files_exist:
-                status = "launching"
-                self.logger.log("INFO", f"Onstart script still waiting for files on instance {instance_id}")
-            elif onstart_running and onstart_status == "waiting_for_files" and training_files_exist:
-                # Files exist but script is still waiting - might be stuck
-                status = "unknown"
-                self.logger.log("WARNING", f"Onstart script stuck in waiting loop despite files existing on instance {instance_id}")
             # Only mark as completed if:
             # 1. Training process is NOT running
             # 2. AND (we have adapter files OR weight files OR completion indicators in logs)
@@ -2553,15 +2359,14 @@ cd /workspace/axolotl
                     "has_output": has_output,
                     "logs_available": logs is not None and len(logs) > 0
                 })
-            elif has_output and not training_running and not onstart_running:
+            elif has_output and not training_running:
                 # Has output but no clear completion - provide detailed diagnostics
                 # Check if training ever started by looking for any training-related files or logs
                 if not training_started:
-                    # Training never started - onstart finished but training didn't begin
+                    # Training never started
                     status = "failed"
-                    failure_reason = "Training never started. Onstart script completed but training process did not begin. Check if files were uploaded correctly and onstart script logs."
+                    failure_reason = "Training never started. Training process did not begin. Check if files were uploaded correctly and training logs."
                     self.logger.log("ERROR", f"Training never started on instance {instance_id}", {
-                        "onstart_finished": True,
                         "training_files_exist": training_files_exist,
                         "has_output": has_output
                     })
@@ -2577,8 +2382,6 @@ cd /workspace/axolotl
                         "completion_indicators": completion_indicators,
                         "completion_details": completion_details,
                         "training_files_exist": training_files_exist,
-                        "onstart_running": onstart_running,
-                        "onstart_status": onstart_status,
                         "training_started": training_started,
                         "logs_available": logs is not None and len(logs) > 0,
                         "logs_length": len(logs) if logs else 0,
@@ -2608,10 +2411,6 @@ cd /workspace/axolotl
                 "completion_indicators": completion_indicators,
                 "completion_details": completion_details,
                 "training_files_exist": training_files_exist,
-                "onstart_running": onstart_running,
-                "onstart_status": onstart_status,
-                "onstart_process_info": onstart_process_info,
-                "onstart_logs": onstart_logs,
                 "training_failed": training_failed,
                 "training_started": training_started,
                 "failure_reason": failure_reason,
