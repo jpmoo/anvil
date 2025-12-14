@@ -200,10 +200,10 @@ class ModelManager:
             Path to the new version folder
         """
         version_num = self.get_next_version_number(model_name)
-            model_dir = self.models_dir / model_name
+        model_dir = self.models_dir / model_name
         version_dir = model_dir / f"V{version_num}"
-            version_dir.mkdir(parents=True, exist_ok=True)
-            
+        version_dir.mkdir(parents=True, exist_ok=True)
+        
         # Create training subdirectory
         training_dir = version_dir / "training"
         training_dir.mkdir(parents=True, exist_ok=True)

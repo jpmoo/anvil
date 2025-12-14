@@ -158,17 +158,24 @@ class VastAIClient:
             Instance creation response
         """
         # Vast.ai API payload format
+        # Only include essential options to minimize cost
+        # We explicitly avoid optional features that may increase pricing:
+        # - No Jupyter notebook access
+        # - No public IP (SSH only via Vast.ai's SSH gateway)
+        # - Minimal disk space (only what's requested)
+        # - No extra storage or network options
+        # Build payload for instance creation
         payload = {
             "image": image,
             "disk": disk_space,
-            "runtype": "ssh"
+            "runtype": "ssh"  # SSH only, no Jupyter or other services
         }
-        
-        if env_vars:
-            payload["env"] = env_vars
         
         if onstart_cmd:
             payload["onstart"] = onstart_cmd
+        
+        if env_vars:
+            payload["env"] = env_vars
         
         # Headers with Bearer token authentication (required for instance creation)
         headers_with_auth = self.headers.copy()
@@ -349,14 +356,128 @@ class VastAIClient:
             List of instances
         """
         try:
+            headers_with_auth = self.headers.copy()
+            headers_with_auth["Authorization"] = f"Bearer {self.api_key}"
+            
             response = requests.get(
                 f"{self.base_url}/instances",
-                headers=self.headers,
+                headers=headers_with_auth,
                 params={"owner": "me"},
                 timeout=30
             )
             response.raise_for_status()
-            return response.json().get("instances", [])
+            data = response.json()
+            
+            # Handle different response formats
+            if isinstance(data, list):
+                # Filter out non-dict items (in case API returns mixed types)
+                return [item for item in data if isinstance(item, dict)]
+            elif isinstance(data, dict):
+                instances = data.get("instances", []) or data.get("results", []) or []
+                # Filter out non-dict items
+                if isinstance(instances, list):
+                    return [item for item in instances if isinstance(item, dict)]
+                return []
+            return []
         except Exception as e:
             raise Exception(f"Error listing instances: {str(e)}")
+    
+    def start_instance(self, instance_id: str) -> bool:
+        """
+        Start a stopped instance
+        
+        Args:
+            instance_id: ID of the instance to start
+        
+        Returns:
+            True if successful
+        """
+        try:
+            headers_with_auth = self.headers.copy()
+            headers_with_auth["Authorization"] = f"Bearer {self.api_key}"
+            headers_with_auth["Content-Type"] = "application/json"
+            
+            response = requests.put(
+                f"{self.base_url}/instances/{instance_id}/start",
+                headers=headers_with_auth,
+                timeout=30
+            )
+            response.raise_for_status()
+            
+            # Check response
+            try:
+                result = response.json()
+                if isinstance(result, dict):
+                    success = result.get("success", False) or result.get("status") == "ok"
+                    if not success:
+                        error_msg = result.get("error") or result.get("msg", "Unknown error")
+                        raise Exception(f"Vast.ai API returned error: {error_msg}")
+            except json.JSONDecodeError:
+                # Response might not be JSON, that's okay if status is 200
+                if response.status_code == 200:
+                    return True
+                raise Exception(f"Unexpected response format: {response.text[:200]}")
+            
+            return True
+        except requests.exceptions.HTTPError as e:
+            error_detail = ""
+            if hasattr(e, 'response') and e.response is not None:
+                try:
+                    error_json = e.response.json()
+                    error_detail = f" - {json.dumps(error_json)}"
+                except:
+                    error_detail = f" - {e.response.text[:200]}"
+            raise Exception(f"Error starting instance: {e.response.status_code if hasattr(e, 'response') else 'unknown'}{error_detail}")
+        except Exception as e:
+            raise Exception(f"Error starting instance: {str(e)}")
+    
+    def stop_instance(self, instance_id: str) -> bool:
+        """
+        Stop a running instance (does not destroy it)
+        
+        Args:
+            instance_id: ID of the instance to stop
+        
+        Returns:
+            True if successful
+        """
+        try:
+            headers_with_auth = self.headers.copy()
+            headers_with_auth["Authorization"] = f"Bearer {self.api_key}"
+            headers_with_auth["Content-Type"] = "application/json"
+            
+            response = requests.put(
+                f"{self.base_url}/instances/{instance_id}/stop",
+                headers=headers_with_auth,
+                timeout=30
+            )
+            response.raise_for_status()
+            
+            # Check response
+            try:
+                result = response.json()
+                if isinstance(result, dict):
+                    success = result.get("success", False) or result.get("status") == "ok"
+                    if not success:
+                        error_msg = result.get("error") or result.get("msg", "Unknown error")
+                        raise Exception(f"Vast.ai API returned error: {error_msg}")
+            except json.JSONDecodeError:
+                # Response might not be JSON, that's okay if status is 200
+                if response.status_code == 200:
+                    return True
+                raise Exception(f"Unexpected response format: {response.text[:200]}")
+            
+            return True
+        except requests.exceptions.HTTPError as e:
+            error_detail = ""
+            if hasattr(e, 'response') and e.response is not None:
+                try:
+                    error_json = e.response.json()
+                    error_detail = f" - {json.dumps(error_json)}"
+                except:
+                    error_detail = f" - {e.response.text[:200]}"
+            raise Exception(f"Error stopping instance: {e.response.status_code if hasattr(e, 'response') else 'unknown'}{error_detail}")
+        except Exception as e:
+            raise Exception(f"Error stopping instance: {str(e)}")
+    
 

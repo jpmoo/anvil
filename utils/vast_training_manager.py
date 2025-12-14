@@ -72,7 +72,7 @@ class VastTrainingManager:
             # Fallback if training_dir is not a Path (shouldn't happen, but be safe)
             self.jobs_file = PathClass(self.training_dir) / "vast_jobs.json"
     
-    def prepare_training_package(self, epochs: int = 3, learning_rate: float = 2e-4, hf_model_override: Optional[str] = None, yaml_config_path: Optional[str] = None, file_group: Optional[List[Dict]] = None) -> Dict:
+    def prepare_training_package(self, epochs: int = 10, learning_rate: float = 2e-4, hf_model_override: Optional[str] = None, yaml_config_path: Optional[str] = None, file_group: Optional[List[Dict]] = None) -> Dict:
         """
         Prepare all training data and configuration files (without moving from queue)
         
@@ -140,6 +140,78 @@ class VastTrainingManager:
             with open(config_path, 'r') as f:
                 config = yaml.safe_load(f) or {}
             
+            # Fix adapter issue: if adapter is set to "lora" as a string (not a path), remove it
+            # Axolotl will infer LoRA from lora_* parameters, and "lora" as a string causes it to look for adapter files
+            if config.get("adapter") == "lora" and not Path(str(config.get("adapter", ""))).exists():
+                # Only remove if it's not a valid path (i.e., it's just the string "lora")
+                del config["adapter"]
+                self.logger.log("INFO", "Removed 'adapter: lora' from YAML config (LoRA will be inferred from lora_* parameters)")
+            
+            # Auto-adjust config for small datasets to prevent empty batch errors
+            total_examples = dataset_stats.get("total_examples", 0)
+            if total_examples > 0:
+                # Auto-calculate epochs based on dataset size (same logic as default config)
+                batch_size = config.get("micro_batch_size", 4)
+                gradient_accumulation_steps = config.get("gradient_accumulation_steps", 4)
+                effective_batch_size = batch_size * gradient_accumulation_steps
+                
+                # Calculate steps per epoch
+                sample_packing = config.get("sample_packing", True)
+                if sample_packing:
+                    sample_packing_efficiency = 0.7  # Conservative estimate
+                    effective_dataset_size = max(1, int(total_examples * sample_packing_efficiency))
+                else:
+                    effective_dataset_size = total_examples
+                
+                steps_per_epoch = max(1, effective_dataset_size // effective_batch_size)
+                
+                # Target steps based on dataset size
+                if total_examples < 200:
+                    target_steps = 150
+                elif total_examples < 1000:
+                    target_steps = 300
+                else:
+                    target_steps = 400
+                
+                # Calculate epochs needed to reach target steps
+                calculated_epochs = max(1, int(target_steps / steps_per_epoch))
+                calculated_epochs = min(max(calculated_epochs, 1), 50)  # Cap at 50
+                
+                # Update epochs in config to use calculated value
+                current_epochs = config.get("num_epochs", epochs)
+                final_epochs = max(calculated_epochs, current_epochs)  # Use higher of calculated or existing
+                config["num_epochs"] = final_epochs
+                final_steps = steps_per_epoch * final_epochs
+                self.logger.log("INFO", f"Auto-calculated epochs for YAML config: {final_epochs} (targeting ~{target_steps} steps for {total_examples} examples, ~{steps_per_epoch} steps/epoch, will result in ~{final_steps} total steps)")
+                
+                # Calculate minimum eval examples needed (at least 2 for batch creation)
+                min_eval_examples = 2
+                val_set_size = config.get("val_set_size", 0.1)
+                
+                # If validation set would be too small, adjust it
+                if total_examples * val_set_size < min_eval_examples:
+                    if total_examples < 50:
+                        # Very small dataset: disable validation entirely
+                        config["val_set_size"] = 0.0
+                        self.logger.log("INFO", f"Dataset has only {total_examples} examples. Disabling validation set to prevent empty batch errors.")
+                    elif total_examples < 200:
+                        # Small dataset: reduce validation set or disable sample packing
+                        # Disable sample packing for small datasets as it can cause empty batch issues
+                        if config.get("sample_packing", False):
+                            config["sample_packing"] = False
+                            self.logger.log("INFO", f"Dataset has {total_examples} examples. Disabled sample_packing for stability with small datasets.")
+                        # Ensure val_set_size results in at least min_eval_examples
+                        min_val_size = min_eval_examples / total_examples
+                        if val_set_size < min_val_size:
+                            config["val_set_size"] = min_val_size
+                            self.logger.log("INFO", f"Adjusted val_set_size to {min_val_size:.3f} to ensure at least {min_eval_examples} eval examples.")
+                    else:
+                        # Medium dataset: just ensure val_set_size is reasonable
+                        min_val_size = min_eval_examples / total_examples
+                        if val_set_size < min_val_size:
+                            config["val_set_size"] = min_val_size
+                            self.logger.log("INFO", f"Adjusted val_set_size to {min_val_size:.3f} to ensure at least {min_eval_examples} eval examples.")
+            
             # YAML configs don't include datasets or paths - we need to set them
             # Update paths and model settings in config to match remote paths and correct model
             # Always set datasets (YAML won't include this)
@@ -152,13 +224,75 @@ class VastTrainingManager:
             config["base_model_config"] = hf_model
             # Ensure dataset_preparation_path is set (Axolotl needs this)
             if "dataset_preparation_path" not in config:
-                config["dataset_preparation_path"] = "./prepared_data"
+                config["dataset_preparation_path"] = "/workspace/axolotl/prepared_data"
+            
+            # Maximize sample retention: set train_on_inputs to True if not explicitly set
+            # This prevents dropping samples where input has no trainable tokens
+            if "train_on_inputs" not in config:
+                config["train_on_inputs"] = True
+                self.logger.log("INFO", "Set train_on_inputs=True to maximize sample retention")
+            elif config.get("train_on_inputs") == False:
+                # Override if it's explicitly False - user wants to maximize retention
+                config["train_on_inputs"] = True
+                self.logger.log("INFO", "Overrode train_on_inputs=False to True to maximize sample retention")
+            
             # Write updated config back
             with open(config_path, 'w') as f:
                 yaml.dump(config, f, default_flow_style=False, sort_keys=False)
         else:
-            # Create Axolotl config (use placeholder version name for now)
-            # Will be updated when version directory is created after successful training
+            # Calculate appropriate number of epochs based on dataset size to target reasonable training steps
+            # Target: 200-500 steps for good training (adjust based on dataset size)
+            total_examples = dataset_stats.get("total_examples", 0)
+            batch_size = 4  # Default micro_batch_size
+            gradient_accumulation_steps = 4  # Default
+            effective_batch_size = batch_size * gradient_accumulation_steps
+            
+            if total_examples > 0:
+                # Calculate steps per epoch
+                # With sample packing, Axolotl packs multiple samples per sequence, reducing steps
+                # Estimate: sample packing efficiency is typically 0.6-0.9, so we'll use 0.7 as average
+                # This means ~70% of samples are packed, effectively reducing dataset size
+                sample_packing_efficiency = 0.7  # Conservative estimate
+                effective_dataset_size = max(1, int(total_examples * sample_packing_efficiency))
+                steps_per_epoch = max(1, effective_dataset_size // effective_batch_size)
+                
+                # Target steps based on dataset size:
+                # - Small datasets (< 200): target 100-200 steps
+                # - Medium datasets (200-1000): target 200-400 steps  
+                # - Large datasets (> 1000): target 300-500 steps
+                if total_examples < 200:
+                    target_steps = 150
+                elif total_examples < 1000:
+                    target_steps = 300
+                else:
+                    target_steps = 400
+                
+                # Calculate epochs needed to reach target steps
+                calculated_epochs = max(1, int(target_steps / steps_per_epoch))
+                # Cap at reasonable maximum (50 epochs) and minimum (1 epoch)
+                calculated_epochs = min(max(calculated_epochs, 1), 50)
+                
+                # Always use auto-calculated epochs for optimal training
+                # User can still override via epochs parameter if needed, but we'll use calculated by default
+                # Only use user-provided epochs if it's higher than calculated (to ensure enough steps)
+                if epochs >= calculated_epochs:
+                    # User provided higher value - use it
+                    final_epochs = epochs
+                    final_steps = steps_per_epoch * final_epochs
+                    self.logger.log("INFO", f"Using {final_epochs} epochs (~{final_steps} steps) - user override")
+                else:
+                    # Use calculated epochs (better for training)
+                    final_epochs = calculated_epochs
+                    final_steps = steps_per_epoch * final_epochs
+                    if epochs != 10:  # User provided a value but it was lower
+                        self.logger.log("INFO", f"Auto-calculated {final_epochs} epochs (~{final_steps} steps) instead of user-specified {epochs} epochs (~{steps_per_epoch * epochs} steps) to ensure adequate training")
+                    else:
+                        self.logger.log("INFO", f"Auto-calculated epochs: {final_epochs} (targeting ~{target_steps} steps for {total_examples} examples, ~{steps_per_epoch} steps/epoch, will result in ~{final_steps} total steps)")
+                
+                epochs = final_epochs
+            
+            # Create stock/default Axolotl config (no YAML file provided)
+            # This creates a standard Axolotl configuration with default settings
             config = self.axolotl_prep.create_axolotl_config(
                 base_model=hf_model,
                 dataset_path="/workspace/data/training_data.jsonl",  # Path on Vast.ai instance
@@ -166,8 +300,45 @@ class VastTrainingManager:
                 output_path=config_path,
                 num_epochs=epochs,
                 learning_rate=learning_rate,
+                train_on_inputs=True,  # Maximize sample retention - set to False if you want to focus only on responses
                 previous_adapter_path=previous_adapter_path  # Path to previous adapter for incremental training
             )
+            
+            # Auto-adjust config for small datasets to prevent empty batch errors
+            total_examples = dataset_stats.get("total_examples", 0)
+            if total_examples > 0:
+                # Calculate minimum eval examples needed (at least 2 for batch creation)
+                min_eval_examples = 2
+                val_set_size = config.get("val_set_size", 0.1)
+                
+                # If validation set would be too small, adjust it
+                if total_examples * val_set_size < min_eval_examples:
+                    if total_examples < 50:
+                        # Very small dataset: disable validation entirely
+                        config["val_set_size"] = 0.0
+                        self.logger.log("INFO", f"Dataset has only {total_examples} examples. Disabling validation set to prevent empty batch errors.")
+                    elif total_examples < 200:
+                        # Small dataset: reduce validation set or disable sample packing
+                        # Disable sample packing for small datasets as it can cause empty batch issues
+                        if config.get("sample_packing", False):
+                            config["sample_packing"] = False
+                            self.logger.log("INFO", f"Dataset has {total_examples} examples. Disabled sample_packing for stability with small datasets.")
+                        # Ensure val_set_size results in at least min_eval_examples
+                        min_val_size = min_eval_examples / total_examples
+                        if val_set_size < min_val_size:
+                            config["val_set_size"] = min_val_size
+                            self.logger.log("INFO", f"Adjusted val_set_size to {min_val_size:.3f} to ensure at least {min_eval_examples} eval examples.")
+                    else:
+                        # Medium dataset: just ensure val_set_size is reasonable
+                        min_val_size = min_eval_examples / total_examples
+                        if val_set_size < min_val_size:
+                            config["val_set_size"] = min_val_size
+                            self.logger.log("INFO", f"Adjusted val_set_size to {min_val_size:.3f} to ensure at least {min_eval_examples} eval examples.")
+            
+            # Write updated config back to file
+            import yaml
+            with open(config_path, 'w') as f:
+                yaml.dump(config, f, default_flow_style=False, sort_keys=False)
         
         return {
             "temp_dir": str(temp_dir),
@@ -180,65 +351,88 @@ class VastTrainingManager:
             "previous_adapter_path": previous_adapter_path  # Local path to previous adapter
         }
     
-    def create_training_script(self, package_info: Dict) -> str:
+    def create_training_script(self, package_info: Dict, hf_token: Optional[str] = None) -> str:
         """
         Create a minimal training script that waits for files to be uploaded via SCP
         
         Args:
             package_info: Information from prepare_training_package()
+            hf_token: Optional Hugging Face token for gated models
         
         Returns:
             Script content as string (minimal, without embedded files)
         """
         # Create a minimal script that sets up the environment and waits for files
         # Files will be uploaded via SCP after instance is ready
+        # Note: HF token is set via env vars, no need to duplicate in script
+        
+        output_dir = package_info['config']['output_dir']
+        # Use double braces for literal braces in f-strings, and escape $ for bash variables
         script = f"""#!/bin/bash
 set -e
-
-# Install Axolotl
-cd /workspace
-git clone https://github.com/OpenAccess-AI-Collective/axolotl.git || true
-cd axolotl
-pip install -e .
-
-# Install dependencies
-pip install flash-attn --no-build-isolation || true
-
-# Create directories
-mkdir -p /workspace/data
-mkdir -p {package_info['config']['output_dir']}
-
-# Wait for training files to be uploaded (check every 10 seconds, timeout after 10 minutes)
-echo "Waiting for training files to be uploaded via SCP..."
-timeout=600
-elapsed=0
-while [ $elapsed -lt $timeout ]; do
-    if [ -f "/workspace/data/training_data.jsonl" ] && [ -f "/workspace/data/axolotl_config.yaml" ]; then
-        echo "Training files found! Starting training..."
-        break
+mkdir -p /workspace/data {output_dir}
+check_files() {{
+  if [ -f /workspace/data/training_data.jsonl ] && [ -f /workspace/data/axolotl_config.yaml ]; then
+    return 0
+  fi
+  for idx in 0 1 2 3 4 5 6 7 8 9; do
+    if [ -f /workspace/data/training_data_${{idx}}.jsonl ] && [ -f /workspace/data/axolotl_config_${{idx}}.yaml ]; then
+      return 0
     fi
-    sleep 10
-    elapsed=$((elapsed + 10))
-    echo "Still waiting... ($elapsed/$timeout seconds)"
+  done
+  return 1
+}}
+cd /workspace
+# Check if axolotl is already installed and working
+AXOLOTL_INSTALLED=0
+if [ -d axolotl ]; then
+ /opt/conda/bin/python -c "import axolotl" 2>/dev/null && AXOLOTL_INSTALLED=1 || python3 -c "import axolotl" 2>/dev/null && AXOLOTL_INSTALLED=1 || python -c "import axolotl" 2>/dev/null && AXOLOTL_INSTALLED=1 || true
+fi
+if [ ${{AXOLOTL_INSTALLED}} -eq 0 ]; then
+ echo "Installing axolotl..."
+ if [ ! -d axolotl ]; then
+  git clone https://github.com/OpenAccess-AI-Collective/axolotl.git || true
+ fi
+ cd axolotl
+ /opt/conda/bin/pip install -e . || pip install -e . || true
+else
+ echo "Axolotl already installed, skipping..."
+ cd axolotl || (git clone https://github.com/OpenAccess-AI-Collective/axolotl.git && cd axolotl)
+fi
+# Check and install dependencies only if missing
+echo "Checking dependencies..."
+PYTHON_CMD="/opt/conda/bin/python"
+DEPS_INSTALLED=0
+${{PYTHON_CMD}} -c "import huggingface_hub, accelerate, peft, bitsandbytes" 2>/dev/null && DEPS_INSTALLED=1 || python3 -c "import huggingface_hub, accelerate, peft, bitsandbytes" 2>/dev/null && DEPS_INSTALLED=1 || python -c "import huggingface_hub, accelerate, peft, bitsandbytes" 2>/dev/null && DEPS_INSTALLED=1 || true
+if [ ${{DEPS_INSTALLED}} -eq 0 ]; then
+ echo "Installing huggingface_hub, accelerate, peft, bitsandbytes..."
+ ${{PYTHON_CMD}} -m pip install huggingface_hub accelerate peft bitsandbytes || python3 -m pip install huggingface_hub accelerate peft bitsandbytes || python -m pip install huggingface_hub accelerate peft bitsandbytes || true
+else
+ echo "Dependencies already installed, skipping..."
+fi
+# Install flash-attn in background (optional optimization, not required for training)
+# This allows training to start faster while flash-attn installs in parallel
+FLASH_ATTN_INSTALLED=0
+${{PYTHON_CMD}} -c "import flash_attn" 2>/dev/null && FLASH_ATTN_INSTALLED=1 || python3 -c "import flash_attn" 2>/dev/null && FLASH_ATTN_INSTALLED=1 || python -c "import flash_attn" 2>/dev/null && FLASH_ATTN_INSTALLED=1 || true
+if [ ${{FLASH_ATTN_INSTALLED}} -eq 0 ]; then
+ echo "Installing flash-attn in background (optional optimization, training will work without it)..."
+ nohup ${{PYTHON_CMD}} -m pip install flash-attn --only-binary :all: > /tmp/flash_attn_install.log 2>&1 & || nohup python3 -m pip install flash-attn --only-binary :all: > /tmp/flash_attn_install.log 2>&1 & || nohup python -m pip install flash-attn --only-binary :all: > /tmp/flash_attn_install.log 2>&1 & || true
+ echo "flash-attn installation started in background (check /tmp/flash_attn_install.log for progress)"
+else
+ echo "flash-attn already installed, skipping..."
+fi
+t=900;e=0;f=0
+while [ ${{e}} -lt ${{t}} ];do
+ if check_files;then f=1;break;fi
+ sleep 5;e=$((e+5))
 done
-
-if [ ! -f "/workspace/data/training_data.jsonl" ]; then
-    echo "Error: training_data.jsonl not found after waiting"
-    exit 1
-fi
-
-if [ ! -f "/workspace/data/axolotl_config.yaml" ]; then
-    echo "Error: axolotl_config.yaml not found after waiting"
-    exit 1
-fi
-
-# Run training
+if [ ${{f}} -eq 0 ];then echo "Error: Files not found";exit 1;fi
+CF=""
+[ -f /workspace/data/axolotl_config.yaml ]&&CF=/workspace/data/axolotl_config.yaml
+if [ -z "${{CF}}" ];then for i in 0 1 2 3 4 5 6 7 8 9;do [ -f /workspace/data/axolotl_config_${{i}}.yaml ]&&CF=/workspace/data/axolotl_config_${{i}}.yaml&&break;done;fi
+[ -z "${{CF}}" ]&&(echo "Error: Config not found";exit 1)
 cd /workspace/axolotl
-accelerate launch -m axolotl.cli.train /workspace/data/axolotl_config.yaml
-
-# After training, the model will be in {package_info['config']['output_dir']}
-echo "Training complete! Model saved to {package_info['config']['output_dir']}"
-echo "Ready for download"
+/opt/conda/bin/python -m accelerate launch -m axolotl.cli.train "${{CF}}"||python3 -m accelerate launch -m axolotl.cli.train "${{CF}}"||python -m accelerate launch -m axolotl.cli.train "${{CF}}"
 """
         return script
     
@@ -247,13 +441,16 @@ echo "Ready for download"
                            min_gpu_ram: int = 16,
                            max_price: Optional[float] = None,
                            disk_space: int = 100,
-                           epochs: int = 3,
+                           epochs: int = 10,
                            learning_rate: float = 2e-4,
                            hf_model_override: Optional[str] = None,
                            num_gpus: Optional[int] = None,
                            yaml_config_path: Optional[str] = None,
                            file_group: Optional[List[Dict]] = None,
-                           job_queue: Optional[List[Dict]] = None) -> Dict:
+                           job_queue: Optional[List[Dict]] = None,
+                           hf_token: Optional[str] = None,
+                           existing_instance_id: Optional[str] = None,
+                           ssh_port_override: Optional[int] = None) -> Dict:
         """
         Launch a training job on Vast.ai
         
@@ -279,6 +476,7 @@ echo "Ready for download"
             current_job_index = None
         
         # Prepare training package (files stay in queue until training succeeds)
+        # Note: prepare_training_package will auto-calculate optimal epochs based on dataset size
         package_info = self.prepare_training_package(
             epochs=epochs, 
             learning_rate=learning_rate, 
@@ -287,59 +485,113 @@ echo "Ready for download"
             file_group=file_group
         )
         
-        # Search for available offers
-        offers = self.vast_client.search_offers(
-            gpu_name=gpu_name,
-            min_gpu_ram=min_gpu_ram,
-            min_disk_space=disk_space,
-            max_price=max_price,
-            num_gpus=num_gpus
-        )
-        
-        if not offers:
-            raise Exception("No suitable GPU offers found on Vast.ai")
-        
-        # Select best offer (first one, already sorted by price)
-        selected_offer = offers[0]
-        offer_id = selected_offer.get("id") or selected_offer.get("offer_id")
-        
-        if not offer_id:
-            raise Exception(f"Invalid offer format: {selected_offer}")
-        
-        # Update adapter path in config if we uploaded a previous adapter
-        if package_info.get("remote_adapter_path"):
-            # Update the config file to use the remote adapter path
+        # Get the actual epochs used (may have been auto-calculated)
+        # Check both the config dict and the YAML file if it exists
+        actual_epochs = epochs
+        if package_info.get("config"):
+            actual_epochs = package_info["config"].get("num_epochs", epochs)
+        elif package_info.get("config_path"):
+            # If config is a YAML file, read it
+            import yaml
             config_path = Path(package_info["config_path"])
             if config_path.exists():
-                import yaml
                 with open(config_path, 'r') as f:
-                    config_data = yaml.safe_load(f)
-                config_data["adapter"] = package_info["remote_adapter_path"]
-                with open(config_path, 'w') as f:
-                    yaml.dump(config_data, f)
+                    yaml_config = yaml.safe_load(f) or {}
+                    actual_epochs = yaml_config.get("num_epochs", epochs)
         
-        # Create training script
-        training_script = self.create_training_script(package_info)
+        if actual_epochs != epochs:
+            epochs = actual_epochs  # Use the calculated value
+            self.logger.log("INFO", f"Using auto-calculated {epochs} epochs for training")
         
-        # Create onstart command that will:
-        # 1. Install Axolotl
-        # 2. Upload training data (via SSH or volume mount)
-        # 3. Run training
-        onstart_cmd = training_script
-        
-        # Launch instance with minimal script (files will be uploaded after instance is ready)
-        instance_info = self.vast_client.create_instance(
-            offer_id=str(offer_id),
-            image="pytorch/pytorch:2.1.0-cuda11.8-cudnn8-devel",  # PyTorch with CUDA
-            disk_space=disk_space,
-            env_vars={
+        # If using existing instance, skip instance creation
+        if existing_instance_id:
+            instance_id = existing_instance_id
+            # Get instance info to extract offer details
+            try:
+                instance_status = self.vast_client.get_instance_status(instance_id)
+                # Extract offer_id from instance if available (for job tracking)
+                offer_id = instance_status.get("machine_id") or instance_status.get("offer_id") or "existing"
+                # Create a mock selected_offer dict from instance status for job_info
+                selected_offer = {
+                    "gpu_ram": instance_status.get("gpu_ram", 0),
+                    "dph_total": instance_status.get("dph_total", 0),
+                    "disk_space": instance_status.get("disk_space", disk_space),
+                    "geolocation": instance_status.get("geolocation"),
+                    "location": instance_status.get("location"),
+                    "country": instance_status.get("country"),
+                    "gpu_name": instance_status.get("gpu_name", "Unknown")
+                }
+            except:
+                offer_id = "existing"
+                # Create minimal mock selected_offer if we can't get instance status
+                selected_offer = {
+                    "gpu_ram": 0,
+                    "dph_total": 0,
+                    "disk_space": disk_space,
+                    "gpu_name": "Unknown"
+                }
+        else:
+            # Search for available offers
+            offers = self.vast_client.search_offers(
+                gpu_name=gpu_name,
+                min_gpu_ram=min_gpu_ram,
+                min_disk_space=disk_space,
+                max_price=max_price,
+                num_gpus=num_gpus
+            )
+            
+            if not offers:
+                raise Exception("No suitable GPU offers found on Vast.ai")
+            
+            # Select best offer (first one, already sorted by price)
+            selected_offer = offers[0]
+            offer_id = selected_offer.get("id") or selected_offer.get("offer_id")
+            
+            if not offer_id:
+                raise Exception(f"Invalid offer format: {selected_offer}")
+            
+            # Update adapter path in config if we uploaded a previous adapter
+            if package_info.get("remote_adapter_path"):
+                # Update the config file to use the remote adapter path
+                config_path = Path(package_info["config_path"])
+                if config_path.exists():
+                    import yaml
+                    with open(config_path, 'r') as f:
+                        config_data = yaml.safe_load(f)
+                    config_data["adapter"] = package_info["remote_adapter_path"]
+                    with open(config_path, 'w') as f:
+                        yaml.dump(config_data, f)
+            
+            # Create training script
+            training_script = self.create_training_script(package_info, hf_token=hf_token)
+            
+            # Create onstart command that will:
+            # 1. Install Axolotl
+            # 2. Upload training data (via SSH or volume mount)
+            # 3. Run training
+            onstart_cmd = training_script
+            
+            # Prepare environment variables
+            env_vars = {
                 "TZ": "UTC",
                 "MODEL_NAME": self.model_name
-            },
-            onstart_cmd=onstart_cmd
-        )
-        
-        instance_id = instance_info.get("new_contract") or instance_info.get("id")
+            }
+            # Add HF token if provided (for gated models like Gemma)
+            if hf_token:
+                env_vars["HF_TOKEN"] = hf_token
+                env_vars["HUGGING_FACE_HUB_TOKEN"] = hf_token
+            
+            # Launch instance with minimal script (files will be uploaded after instance is ready)
+            # Use smaller, often-cached image for faster startup
+            instance_info = self.vast_client.create_instance(
+                offer_id=str(offer_id),
+                image="pytorch/pytorch:2.1.0-cuda11.8-cudnn8-runtime",  # Smaller, often cached
+                disk_space=disk_space,
+                env_vars=env_vars,
+                onstart_cmd=onstart_cmd
+            )
+            
+            instance_id = instance_info.get("new_contract") or instance_info.get("id")
         
         # Wait for instance to be ready, then upload files via SCP
         # Note: This requires SSH keys to be configured
@@ -392,7 +644,12 @@ echo "Ready for download"
             "epochs": epochs,  # Store for queue processing
             "learning_rate": learning_rate,  # Store for queue processing
             "hf_model_override": hf_model_override,  # Store for queue processing
+            "ssh_port_override": ssh_port_override,  # Store SSH port override if provided
         }
+        
+        # If SSH port override is provided, save it to the job
+        if ssh_port_override:
+            job_info["ssh_port"] = ssh_port_override
         
         self._save_job(job_info)
         
@@ -427,6 +684,15 @@ echo "Ready for download"
             self.logger.log("INFO", f"Job {job.get('instance_id')} is already finalized, skipping status check")
             return job
         
+        # Preserve "launching" and "validated" statuses - don't overwrite them based on instance status
+        # These statuses are set by the UI workflow and should only change when explicitly updated
+        current_status = job.get("status", "unknown")
+        if current_status in ["launching", "validated"]:
+            # Still get instance info for SSH details, but don't update status
+            preserve_status = True
+        else:
+            preserve_status = False
+        
         # Get current instance status from Vast.ai
         try:
             self.logger.log("INFO", f"Checking status for instance {job['instance_id']}")
@@ -449,9 +715,11 @@ echo "Ready for download"
             # Store old status before updating
             old_status = job.get("status", "unknown")
             
-            # Determine status with improved detection
+            # Determine status with improved detection, but preserve "launching" and "validated" statuses
             determined_status = self._determine_status(instance_status)
-            job["status"] = determined_status
+            if not preserve_status:
+                job["status"] = determined_status
+            # else: keep the existing "launching" or "validated" status
             
             # Update SSH info if available (for connection) - check multiple possible fields
             ssh_host = (instance_status.get("ssh_host") or 
@@ -1298,46 +1566,11 @@ echo "Ready for download"
         except Exception as e:
             raise Exception(f"Error downloading weights: {str(e)}")
         
-        # Destroy the instance after successful download to stop charges
-        instance_destroyed = False
-        destroy_error = None
-        try:
-            destroyed = self.vast_client.destroy_instance(instance_id)
-            if destroyed:
-                print(f"✅ Instance {instance_id} destroyed successfully")
-                instance_destroyed = True
-            else:
-                print(f"⚠️ Warning: destroy_instance returned False for instance {instance_id}")
-                destroy_error = "destroy_instance returned False"
-        except Exception as e:
-            error_msg = str(e)
-            print(f"⚠️ Warning: Error destroying instance {instance_id}: {error_msg}")
-            destroy_error = error_msg
-            # Don't fail the entire operation if instance destruction fails, but track it
-        
-        # Verify instance was actually destroyed by checking status
-        if instance_destroyed:
-            try:
-                # Wait a moment for destruction to propagate
-                import time
-                time.sleep(2)
-                # Try to get instance status - should get 404 if destroyed
-                try:
-                    check_status = self.vast_client.get_instance_status(instance_id)
-                    # If we get here, instance still exists
-                    print(f"⚠️ Warning: Instance {instance_id} still exists after destroy call")
-                    instance_destroyed = False
-                    destroy_error = "Instance still exists after destroy call"
-                except Exception as check_e:
-                    if "404" in str(check_e) or "INSTANCE_NOT_FOUND" in str(check_e):
-                        # Good - instance is actually destroyed
-                        instance_destroyed = True
-                        print(f"✅ Verified: Instance {instance_id} is destroyed (404)")
-                    else:
-                        # Other error - can't verify
-                        print(f"⚠️ Could not verify instance destruction: {check_e}")
-            except Exception as verify_e:
-                print(f"⚠️ Error verifying instance destruction: {verify_e}")
+        # Do NOT stop the instance - user must shut it down manually
+        # This prevents accidental data loss and gives users control
+        print(f"ℹ️ Instance {instance_id} will remain running. User must shut it down manually in Vast.ai to stop charges.")
+        instance_stopped = False  # Track that we did NOT stop it
+        stop_error = None
         
         # Get model metadata for version info
         metadata = self.model_manager.get_model_metadata(self.model_name)
@@ -1357,8 +1590,9 @@ echo "Ready for download"
             "instance_id": instance_id,
             "weights_downloaded": True,
             "weights_path": str(weights_dir),
-            "instance_destroyed": instance_destroyed,
-            "destroy_error": destroy_error if not instance_destroyed else None
+            "instance_stopped": False,  # We don't stop instances anymore
+            "stop_error": None,
+            "note": "Instance is still running. You must shut it down manually in Vast.ai to stop charges."
         }
         metadata_path = version_dir / "version_metadata.json"
         with open(metadata_path, 'w') as f:
@@ -1370,16 +1604,15 @@ echo "Ready for download"
         job["status"] = "completed"
         job["finalized"] = True  # Mark as finalized to prevent going back to launching
         job["finalized_at"] = datetime.now().isoformat()
-        job["instance_destroyed"] = instance_destroyed
+        job["instance_stopped"] = False  # We don't stop instances anymore
         job["weights_downloaded"] = True
         job["weights_path"] = str(weights_dir)
-        if destroy_error:
-            job["destroy_error"] = destroy_error
         self._save_job(job)
         self.logger.log("SUCCESS", f"Training job finalized successfully", {
             "version": version_dir.name,
             "weights_downloaded": True,
-            "instance_destroyed": instance_destroyed
+            "instance_stopped": False,
+            "note": "Instance still running - user must shut down manually"
         })
         
         # Clean up temp directory
@@ -1505,6 +1738,341 @@ echo "Ready for download"
             "message": f"Undo complete: {len(restored_files)} file(s) restored to queue, version folder deleted"
         }
     
+    def validate_instance(self, instance_id: str, ssh_host_override: Optional[str] = None, ssh_port_override: Optional[int] = None) -> Dict:
+        """
+        Validate that an existing instance meets all requirements for training
+        
+        Args:
+            instance_id: Vast.ai instance ID to validate
+        
+        Returns:
+            Dictionary with validation results:
+            {
+                "valid": bool,
+                "errors": List[str],
+                "warnings": List[str],
+                "details": Dict with detailed information
+            }
+        """
+        errors = []
+        warnings = []
+        details = {}
+        
+        try:
+            # 1. Check instance exists and is running
+            try:
+                api_response = self.vast_client.get_instance_status(instance_id)
+                
+                # Extract instance data - API response may have 'instances' key with nested data
+                if "instances" in api_response and isinstance(api_response["instances"], dict):
+                    instance_status = api_response["instances"]
+                elif isinstance(api_response, dict) and "actual_status" in api_response:
+                    # Already at instance level
+                    instance_status = api_response
+                else:
+                    # Try to find instance data in response
+                    instance_status = api_response
+                
+                # Get actual_status - check multiple possible fields
+                actual_status = (instance_status.get("actual_status") or 
+                               instance_status.get("status") or 
+                               "unknown")
+                details["status"] = actual_status
+                
+                if actual_status.lower() != "running":
+                    errors.append(f"Instance is not running. Current status: {actual_status}")
+                    return {
+                        "valid": False,
+                        "errors": errors,
+                        "warnings": warnings,
+                        "details": details
+                    }
+            except Exception as e:
+                error_msg = str(e)
+                if "404" in error_msg or "not found" in error_msg.lower():
+                    errors.append(f"Instance {instance_id} not found. It may have been destroyed.")
+                else:
+                    errors.append(f"Could not get instance status: {error_msg}")
+                return {
+                    "valid": False,
+                    "errors": errors,
+                    "warnings": warnings,
+                    "details": details
+                }
+            
+            # 2. Check SSH connectivity
+            try:
+                # Use manual override if provided, otherwise get from API
+                if ssh_host_override and ssh_port_override:
+                    ssh_host = ssh_host_override
+                    ssh_port = ssh_port_override
+                    details["ssh_host"] = ssh_host
+                    details["ssh_port"] = ssh_port
+                    details["ssh_override"] = True
+                else:
+                    ssh_info = self.get_instance_ssh_info(instance_id)
+                    ssh_host = ssh_info.get("host")
+                    ssh_port = ssh_info.get("port", 22)
+                    details["ssh_host"] = ssh_host
+                    details["ssh_port"] = ssh_port
+                    details["ssh_override"] = False
+                    # Show what we found vs what might be available
+                    raw_data = ssh_info.get("raw_data", {})
+                    if raw_data:
+                        details["ssh_raw_data"] = raw_data
+                
+                if not ssh_host:
+                    errors.append("SSH connection details not available. Instance may still be initializing.")
+                    return {
+                        "valid": False,
+                        "errors": errors,
+                        "warnings": warnings,
+                        "details": details
+                    }
+                
+                # Use the user's actual known_hosts file so we can leverage keys they've already accepted
+                # Also try to add the key if it's not there
+                user_known_hosts = os.path.expanduser("~/.ssh/known_hosts")
+                known_hosts_file = user_known_hosts if os.path.exists(user_known_hosts) else "/dev/null"
+                
+                # Try to add the host key if it's not already in known_hosts
+                try:
+                    # Check if key is already in known_hosts
+                    key_in_file = False
+                    if os.path.exists(user_known_hosts):
+                        with open(user_known_hosts, 'r') as f:
+                            if ssh_host in f.read() or f"[{ssh_host}]:{ssh_port}" in f.read():
+                                key_in_file = True
+                    
+                    # If not in file, try to add it
+                    if not key_in_file:
+                        ssh_keyscan_cmd = [
+                            "ssh-keyscan", "-p", str(ssh_port), "-H", ssh_host
+                        ]
+                        keyscan_result = subprocess.run(ssh_keyscan_cmd, capture_output=True, text=True, timeout=5)
+                        if keyscan_result.returncode == 0 and keyscan_result.stdout:
+                            # Append to user's known_hosts
+                            with open(user_known_hosts, 'a') as f:
+                                f.write(keyscan_result.stdout)
+                            known_hosts_file = user_known_hosts
+                except Exception as e:
+                    # If we can't modify known_hosts, that's okay - use what we have
+                    pass
+                
+                # Test SSH connection
+                # Use accept-new to auto-accept new keys, but prefer existing known_hosts
+                # Don't use LogLevel=ERROR as it suppresses useful error messages
+                test_ssh_cmd = [
+                    "ssh", "-p", str(ssh_port), 
+                    "-o", "StrictHostKeyChecking=accept-new",  # Auto-accept new host keys
+                    "-o", f"UserKnownHostsFile={known_hosts_file}",
+                    "-o", "ConnectTimeout=10",
+                    "-o", "PasswordAuthentication=no",  # Prefer key-based auth
+                    f"root@{ssh_host}",
+                    "echo 'SSH_OK'"
+                ]
+                
+                ssh_test = subprocess.run(test_ssh_cmd, capture_output=True, text=True, timeout=15)
+                
+                if ssh_test.returncode != 0 or "SSH_OK" not in ssh_test.stdout:
+                    # SSH connection failed - provide helpful error message
+                    stderr_msg = ssh_test.stderr.strip() if ssh_test.stderr else ""
+                    stdout_msg = ssh_test.stdout.strip() if ssh_test.stdout else ""
+                    combined_output = (stderr_msg + " " + stdout_msg).lower()
+                    
+                    # Always include the actual error output first
+                    error_detail = f"SSH connection failed (return code: {ssh_test.returncode})"
+                    
+                    # Always show both stderr and stdout for debugging
+                    error_detail += "\n\nSSH Error Output (stderr):"
+                    if stderr_msg:
+                        error_detail += f"\n{stderr_msg}"
+                    else:
+                        error_detail += "\n(empty - no stderr output)"
+                    
+                    error_detail += "\n\nSSH Standard Output (stdout):"
+                    if stdout_msg:
+                        error_detail += f"\n{stdout_msg}"
+                    else:
+                        error_detail += "\n(empty - no stdout output)"
+                    
+                    # Check for specific error patterns and provide guidance
+                    if "connection closed" in combined_output:
+                        error_detail += ("\n\nDiagnosis: Connection is being established but immediately closed by the server.")
+                        # If instance is running, this is likely a Vast.ai SSH gateway issue
+                        # Make it a warning instead of error since user can connect manually
+                        if actual_status.lower() == "running":
+                            error_detail += (f"\n\nNote: This is common with Vast.ai instances. The SSH gateway may close "
+                                           "non-interactive connections. If you can connect manually "
+                                           f"(ssh -p {ssh_port} root@{ssh_host}), the instance is fine.")
+                            error_detail += ("\nYou can proceed to Phase 2 if you've verified SSH works manually.")
+                            warnings.append(f"SSH automated test failed (connection closed by server). If you can connect manually (ssh -p {ssh_port} root@{ssh_host}), you can proceed to Phase 2.")
+                            # Don't add as error - just warning
+                        else:
+                            error_detail += ("\nSolution: Try connecting manually first: ssh -p {} root@{}".format(ssh_port, ssh_host))
+                            errors.append(f"SSH connection test failed. {error_detail}")
+                            errors.append("Note: SSH connectivity is required for Phase 2 (file upload).")
+                    elif "connection refused" in combined_output:
+                        error_detail += ("\n\nDiagnosis: Connection refused - SSH service may not be running.")
+                        error_detail += ("\nSolution: Check the instance status in Vast.ai dashboard.")
+                    elif "permission denied" in combined_output or "authentication failed" in combined_output:
+                        error_detail += ("\n\nDiagnosis: Authentication failed.")
+                        error_detail += ("\nSolution: Ensure your SSH keys are configured in your Vast.ai account settings.")
+                    elif "host key verification failed" in combined_output or ("host key" in combined_output and "verification" in combined_output):
+                        error_detail += (f"\n\nDiagnosis: Host key verification issue.")
+                        error_detail += (f"\nSolution: Try: ssh -p {ssh_port} root@{ssh_host} and accept the host key.")
+                    elif "could not resolve hostname" in combined_output:
+                        error_detail += "\n\nDiagnosis: Could not resolve hostname."
+                        error_detail += "\nSolution: Check network connectivity."
+                    elif ssh_test.returncode == 255:
+                        # Generic SSH error - provide common solutions
+                        error_detail += ("\n\nCommon causes for SSH error 255:")
+                        error_detail += ("\n  1. Host key not accepted - connect manually first: ssh -p {} root@{}".format(ssh_port, ssh_host))
+                        error_detail += ("\n  2. SSH keys not configured - check Vast.ai account settings")
+                        error_detail += ("\n  3. Instance SSH service not ready - wait a few minutes")
+                        error_detail += ("\n  4. Network/firewall issues")
+                        errors.append(f"SSH connection test failed. {error_detail}")
+                        errors.append("Note: SSH connectivity is required for Phase 2 (file upload).")
+                    else:
+                        # Other errors - keep as errors
+                        errors.append(f"SSH connection test failed. {error_detail}")
+                        errors.append("Note: SSH connectivity is required for Phase 2 (file upload).")
+                    
+                    # Continue with other checks to provide full validation report
+                else:
+                    details["ssh_connection_ok"] = True
+            except subprocess.TimeoutExpired:
+                errors.append("SSH connection timed out. Instance may be overloaded or network issues.")
+                return {
+                    "valid": False,
+                    "errors": errors,
+                    "warnings": warnings,
+                    "details": details
+                }
+            except FileNotFoundError:
+                errors.append("SSH client not found. Please install OpenSSH client.")
+                return {
+                    "valid": False,
+                    "errors": errors,
+                    "warnings": warnings,
+                    "details": details
+                }
+            except Exception as e:
+                errors.append(f"SSH connection error: {str(e)}")
+                return {
+                    "valid": False,
+                    "errors": errors,
+                    "warnings": warnings,
+                    "details": details
+                }
+            
+            # 3. Check disk space
+            try:
+                check_disk_cmd = [
+                    "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
+                    f"root@{ssh_host}",
+                    "df -h /workspace 2>/dev/null | tail -1 | awk '{print $4}' | sed 's/G//' || echo '0'"
+                ]
+                disk_result = subprocess.run(check_disk_cmd, capture_output=True, text=True, timeout=10)
+                if disk_result.returncode == 0:
+                    try:
+                        available_gb = float(disk_result.stdout.strip().replace('G', '').replace('M', ''))
+                        # If in MB, convert to GB
+                        if 'M' in disk_result.stdout:
+                            available_gb = available_gb / 1024
+                        details["disk_available_gb"] = available_gb
+                        if available_gb < 50:
+                            warnings.append(f"Low disk space: {available_gb:.1f} GB available. Recommend at least 50 GB.")
+                    except:
+                        warnings.append("Could not parse disk space information.")
+                else:
+                    warnings.append("Could not check disk space.")
+            except Exception as e:
+                warnings.append(f"Disk space check failed: {str(e)[:100]}")
+            
+            # 4. Check GPU availability
+            try:
+                check_gpu_cmd = [
+                    "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
+                    f"root@{ssh_host}",
+                    "nvidia-smi --query-gpu=name,memory.total --format=csv,noheader 2>/dev/null || echo 'NO_GPU'"
+                ]
+                gpu_result = subprocess.run(check_gpu_cmd, capture_output=True, text=True, timeout=10)
+                if "NO_GPU" in gpu_result.stdout or gpu_result.returncode != 0:
+                    errors.append("GPU not detected. Instance may not have GPU access or nvidia-smi is not available.")
+                else:
+                    gpu_info = gpu_result.stdout.strip().split('\n')
+                    details["gpu_info"] = gpu_info
+                    if not gpu_info or not gpu_info[0] or gpu_info[0] == "NO_GPU":
+                        errors.append("No GPU detected on instance.")
+            except Exception as e:
+                warnings.append(f"GPU check failed: {str(e)[:100]}")
+            
+            # 5. Check required directories
+            try:
+                check_dirs_cmd = [
+                    "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
+                    f"root@{ssh_host}",
+                    "test -d /workspace && test -d /workspace/data && test -d /workspace/output && echo 'DIRS_OK' || echo 'DIRS_MISSING'"
+                ]
+                dirs_result = subprocess.run(check_dirs_cmd, capture_output=True, text=True, timeout=10)
+                if "DIRS_MISSING" in dirs_result.stdout:
+                    warnings.append("Required directories (/workspace, /workspace/data, /workspace/output) may be missing. They will be created if needed.")
+                else:
+                    details["directories_ok"] = True
+            except Exception as e:
+                warnings.append(f"Directory check failed: {str(e)[:100]}")
+            
+            # 6. Check Python and basic tools
+            try:
+                check_python_cmd = [
+                    "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
+                    f"root@{ssh_host}",
+                    "python3 --version 2>&1 || python --version 2>&1 || echo 'NO_PYTHON'"
+                ]
+                python_result = subprocess.run(check_python_cmd, capture_output=True, text=True, timeout=10)
+                if "NO_PYTHON" in python_result.stdout or python_result.returncode != 0:
+                    warnings.append("Python may not be available. Training setup will install required tools.")
+                else:
+                    details["python_version"] = python_result.stdout.strip()
+            except Exception as e:
+                warnings.append(f"Python check failed: {str(e)[:100]}")
+            
+            # 7. Check if onstart script has completed (for existing instances, it should be done)
+            try:
+                check_onstart_cmd = [
+                    "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
+                    f"root@{ssh_host}",
+                    "ps aux | grep -E 'bash.*/.launch|onstart' | grep -v grep | head -1 || echo 'no_onstart'"
+                ]
+                onstart_result = subprocess.run(check_onstart_cmd, capture_output=True, text=True, timeout=10)
+                if "no_onstart" not in onstart_result.stdout and onstart_result.stdout.strip():
+                    # Onstart is still running - this is unusual for an existing instance that passed other checks
+                    warnings.append("Onstart script is still running. This is normal if the instance just started, but unusual for an existing instance. Training may be delayed until onstart completes.")
+                    details["onstart_running"] = True
+                else:
+                    details["onstart_running"] = False
+            except Exception as e:
+                # Don't fail validation if we can't check onstart status
+                pass
+            
+            # If we got here with no errors, instance is valid
+            return {
+                "valid": len(errors) == 0,
+                "errors": errors,
+                "warnings": warnings,
+                "details": details
+            }
+            
+        except Exception as e:
+            errors.append(f"Validation error: {str(e)}")
+            return {
+                "valid": False,
+                "errors": errors,
+                "warnings": warnings,
+                "details": details
+            }
+    
     def get_instance_ssh_info(self, instance_id: str) -> Dict:
         """
         Get SSH connection information for an instance
@@ -1523,10 +2091,75 @@ echo "Ready for download"
         else:
             instance_data = instance_status
         
+        # Try multiple fields to find the correct SSH connection info
+        # Vast.ai may provide different connection methods (gateway vs direct)
+        # Priority: Direct IP first, then gateway
+        public_ip = instance_data.get("public_ipaddr") or instance_data.get("ipaddr")
+        ssh_ip = instance_data.get("ssh_ip")
+        ssh_host_gateway = instance_data.get("ssh_host")
+        
+        # Determine if we're using direct IP or gateway
+        using_direct_ip = bool(public_ip or ssh_ip)
+        using_gateway = bool(ssh_host_gateway and not using_direct_ip)
+        
+        # Select host - prefer direct IP
+        ssh_host = (public_ip or
+                   ssh_ip or
+                   ssh_host_gateway or
+                   instance_data.get("host"))
+        
+        # For port selection:
+        # - Direct IP connections typically use port 22 (standard SSH)
+        # - Gateway/proxy connections use ssh_port (which may be a non-standard port like 16890)
+        ssh_port = None
+        
+        if using_direct_ip:
+            # For direct SSH connections, use port 22 (standard SSH port)
+            # Vast.ai direct connections always use port 22
+            ssh_port = 22
+        elif using_gateway:
+            # For gateway/proxy connections, use the ssh_port field
+            ssh_port = (instance_data.get("ssh_port") or
+                       instance_data.get("port") or
+                       instance_data.get("conn_port") or
+                       instance_data.get("connection_port") or
+                       22)
+        else:
+            # Fallback - default to 22
+            ssh_port = 22
+        
+        # Ensure port is an integer
+        try:
+            ssh_port = int(ssh_port)
+        except (ValueError, TypeError):
+            ssh_port = 22
+        
+        # Check for Jupyter connection info (if available)
+        jupyter_url = instance_data.get("jupyter_url") or instance_data.get("jupyter")
+        jupyter_port = instance_data.get("jupyter_port")
+        
         return {
-            "host": instance_data.get("ssh_host") or instance_data.get("public_ipaddr"),
-            "port": instance_data.get("ssh_port") or 22,
-            "status": instance_data.get("actual_status", "unknown")
+            "host": ssh_host,
+            "port": ssh_port,
+            "status": instance_data.get("actual_status", "unknown"),
+            # Jupyter info if available
+            "jupyter_url": jupyter_url,
+            "jupyter_port": jupyter_port,
+            # Also return raw data for debugging
+            "raw_data": {
+                "connection_type": "direct" if using_direct_ip else ("gateway" if using_gateway else "unknown"),
+                "ssh_host": instance_data.get("ssh_host"),
+                "public_ipaddr": instance_data.get("public_ipaddr"),
+                "ipaddr": instance_data.get("ipaddr"),
+                "ssh_ip": instance_data.get("ssh_ip"),
+                "ssh_port": instance_data.get("ssh_port"),
+                "port": instance_data.get("port"),
+                "conn_port": instance_data.get("conn_port"),
+                "connection_port": instance_data.get("connection_port"),
+                "jupyter_url": jupyter_url,
+                "jupyter_port": jupyter_port,
+                "all_keys": list(instance_data.keys())  # For debugging - see all available fields
+            }
         }
     
     def check_training_status(self, instance_id: str) -> Dict:
@@ -1863,11 +2496,31 @@ echo "Ready for download"
                         failure_reason = error_lines[-1][:500]  # Last error with context, truncated
                 
                 # Also check if training actually started by looking for training-related messages
-                if any(indicator in log_lower for indicator in ["starting training", "beginning training", "epoch", "step", "loss", "accelerate launch"]):
+                # Include preprocessing activities (tokenizing, dropping sequences, etc.) as indicators of active training
+                training_indicators = [
+                    "starting training", "beginning training", "epoch", "step", "loss", 
+                    "accelerate launch", "tokenizing", "preprocessing", "pre-process",
+                    "dropping long sequences", "drop samples", "saving the dataset",
+                    "loading dataset", "preparing dataset", "sample packing"
+                ]
+                if any(indicator in log_lower for indicator in training_indicators):
                     training_started = True
             
             # Check if onstart is still running, training might not have started yet
-            if onstart_running and onstart_status == "installing":
+            # But also check if preprocessing is happening (which is part of training)
+            is_preprocessing = False
+            if logs:
+                log_lower = logs.lower()
+                preprocessing_indicators = ["tokenizing", "preprocessing", "pre-process", "dropping long sequences", 
+                                          "drop samples", "saving the dataset", "sample packing", "loading dataset"]
+                is_preprocessing = any(indicator in log_lower for indicator in preprocessing_indicators)
+            
+            if training_running or (onstart_running and is_preprocessing):
+                # Training is actively running (either actual training or preprocessing)
+                status = "training"
+                if is_preprocessing and not training_running:
+                    self.logger.log("INFO", f"Training preprocessing in progress on instance {instance_id}")
+            elif onstart_running and onstart_status == "installing":
                 status = "launching"
                 self.logger.log("INFO", f"Onstart script still installing dependencies on instance {instance_id}")
             elif onstart_running and onstart_status == "waiting_for_files" and not training_files_exist:
@@ -1891,9 +2544,8 @@ echo "Ready for download"
                     "completion_details": completion_details,
                     "has_output": has_output
                 })
-            elif training_running or (onstart_running and onstart_status == "training"):
-                status = "training"
-                self.logger.log("INFO", f"Training is actively running on instance {instance_id}")
+            # This check is now handled earlier in the preprocessing detection above
+            # Keeping for backward compatibility but it should already be set to "training" if preprocessing is detected
             elif training_failed:
                 status = "failed"
                 self.logger.log("ERROR", f"Training appears to have failed on instance {instance_id}", {

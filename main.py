@@ -18,110 +18,71 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# Custom CSS to reduce sidebar padding and improve layout
+# Custom CSS to improve sidebar layout
 st.markdown("""
 <style>
-    /* Remove all top padding from sidebar */
+    /* Sidebar base styling */
     section[data-testid="stSidebar"] {
-        padding-top: 0 !important;
+        padding-top: 1rem !important;
     }
     
-    section[data-testid="stSidebar"] > div {
-        padding-top: 0 !important;
-    }
-    
-    /* Remove padding from sidebar content container */
-    .css-1d391kg {
-        padding-top: 0 !important;
-        padding-bottom: 0.5rem !important;
-    }
-    
-    /* Remove all margins from logo/image */
-    .stImage {
-        margin-top: 0 !important;
-        margin-bottom: 0 !important;
-        padding-top: 0 !important;
-        padding-bottom: 0 !important;
+    /* Logo container styling */
+    #anvil-logo-container {
         display: flex !important;
         justify-content: center !important;
         align-items: center !important;
-    }
-    
-    .stImage > img {
-        margin-top: 0 !important;
-        margin-bottom: 0.25rem !important;
+        margin: 0.5rem 0 !important;
         padding: 0 !important;
     }
     
-    /* Scale logo to 50% and center - more specific selector */
-    section[data-testid="stSidebar"] .stImage {
-        display: flex !important;
-        justify-content: center !important;
-        align-items: center !important;
-    }
-    
-    section[data-testid="stSidebar"] .stImage img {
-        max-width: 50% !important;
-        width: 50% !important;
+    #anvil-logo-container img {
+        max-width: 80% !important;
         height: auto !important;
+        display: block !important;
         margin: 0 auto !important;
     }
     
-    /* Remove padding from sidebar header area */
-    .css-1lcbmhc .css-1d391kg {
-        padding-top: 0 !important;
+    /* Ensure proper spacing for sidebar elements */
+    section[data-testid="stSidebar"] .stMarkdown {
+        margin-top: 0.5rem !important;
+        margin-bottom: 0.5rem !important;
     }
     
-    /* Target the first element in sidebar to remove top spacing */
-    section[data-testid="stSidebar"] > div > div:first-child {
-        padding-top: 0 !important;
-        margin-top: 0 !important;
+    /* First markdown (logo) - minimal top margin */
+    section[data-testid="stSidebar"] .stMarkdown:first-of-type {
+        margin-top: 0.5rem !important;
+        margin-bottom: 0.5rem !important;
     }
     
-    /* Center icon buttons - target Streamlit buttons specifically */
-    button[data-testid*="baseButton"],
-    button[data-testid*="button"],
-    button.stButton > button {
-        display: flex !important;
-        align-items: center !important;
-        justify-content: center !important;
-        text-align: center !important;
-        padding-left: 0 !important;
-        padding-right: 0 !important;
+    /* Horizontal rule spacing */
+    section[data-testid="stSidebar"] hr {
+        margin-top: 0.75rem !important;
+        margin-bottom: 0.75rem !important;
     }
     
-    /* Center button content - target Streamlit's button structure */
-    button[data-testid*="baseButton"] > p,
-    button[data-testid*="button"] > p,
-    button.stButton > button > p,
-    button > p {
-        margin: 0 !important;
-        padding: 0 !important;
-        display: flex !important;
-        align-items: center !important;
-        justify-content: center !important;
-        text-align: center !important;
-        width: 100% !important;
-        line-height: 1 !important;
-        text-indent: 0 !important;
+    /* Subheader spacing */
+    section[data-testid="stSidebar"] .stSubheader {
+        margin-top: 1rem !important;
+        margin-bottom: 0.5rem !important;
     }
     
-    /* Target the button wrapper */
+    /* Button styling */
     .stButton > button {
         display: flex !important;
         align-items: center !important;
         justify-content: center !important;
-        padding: 0.25rem 0.5rem !important;
+        padding: 0.5rem !important;
     }
     
-    .stButton > button > p {
-        margin: 0 !important;
-        padding: 0 !important;
-        width: 100% !important;
-        text-align: center !important;
-        display: flex !important;
-        align-items: center !important;
-        justify-content: center !important;
+    /* Prevent text overlap */
+    section[data-testid="stSidebar"] * {
+        line-height: 1.5 !important;
+    }
+    
+    /* Caption spacing */
+    section[data-testid="stSidebar"] .stCaption {
+        margin-top: 0.25rem !important;
+        margin-bottom: 0.25rem !important;
     }
 </style>
 """, unsafe_allow_html=True)
@@ -144,21 +105,20 @@ def main():
     
     # Sidebar for model selection and navigation
     with st.sidebar:
-        # Display logo if available (with minimal padding)
+        # Display logo if available
         from utils.config import ASSETS_DIR
         logo_path = ASSETS_DIR / "logo.png"
         if logo_path.exists():
-            # Use HTML to display logo at 62.5% size (25% bigger than 50%)
             import base64
             with open(logo_path, "rb") as img_file:
                 img_data = base64.b64encode(img_file.read()).decode()
             st.markdown(
-                f'<div style="display: flex; justify-content: center; margin-bottom: 0.25rem;"><img src="data:image/png;base64,{img_data}" style="width: 78.125%; height: auto;"></div>',
+                f'<div id="anvil-logo-container"><img src="data:image/png;base64,{img_data}" alt="Anvil Logo"></div>',
                 unsafe_allow_html=True
             )
         else:
             st.title("🔨 Anvil")
-        st.markdown("---")
+        st.markdown("<hr style='margin-top: 0.25rem; margin-bottom: 0.5rem;'>", unsafe_allow_html=True)
         
         # Model Profile Selection
         st.subheader("Model Profile Selection")

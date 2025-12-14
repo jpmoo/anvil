@@ -258,9 +258,11 @@ class AxolotlDataPrep:
                               lora_alpha: int = 16,
                               lora_dropout: float = 0.05,
                               learning_rate: float = 2e-4,
-                              num_epochs: int = 3,
+                              num_epochs: int = 10,
                               batch_size: int = 4,
                               gradient_accumulation_steps: int = 4,
+                              max_steps: Optional[int] = None,
+                              train_on_inputs: bool = True,  # Set to True to maximize sample retention
                               output_path: Optional[Path] = None,
                               previous_adapter_path: Optional[str] = None) -> Dict:
         """
@@ -282,13 +284,41 @@ class AxolotlDataPrep:
         Returns:
             Configuration dictionary
         """
+        # Determine model and tokenizer types based on the base model
+        # Default to Llama types, but override for specific model families
+        model_type = "LlamaForCausalLM"
+        tokenizer_type = "LlamaTokenizer"
+        use_model_type = True  # Flag to control whether to include model_type in config
+        
+        base_model_lower = base_model.lower()
+        if "gemma" in base_model_lower:
+            # Gemma 3 uses a different architecture - let Axolotl auto-detect
+            if "gemma-3" in base_model_lower or "gemma3" in base_model_lower:
+                # Don't set model_type for Gemma 3 - let transformers auto-detect
+                use_model_type = False
+                tokenizer_type = "GemmaTokenizer"
+            else:
+                # Gemma 1/2 use GemmaForCausalLM
+                model_type = "GemmaForCausalLM"
+                tokenizer_type = "GemmaTokenizer"
+        elif "mistral" in base_model_lower or "mixtral" in base_model_lower:
+            model_type = "MistralForCausalLM"
+            tokenizer_type = "MistralTokenizer"
+        elif "phi" in base_model_lower:
+            model_type = "PhiForCausalLM"
+            tokenizer_type = "PhiTokenizer"
+        elif "qwen" in base_model_lower:
+            model_type = "Qwen2ForCausalLM"
+            tokenizer_type = "Qwen2Tokenizer"
+        
         config = {
             "base_model": base_model,
             "base_model_config": base_model,
-            "model_type": "LlamaForCausalLM",
-            "tokenizer_type": "LlamaTokenizer",
+            "tokenizer_type": tokenizer_type,
             "load_in_8bit": False,
-            "load_in_4bit": False,
+            "load_in_4bit": True,  # Enable 4-bit quantization to reduce memory usage
+            # Note: Do not set "adapter" for new LoRA training - the lora_* parameters below are sufficient
+            # Axolotl will automatically use LoRA when lora_r, lora_alpha, etc. are present
             "strict": False,
             
             "datasets": [
@@ -298,7 +328,7 @@ class AxolotlDataPrep:
                 }
             ],
             
-            "dataset_preparation_path": "./prepared_data",
+            "dataset_preparation_path": "/workspace/axolotl/prepared_data",
             
             "val_set_size": 0.1,
             "output_dir": output_dir,
@@ -334,7 +364,7 @@ class AxolotlDataPrep:
             "lr_scheduler": "cosine",
             "learning_rate": learning_rate,
             "warmup_steps": 100,
-            "train_on_inputs": False,
+            "train_on_inputs": train_on_inputs,  # True = maximize retention (learns from prompts), False = focus on responses only
             "group_by_length": True,
             "bf16": True,
             "fp16": False,
@@ -347,10 +377,17 @@ class AxolotlDataPrep:
             "dataloader_num_workers": 4
         }
         
+        # Only add model_type if we want to explicitly set it
+        # For Gemma 3, we let Axolotl/transformers auto-detect the correct model type
+        if use_model_type:
+            config["model_type"] = model_type
+        
         # Load previous adapter if provided (for incremental training V2+)
         # Axolotl will load this adapter and continue training from it
+        # Note: If previous_adapter_path is set, it will override the "lora" adapter type
         if previous_adapter_path:
             config["adapter"] = previous_adapter_path
+        # If no previous adapter, the "adapter": "lora" in config above tells Axolotl to create a new LoRA adapter
         
         if output_path:
             import yaml

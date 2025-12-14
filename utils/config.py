@@ -106,4 +106,53 @@ def delete_vast_api_key():
         del config["vast_api_key"]
         save_app_config(config)
 
+def get_hf_token() -> str:
+    """Get Hugging Face token from config or environment"""
+    import os
+    # First check environment variable
+    env_token = os.getenv("HF_TOKEN") or os.getenv("HUGGING_FACE_HUB_TOKEN", "")
+    if env_token:
+        return env_token
+    
+    # Then check config file
+    config = get_app_config()
+    return config.get("hf_token", "")
+
+def save_hf_token(token: str):
+    """Save Hugging Face token to config file"""
+    config = get_app_config()
+    config["hf_token"] = token
+    save_app_config(config)
+
+def delete_hf_token():
+    """Delete Hugging Face token from config file"""
+    config = get_app_config()
+    if "hf_token" in config:
+        del config["hf_token"]
+        save_app_config(config)
+
+def get_model_preferences_file(model_name: str) -> Path:
+    """Get the preferences file path for a specific model"""
+    return MODELS_DIR / model_name / "preferences.json"
+
+def get_model_preferences(model_name: str) -> dict:
+    """Get user preferences for a specific model (prepend text, summary setting, etc.)"""
+    prefs_file = get_model_preferences_file(model_name)
+    if prefs_file.exists():
+        try:
+            import json
+            with open(prefs_file, 'r') as f:
+                return json.load(f)
+        except:
+            return {}
+    return {}
+
+def save_model_preferences(model_name: str, preferences: dict):
+    """Save user preferences for a specific model"""
+    import json
+    prefs_file = get_model_preferences_file(model_name)
+    prefs_file.parent.mkdir(parents=True, exist_ok=True)
+    with open(prefs_file, 'w') as f:
+        json.dump(preferences, f, indent=2)
+
 
