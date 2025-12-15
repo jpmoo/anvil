@@ -1370,11 +1370,7 @@ def render():
                         
                         # Show workspace folder path
                         st.info(f"📁 **Workspace Folder:** `/workspace` (training files: `/workspace/data`, output: `/workspace/output/training`)")
-                        
-                        # Show example commands
-                        with st.expander("📋 SSH Commands & Examples"):
-                            st.code(f"# Connect to instance\n{ssh_command}\n\n# Once connected, navigate to workspace:\ncd /workspace\n\n# View training files:\nls -lh /workspace/data/\n\n# View training output:\nls -lh /workspace/output/training/\n\n# View training logs:\ntail -f /workspace/output/training/training.log\n\n# View debug logs:\ntail -f /workspace/output/training/debug.log", language="bash")
-                    
+
                     st.info("💡 **Click 'Check Instance'** to validate the instance. Phase 2 will only start when all checks pass.")
                     
                     # Terminal output area (scrollable)
@@ -1745,15 +1741,29 @@ def render():
                                     else:
                                         terminal_output.append(f"[WARNING] Cleanup had issues, but continuing...")
                                 
+                                # Check for SSH port override (user-specified port takes precedence)
+                                ssh_port_override = active_job.get("ssh_port_override")
                                 if not ssh_host:
                                     job_status = training_manager.get_job_status(instance_id)
                                     ssh_host = job_status.get("ssh_host")
-                                    ssh_port = job_status.get("ssh_port", 22)
+                                    api_ssh_port = job_status.get("ssh_port", 22)
+                                    
+                                    # Use override port if set, otherwise use API port
+                                    if ssh_port_override:
+                                        ssh_port = ssh_port_override
+                                    else:
+                                        ssh_port = api_ssh_port
+                                    
                                     # Save to job for future use
                                     if ssh_host:
                                         active_job["ssh_host"] = ssh_host
                                         active_job["ssh_port"] = ssh_port
                                         training_manager._save_job(active_job)
+                                elif ssh_port_override:
+                                    # SSH host exists, but check if we need to use port override
+                                    ssh_port = ssh_port_override
+                                else:
+                                    ssh_port = active_job.get("ssh_port", 22)
                                 
                                 if ssh_host:
                                     # Append to existing terminal output (don't clear it)
@@ -2122,13 +2132,25 @@ def render():
                                                             with open(job_config_file, 'r') as f:
                                                                 config = yaml.safe_load(f) or {}
                                                             
-                                                            # Fix adapter issue: Always remove adapter: 'lora' as it causes path interpretation issues
-                                                            if config.get("adapter") == "lora" and not Path(str(config.get("adapter", ""))).exists():
-                                                                del config["adapter"]
-                                                                terminal_output.append(f"[FIX] Removed 'adapter: lora' from config before upload (LoRA will be inferred from lora_* parameters)")
-                                                                # Save the config back with adapter removed
-                                                                with open(job_config_file, 'w') as f:
-                                                                    yaml.dump(config, f, default_flow_style=False, sort_keys=False)
+                                                            # Ensure adapter: 'lora' is set if lora_* parameters exist (required for LoRA mode)
+                                                            # BUT only if there's no existing adapter path (for incremental training)
+                                                            # The path issue is prevented by NOT setting lora_model_dir to output_dir
+                                                            has_lora_params = config.get("lora_r") is not None and config.get("lora_alpha") is not None
+                                                            current_adapter = config.get("adapter")
+                                                            # Only set adapter: "lora" if:
+                                                            # 1. LoRA params exist
+                                                            # 2. No adapter is set, OR adapter is None/null
+                                                            # 3. Adapter is NOT already set to a path (for incremental training)
+                                                            if has_lora_params and (not current_adapter or current_adapter is None):
+                                                                # Check if adapter might be a path (incremental training) - don't override it
+                                                                if not (isinstance(current_adapter, str) and current_adapter.startswith("/")):
+                                                                    config["adapter"] = "lora"
+                                                                    terminal_output.append(f"[FIX] Added 'adapter: lora' to config (required for LoRA mode)")
+                                                                    # Save the config back with adapter added
+                                                                    with open(job_config_file, 'w') as f:
+                                                                        yaml.dump(config, f, default_flow_style=False, sort_keys=False)
+                                                                else:
+                                                                    terminal_output.append(f"[INFO] Keeping existing adapter path for incremental training: {current_adapter}")
                                                             
                                                             # Auto-adjust for small datasets to prevent empty batch errors
                                                             dataset_path = job_package.get('dataset_path')
@@ -2344,13 +2366,25 @@ def render():
                                         
                                         # Get SSH info - prefer saved SSH details from job over API
                                         ssh_host = active_job.get("ssh_host")
-                                        ssh_port = active_job.get("ssh_port", 22)
-                                        
+                                        # Check for SSH port override first (user-specified port takes precedence)
+                                        ssh_port_override = active_job.get("ssh_port_override")
+                                        if ssh_port_override:
+                                            ssh_port = ssh_port_override
+                                        else:
+                                            ssh_port = active_job.get("ssh_port", 22)
+
                                         # If not in job, get from API
                                         if not ssh_host:
                                             job_status = training_manager.get_job_status(instance_id)
                                             ssh_host = job_status.get("ssh_host")
-                                            ssh_port = job_status.get("ssh_port", 22)
+                                            api_ssh_port = job_status.get("ssh_port", 22)
+
+                                            # Use override port if set, otherwise use API port
+                                            if ssh_port_override:
+                                                ssh_port = ssh_port_override
+                                            else:
+                                                ssh_port = api_ssh_port
+                                            
                                             # Save to job for future use
                                             if ssh_host:
                                                 active_job["ssh_host"] = ssh_host
@@ -2480,7 +2514,12 @@ def render():
                             instance_id = active_job.get("instance_id")
                             # Get SSH info - prefer saved SSH details from job over API
                             ssh_host = active_job.get("ssh_host")
-                            ssh_port = active_job.get("ssh_port", 22)
+                            # Check for SSH port override first (user-specified port takes precedence)
+                            ssh_port_override = active_job.get("ssh_port_override")
+                            if ssh_port_override:
+                                ssh_port = ssh_port_override
+                            else:
+                                ssh_port = active_job.get("ssh_port", 22)
                             
                             # If not in job, get from API (proactively retrieve SSH info)
                             if not ssh_host:
@@ -2490,13 +2529,21 @@ def render():
                                 try:
                                     job_status = training_manager.get_job_status(instance_id)
                                     ssh_host = job_status.get("ssh_host")
-                                    ssh_port = job_status.get("ssh_port", 22)
+                                    api_ssh_port = job_status.get("ssh_port", 22)
+                                    
+                                    # Use override port if set, otherwise use API port
+                                    if ssh_port_override:
+                                        ssh_port = ssh_port_override
+                                    else:
+                                        ssh_port = api_ssh_port
+                                    
                                     # Save to job for future use
                                     if ssh_host:
                                         active_job["ssh_host"] = ssh_host
                                         active_job["ssh_port"] = ssh_port
                                         training_manager._save_job(active_job)
-                                        terminal_output.append(f"[SUCCESS] Retrieved SSH info from API: {ssh_host}:{ssh_port}")
+                                        port_source = "override" if ssh_port_override else "API"
+                                        terminal_output.append(f"[SUCCESS] Retrieved SSH info from API: {ssh_host}:{ssh_port} ({port_source})")
                                     else:
                                         terminal_output.append(f"[WARNING] SSH host not available from API - instance may still be initializing")
                                         terminal_output.append(f"[INFO] The 'Start Training' button will appear once SSH info is available")
@@ -2659,14 +2706,20 @@ def render():
                                         f"        fixed = True\n"
                                         f"        print('Fixed tokenizer_type to Qwen2Tokenizer')\n"
                                         f"    \n"
-                                        f"    # Fix adapter issue: Always remove adapter: 'lora' as it causes path interpretation issues\n"
-                                        f"    if config.get('adapter') == 'lora':\n"
-                                        f"        import os\n"
-                                        f"        adapter_path = str(config.get('adapter', ''))\n"
-                                        f"        if not os.path.exists(adapter_path):\n"
-                                        f"            del config['adapter']\n"
+                                        f"    # Ensure adapter: 'lora' is set if lora_* parameters exist (required for LoRA mode)\n"
+                                        f"    # BUT only if there's no existing adapter path (for incremental training)\n"
+                                        f"    # The path issue is prevented by NOT setting lora_model_dir to output_dir\n"
+                                        f"    has_lora_params = config.get('lora_r') is not None and config.get('lora_alpha') is not None\n"
+                                        f"    current_adapter = config.get('adapter')\n"
+                                        f"    # Only set adapter: 'lora' if no adapter is set AND it's not a path (incremental training)\n"
+                                        f"    if has_lora_params and (not current_adapter or current_adapter is None):\n"
+                                        f"        # Don't override if adapter is already set to a path (incremental training)\n"
+                                        f"        if not (isinstance(current_adapter, str) and current_adapter.startswith('/')):\n"
+                                        f"            config['adapter'] = 'lora'\n"
                                         f"            fixed = True\n"
-                                        f"            print('Removed adapter: lora (LoRA will be inferred from lora_* parameters)')\n"
+                                        f"            print('Added adapter: lora (required for LoRA mode)')\n"
+                                        f"        else:\n"
+                                        f"            print(f'Keeping existing adapter path for incremental training: {{current_adapter}}')\n"
                                         f"    \n"
                                         f"    # CRITICAL: Remove lora_model_dir if it's set to output_dir (causes Axolotl to try loading from there)\n"
                                         f"    # lora_model_dir should only be set to a valid adapter path (for incremental training)\n"
@@ -2857,13 +2910,25 @@ def render():
                             instance_id = active_job.get("instance_id")
                             # Get SSH info - prefer saved SSH details from job over API
                             ssh_host = active_job.get("ssh_host")
-                            ssh_port = active_job.get("ssh_port", 22)
+                            # Check for SSH port override first (user-specified port takes precedence)
+                            ssh_port_override = active_job.get("ssh_port_override")
+                            if ssh_port_override:
+                                ssh_port = ssh_port_override
+                            else:
+                                ssh_port = active_job.get("ssh_port", 22)
                             
                             # If not in job, get from API
                             if not ssh_host:
                                 job_status = training_manager.get_job_status(instance_id)
                                 ssh_host = job_status.get("ssh_host")
-                                ssh_port = job_status.get("ssh_port", 22)
+                                api_ssh_port = job_status.get("ssh_port", 22)
+                                
+                                # Use override port if set, otherwise use API port
+                                if ssh_port_override:
+                                    ssh_port = ssh_port_override
+                                else:
+                                    ssh_port = api_ssh_port
+                                
                                 # Save to job for future use
                                 if ssh_host:
                                     active_job["ssh_host"] = ssh_host
@@ -2949,6 +3014,117 @@ def render():
                                 terminal_output.append(f"[YAML DEBUG] SSH not available - cannot check remote files")
                             
                             terminal_output.append(f"[{datetime.now().strftime('%H:%M:%S')}] === End YAML Debugging ===")
+                            
+                            # Run comprehensive LoRA verification
+                            terminal_output.append(f"[{datetime.now().strftime('%H:%M:%S')}] === LoRA Configuration Verification ===")
+                            
+                            if ssh_host:
+                                lora_verify_cmd = [
+                                    "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
+                                    f"root@{ssh_host}",
+                                    "cd /workspace/data && python3 << 'PYTHON_EOF'\n"
+                                    "import yaml\n"
+                                    "import os\n"
+                                    "import json\n"
+                                    "try:\n"
+                                    "    with open('axolotl_config.yaml', 'r') as f:\n"
+                                    "        config = yaml.safe_load(f) or {}\n"
+                                    "    \n"
+                                    "    print('LORA_VERIFICATION:')\n"
+                                    "    \n"
+                                    "    # Check LoRA parameters\n"
+                                    "    lora_r = config.get('lora_r')\n"
+                                    "    lora_alpha = config.get('lora_alpha')\n"
+                                    "    lora_dropout = config.get('lora_dropout')\n"
+                                    "    lora_target_modules = config.get('lora_target_modules', [])\n"
+                                    "    adapter_val = config.get('adapter')\n"
+                                    "    base_model = config.get('base_model', '')\n"
+                                    "    \n"
+                                    "    print(f'adapter={adapter_val}')\n"
+                                    "    print(f'base_model={base_model}')\n"
+                                    "    print(f'lora_r={lora_r}')\n"
+                                    "    print(f'lora_alpha={lora_alpha}')\n"
+                                    "    print(f'lora_dropout={lora_dropout}')\n"
+                                    "    print(f'lora_target_modules_count={len(lora_target_modules) if lora_target_modules else 0}')\n"
+                                    "    \n"
+                                    "    # Check if adapter: 'lora' is set (required for new LoRA training)\n"
+                                    "    is_new_lora = (adapter_val == 'lora' and lora_r is not None)\n"
+                                    "    print(f'is_new_lora={is_new_lora}')\n"
+                                    "    \n"
+                                    "    # Check if adapter path exists (for incremental training)\n"
+                                    "    is_incremental = False\n"
+                                    "    adapter_exists = False\n"
+                                    "    adapter_config_exists = False\n"
+                                    "    base_model_match = False\n"
+                                    "    \n"
+                                    "    if adapter_val and isinstance(adapter_val, str) and adapter_val.startswith('/'):\n"
+                                    "        is_incremental = True\n"
+                                    "        adapter_exists = os.path.exists(adapter_val)\n"
+                                    "        adapter_config_path = os.path.join(adapter_val, 'adapter_config.json')\n"
+                                    "        adapter_config_exists = os.path.exists(adapter_config_path)\n"
+                                    "        \n"
+                                    "        print(f'adapter_path={adapter_val}')\n"
+                                    "        print(f'adapter_exists={adapter_exists}')\n"
+                                    "        print(f'adapter_config_exists={adapter_config_exists}')\n"
+                                    "        \n"
+                                    "        # Verify base model matches\n"
+                                    "        if adapter_config_exists:\n"
+                                    "            try:\n"
+                                    "                with open(adapter_config_path, 'r') as f:\n"
+                                    "                    adapter_config = json.load(f)\n"
+                                    "                    adapter_base = adapter_config.get('base_model_name', '')\n"
+                                    "                    base_model_match = (adapter_base == base_model) if adapter_base and base_model else False\n"
+                                    "                    print(f'adapter_base_model={adapter_base}')\n"
+                                    "                    print(f'base_model_match={base_model_match}')\n"
+                                    "            except Exception as e:\n"
+                                    "                print(f'adapter_config_read_error={e}')\n"
+                                    "    \n"
+                                    "    # Determine LoRA status\n"
+                                    "    lora_enabled = is_new_lora or (is_incremental and adapter_config_exists)\n"
+                                    "    print(f'lora_enabled={lora_enabled}')\n"
+                                    "    \n"
+                                    "    # Check lora_model_dir (should NOT be set to output_dir)\n"
+                                    "    lora_model_dir = config.get('lora_model_dir', '')\n"
+                                    "    output_dir = config.get('output_dir', '')\n"
+                                    "    lora_model_dir_issue = (lora_model_dir == output_dir)\n"
+                                    "    print(f'lora_model_dir={lora_model_dir}')\n"
+                                    "    print(f'lora_model_dir_issue={lora_model_dir_issue}')\n"
+                                    "    \n"
+                                    "except Exception as e:\n"
+                                    "    print(f'ERROR: {str(e)}')\n"
+                                    "PYTHON_EOF"
+                                ]
+                                lora_verify_result = subprocess.run(lora_verify_cmd, capture_output=True, text=True, timeout=20)
+                                if lora_verify_result.returncode == 0:
+                                    verify_output = lora_verify_result.stdout.strip()
+                                    if "LORA_VERIFICATION:" in verify_output:
+                                        for line in verify_output.split("\n"):
+                                            if "=" in line and "LORA_VERIFICATION" not in line:
+                                                if "lora_enabled=True" in line:
+                                                    terminal_output.append(f"[LoRA VERIFY] ✓ LoRA is enabled")
+                                                elif "lora_enabled=False" in line:
+                                                    terminal_output.append(f"[LoRA VERIFY] ✗ LoRA is NOT enabled")
+                                                elif "is_new_lora=True" in line:
+                                                    terminal_output.append(f"[LoRA VERIFY] ✓ New LoRA training detected (adapter: lora)")
+                                                elif "is_incremental=True" in line:
+                                                    terminal_output.append(f"[LoRA VERIFY] ✓ Incremental training detected")
+                                                elif "adapter_config_exists=True" in line:
+                                                    terminal_output.append(f"[LoRA VERIFY] ✓ Adapter config found (adapter is valid)")
+                                                elif "base_model_match=True" in line:
+                                                    terminal_output.append(f"[LoRA VERIFY] ✓ Base model matches between adapter and config")
+                                                elif "base_model_match=False" in line:
+                                                    terminal_output.append(f"[LoRA VERIFY] ⚠ Base model mismatch detected")
+                                                elif "lora_model_dir_issue=True" in line:
+                                                    terminal_output.append(f"[LoRA VERIFY] ⚠ lora_model_dir points to output_dir (may cause issues)")
+                                                elif "adapter=lora" in line:
+                                                    terminal_output.append(f"[LoRA VERIFY] ✓ Config has adapter: lora")
+                                                elif "adapter=" in line and "/" in line:
+                                                    adapter_path = line.split("=")[1].strip()
+                                                    terminal_output.append(f"[LoRA VERIFY] ✓ Config has adapter path: {adapter_path}")
+                                else:
+                                    terminal_output.append(f"[LoRA VERIFY] Error running verification: {lora_verify_result.stderr[:200]}")
+                            
+                            terminal_output.append(f"[{datetime.now().strftime('%H:%M:%S')}] === End LoRA Verification ===")
                             
                             st.session_state[terminal_output_key] = terminal_output
                             st.session_state[phase3_yaml_debug_key] = True
@@ -3375,252 +3551,180 @@ def render():
                                             
                                             st.session_state[terminal_output_key] = terminal_output
                                             
-                                            # Setup script that installs dependencies and starts training
-                                            # This mirrors the onstart script but runs directly
-                                            # Use a here-doc to avoid quote escaping issues
-
-                                            # Build HF token export section
-                                            if hf_token:
-                                                hf_token_escaped = hf_token.replace("'", "'\"'\"'")
-                                                hf_token_export = f"export HF_TOKEN='{hf_token_escaped}'\nexport HUGGING_FACE_HUB_TOKEN='{hf_token_escaped}'\n"
-                                            else:
-                                                hf_token_export = ""
+                                            # Use the same method as Redo Phase 3 - simpler and more reliable
+                                            # Use a here-document to pass the command more reliably through SSH
+                                            # This avoids issues with quote escaping and command length
                                             
-                                            # Build the script by concatenating parts
-                                            script_parts = [
-                                                "bash << 'TRAIN_SCRIPT'\n",
-                                                "set -e\n",
-                                                "cd /workspace\n",
-                                                "\n",
-                                                "# Check if axolotl is already installed\n",
-                                                "AXOLOTL_INSTALLED=0\n",
-                                                "if [ -d axolotl ]; then\n",
-                                                " /opt/conda/bin/python -c 'import axolotl' 2>/dev/null && AXOLOTL_INSTALLED=1 || python3 -c 'import axolotl' 2>/dev/null && AXOLOTL_INSTALLED=1 || python -c 'import axolotl' 2>/dev/null && AXOLOTL_INSTALLED=1 || true\n",
-                                                "fi\n",
-                                                "\n",
-                                                "if [ $AXOLOTL_INSTALLED -eq 0 ]; then\n",
-                                                " echo 'Installing axolotl...'\n",
-                                                " if [ ! -d axolotl ]; then\n",
-                                                "  git clone https://github.com/OpenAccess-AI-Collective/axolotl.git || true\n",
-                                                " fi\n",
-                                                " cd axolotl\n",
-                                                " /opt/conda/bin/pip install -e . || pip3 install -e . || pip install -e . || true\n",
-                                                "else\n",
-                                                " echo 'Axolotl already installed, skipping...'\n",
-                                                " cd axolotl || (git clone https://github.com/OpenAccess-AI-Collective/axolotl.git && cd axolotl)\n",
-                                                "fi\n",
-                                                "\n",
-                                                "# Check and install dependencies\n",
-                                                "echo 'Checking dependencies...'\n",
-                                                "PYTHON_CMD='/opt/conda/bin/python'\n",
-                                                "DEPS_INSTALLED=0\n",
-                                                "$PYTHON_CMD -c 'import accelerate' 2>/dev/null && DEPS_INSTALLED=1 || python3 -c 'import accelerate' 2>/dev/null && DEPS_INSTALLED=1 || python -c 'import accelerate' 2>/dev/null && DEPS_INSTALLED=1 || true\n",
-                                                "\n",
-                                                "if [ $DEPS_INSTALLED -eq 0 ]; then\n",
-                                                " echo 'Installing accelerate, huggingface_hub, peft, bitsandbytes...'\n",
-                                                " INSTALL_SUCCESS=0\n",
-                                                " $PYTHON_CMD -m pip install accelerate huggingface_hub peft bitsandbytes && INSTALL_SUCCESS=1 || \\\n",
-                                                " python3 -m pip install accelerate huggingface_hub peft bitsandbytes && INSTALL_SUCCESS=1 || \\\n",
-                                                " python -m pip install accelerate huggingface_hub peft bitsandbytes && INSTALL_SUCCESS=1 || true\n",
-                                                " \n",
-                                                " # Verify installation worked\n",
-                                                " if [ $INSTALL_SUCCESS -eq 1 ]; then\n",
-                                                "  $PYTHON_CMD -c 'import accelerate' 2>/dev/null && DEPS_INSTALLED=1 || python3 -c 'import accelerate' 2>/dev/null && DEPS_INSTALLED=1 || python -c 'import accelerate' 2>/dev/null && DEPS_INSTALLED=1 || true\n",
-                                                " fi\n",
-                                                " \n",
-                                                " if [ $DEPS_INSTALLED -eq 0 ]; then\n",
-                                                "  echo 'ERROR: Failed to install accelerate'\n",
-                                                "  exit 1\n",
-                                                " fi\n",
-                                                " echo 'Dependencies installed successfully'\n",
-                                                "else\n",
-                                                " echo 'Dependencies already installed, skipping...'\n",
-                                                "fi\n",
-                                                "\n",
-                                                "# Set Hugging Face token for gated models\n",
-                                                hf_token_export,
-                                                "\n",
-                                                "# Start training\n",
-                                                "echo 'Starting training...'\n",
-                                                "cd /workspace/data\n",
-                                                "CF='/workspace/data/axolotl_config.yaml'\n",
-                                                "cd /workspace/axolotl\n",
-                                                "# Try each Python command in sequence\n",
-                                                "# Check which Python has accelerate available first\n",
-                                                "TRAIN_PYTHON=''\n",
-                                                "if $PYTHON_CMD -c 'import accelerate' 2>/dev/null; then\n",
-                                                " TRAIN_PYTHON='$PYTHON_CMD'\n",
-                                                "elif python3 -c 'import accelerate' 2>/dev/null; then\n",
-                                                " TRAIN_PYTHON='python3'\n",
-                                                "elif python -c 'import accelerate' 2>/dev/null; then\n",
-                                                " TRAIN_PYTHON='python'\n",
-                                                "fi\n",
-                                                "\n",
-                                                "if [ -z \"$TRAIN_PYTHON\" ]; then\n",
-                                                " echo 'ERROR: accelerate not found in any Python'\n",
-                                                " exit 1\n",
-                                                "fi\n",
-                                                "\n",
-                                                "# Find accelerate executable from the Python that has accelerate\n",
-                                                "echo \"Starting training with $TRAIN_PYTHON\"\n",
-                                                "# Get the directory containing the Python executable\n",
-                                                "if [[ \"$TRAIN_PYTHON\" == /* ]]; then\n",
-                                                " PYTHON_DIR=$(dirname \"$TRAIN_PYTHON\")\n",
-                                                " ACCELERATE_CMD=\"$PYTHON_DIR/accelerate\"\n",
-                                                "else\n",
-                                                " ACCELERATE_CMD=$(command -v accelerate 2>/dev/null || echo \"accelerate\")\n",
-                                                "fi\n",
-                                                "# Try accelerate command, fallback to python -m accelerate.commands.launch\n",
-                                                "# Note: HF_TOKEN and HUGGING_FACE_HUB_TOKEN are already exported above\n",
-                                                "if [ -f \"$ACCELERATE_CMD\" ] || command -v accelerate >/dev/null 2>&1; then\n",
-                                                " nohup $ACCELERATE_CMD launch -m axolotl.cli.train \"$CF\" > /workspace/output/training/training.log 2>&1 &\n",
-                                                "else\n",
-                                                " nohup $TRAIN_PYTHON -m accelerate.commands.launch -m axolotl.cli.train \"$CF\" > /workspace/output/training/training.log 2>&1 &\n",
-                                                "fi\n",
-                                                "TRAIN_PID=$!\n",
-                                                "sleep 3\n",
-                                                "# Verify the process is actually running\n",
-                                                "if ps -p $TRAIN_PID > /dev/null 2>&1 || pgrep -f 'axolotl.cli.train' > /dev/null 2>&1; then\n",
-                                                " echo \"Training started successfully (PID: $TRAIN_PID)\"\n",
-                                                "else\n",
-                                                " echo 'ERROR: Training process did not start'\n",
-                                                " echo 'Last 20 lines of log:'\n",
-                                                " tail -20 /workspace/output/training/training.log 2>/dev/null || echo 'No log file'\n",
-                                                " echo 'Checking if accelerate is available:'\n",
-                                                " $TRAIN_PYTHON -c 'import accelerate; print(accelerate.__version__)' 2>&1 || echo 'accelerate import failed'\n",
-                                                " exit 1\n",
-                                                "fi\n",
-                                                "echo 'Training started'\n",
-                                                "TRAIN_SCRIPT"
-                                            ]
-                                            setup_and_train_cmd = "".join(script_parts)
-                                            
-                                            # Start training in background
-                                            terminal_output.append(f"[SSH] Installing dependencies and starting training...")
+                                            terminal_output.append(f"[SSH] Starting training...")
                                             terminal_output.append(f"[DEBUG] Using SSH port: {ssh_port} for training command")
-                                            # Write script to remote file first to avoid quote escaping issues
-                                            script_content = setup_and_train_cmd
                                             
-                                            # Write the script to a file on the remote server
-                                            write_cmd = [
+                                            # Build HF token export section - same as Redo Phase 3
+                                            token_exports = ""
+                                            if hf_token and isinstance(hf_token, str) and hf_token.strip():
+                                                hf_token_clean = hf_token.strip().replace('\n', '').replace('\r', '').replace(';', '').replace('`', '')
+                                                if hf_token_clean:
+                                                    hf_token_escaped = hf_token_clean.replace("'", "'\"'\"'")
+                                                    token_exports = f"export HF_TOKEN='{hf_token_escaped}'\nexport HUGGING_FACE_HUB_TOKEN='{hf_token_escaped}'\n"
+                                                    terminal_output.append(f"[INFO] HF token prepared for export (length: {len(hf_token_clean)})")
+                                            else:
+                                                terminal_output.append(f"[WARNING] No HF token found - gated models (e.g., Gemma) may fail to load")
+                                            
+                                            # Use the same here-document approach as Redo Phase 3
+                                            ssh_command = f"""bash << 'REMOTE_SCRIPT'
+set -e
+{token_exports}cd /workspace/axolotl
+TRAIN_PYTHON=''
+if /opt/conda/bin/python -c 'import accelerate; import axolotl' 2>/dev/null; then
+ TRAIN_PYTHON='/opt/conda/bin/python'
+elif python3 -c 'import accelerate; import axolotl' 2>/dev/null; then
+ TRAIN_PYTHON='python3'
+elif python -c 'import accelerate; import axolotl' 2>/dev/null; then
+ TRAIN_PYTHON='python'
+fi
+if [ -z "$TRAIN_PYTHON" ]; then
+ echo 'ERROR: accelerate or axolotl not found'
+ exit 1
+fi
+if [[ "$TRAIN_PYTHON" == /* ]]; then
+ PYTHON_DIR=$(dirname "$TRAIN_PYTHON")
+ ACCELERATE_CMD="$PYTHON_DIR/accelerate"
+else
+ ACCELERATE_CMD=$(command -v accelerate 2>/dev/null || echo "accelerate")
+fi
+if [ -f "$ACCELERATE_CMD" ] || command -v accelerate >/dev/null 2>&1; then
+ nohup $ACCELERATE_CMD launch -m axolotl.cli.train /workspace/data/axolotl_config.yaml > /workspace/output/training/training.log 2>&1 < /dev/null &
+else
+ nohup $TRAIN_PYTHON -m accelerate.commands.launch -m axolotl.cli.train /workspace/data/axolotl_config.yaml > /workspace/output/training/training.log 2>&1 < /dev/null &
+fi
+REMOTE_SCRIPT"""
+                                            
+                                            # Log the axolotl command that will be executed
+                                            terminal_output.append(f"[DEBUG] Axolotl training command that will be executed:")
+                                            terminal_output.append(f"[DEBUG]   accelerate launch -m axolotl.cli.train /workspace/data/axolotl_config.yaml")
+                                            
+                                            training_cmd = [
                                                 "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
+                                                "-o", "ServerAliveInterval=5", "-o", "ServerAliveCountMax=2",
                                                 f"root@{ssh_host}",
-                                                "cat > /tmp/start_training.sh"
+                                                ssh_command
                                             ]
-                                            write_result = subprocess.run(write_cmd, capture_output=True, text=True, timeout=30, input=script_content)
+                                            terminal_output.append(f"[DEBUG] Executing training command via SSH on port: {ssh_port}")
+                                            terminal_output.append(f"[DEBUG] SSH command: ssh -p {ssh_port} root@{ssh_host}")
                                             
-                                            if write_result.returncode == 0:
-                                                # Make executable and run
-                                                chmod_cmd = [
-                                                    "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
-                                                    "-o", "ServerAliveInterval=60", "-o", "ServerAliveCountMax=3",
-                                                    f"root@{ssh_host}",
-                                                    "chmod +x /tmp/start_training.sh && bash /tmp/start_training.sh 2>&1"
-                                                ]
-                                                training_result = subprocess.run(chmod_cmd, capture_output=True, text=True, timeout=600)
+                                            try:
+                                                training_result = subprocess.run(training_cmd, capture_output=True, text=True, timeout=5)
+                                                terminal_output.append(f"[DEBUG] Training command return code: {training_result.returncode}")
                                                 
-                                                # Show output from script execution - show more lines for debugging
-                                                if training_result.stdout:
-                                                    stdout_filtered = filter_malloc_warnings(training_result.stdout)
-                                                    # Show all output, not just last 10 lines
-                                                    for line in stdout_filtered.strip().split("\n"):
-                                                        if line.strip():
-                                                            terminal_output.append(f"[SCRIPT] {line[:200]}")
-                                                if training_result.stderr:
-                                                    stderr_filtered = filter_malloc_warnings(training_result.stderr)
-                                                    # Show all stderr output
-                                                    for line in stderr_filtered.strip().split("\n"):
-                                                        if line.strip():
-                                                            terminal_output.append(f"[SCRIPT ERROR] {line[:200]}")
-                                                
-                                                # Log return code for debugging
-                                                terminal_output.append(f"[DEBUG] Script execution return code: {training_result.returncode}")
-                                            else:
-                                                error_msg = filter_malloc_warnings(write_result.stderr or write_result.stdout)
-                                                terminal_output.append(f"[ERROR] Failed to write script to remote server")
-                                                if write_result.stdout:
-                                                    terminal_output.append(f"[ERROR] stdout: {write_result.stdout[:500]}")
-                                                if write_result.stderr:
-                                                    terminal_output.append(f"[ERROR] stderr: {write_result.stderr[:500]}")
-                                                training_result = write_result
+                                                if training_result.returncode == 0:
+                                                    terminal_output.append(f"[SSH] Training command executed")
+                                                    if training_result.stdout:
+                                                        stdout_filtered = filter_malloc_warnings(training_result.stdout)
+                                                        for line in stdout_filtered.strip().split("\n"):
+                                                            if line.strip():
+                                                                terminal_output.append(f"[SSH] {line[:200]}")
+                                                else:
+                                                    terminal_output.append(f"[SSH] Training command sent (return code: {training_result.returncode}, checking process status...)")
+                                                    if training_result.stdout:
+                                                        stdout_filtered = filter_malloc_warnings(training_result.stdout)
+                                                        for line in stdout_filtered.strip().split("\n"):
+                                                            if line.strip():
+                                                                terminal_output.append(f"[STDOUT] {line[:200]}")
+                                                    if training_result.stderr:
+                                                        stderr_filtered = filter_malloc_warnings(training_result.stderr)
+                                                        for line in stderr_filtered.strip().split("\n"):
+                                                            if line.strip():
+                                                                terminal_output.append(f"[STDERR] {line[:200]}")
+                                            except subprocess.TimeoutExpired:
+                                                # Timeout is expected - the process is running in background
+                                                terminal_output.append(f"[SSH] Training command sent (timeout expected for background process)")
+                                            except Exception as e:
+                                                terminal_output.append(f"[ERROR] Exception while executing training command: {str(e)}")
+                                                import traceback
+                                                terminal_output.append(f"[ERROR] Traceback: {traceback.format_exc()[:300]}")
                                             
-                                            # Verify training actually started by checking for the process
-                                            if training_result.returncode == 0:
-                                                # Wait a moment for process to start
-                                                import time
-                                                time.sleep(2)
-                                                
-                                                # Check if training process is actually running
-                                                check_process_cmd = [
+                                            # Wait a moment and then check if the process actually started
+                                            import time
+                                            time.sleep(3)
+                                            
+                                            # Quick check to see if log file is being created
+                                            try:
+                                                quick_log_check_cmd = [
                                                     "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
                                                     f"root@{ssh_host}",
-                                                    "ps aux | grep -E '(axolotl|accelerate|train)' | grep -v grep | head -1 || echo 'no_training'"
+                                                    "test -f /workspace/output/training/training.log && (wc -l /workspace/output/training/training.log && tail -20 /workspace/output/training/training.log) || echo 'log_not_created'"
                                                 ]
-                                                try:
-                                                    process_check = subprocess.run(check_process_cmd, capture_output=True, text=True, timeout=15)
+                                                quick_log_check = subprocess.run(quick_log_check_cmd, capture_output=True, text=True, timeout=10)
+                                                if "log_not_created" not in quick_log_check.stdout:
+                                                    log_output = quick_log_check.stdout.strip()
+                                                    lines = log_output.split('\n')
+                                                    if len(lines) > 0:
+                                                        log_lines = lines[0]
+                                                        terminal_output.append(f"[SSH] Log file created: {log_lines}")
+                                                        if len(lines) > 1:
+                                                            log_content = '\n'.join(lines[1:])
+                                                            if log_content.strip():
+                                                                terminal_output.append(f"[SSH] Recent log content (showing more lines):")
+                                                                for line in log_content.strip().split('\n'):
+                                                                    if line.strip():
+                                                                        terminal_output.append(f"[SSH]   {line[:200]}")
+                                                else:
+                                                    terminal_output.append(f"[WARNING] Log file not created yet - training may not have started")
+                                            except subprocess.TimeoutExpired:
+                                                terminal_output.append(f"[WARNING] Log check timed out")
+                                            except Exception as e:
+                                                terminal_output.append(f"[WARNING] Could not check log file: {str(e)}")
+                                            
+                                            # Always check if process started, regardless of command result
+                                            terminal_output.append(f"[SSH] Verifying training process started...")
+                                            
+                                            # Wait a moment and verify training process is running
+                                            try:
+                                                verify_cmd = [
+                                                    "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
+                                                    f"root@{ssh_host}",
+                                                    "sleep 3 && ps aux | grep -E '(accelerate|axolotl)' | grep -v grep | head -2 || echo 'no_process'"
+                                                ]
+                                                verify_result = subprocess.run(verify_cmd, capture_output=True, text=True, timeout=15)
+                                                
+                                                if "no_process" not in verify_result.stdout:
+                                                    stdout_filtered = filter_malloc_warnings(verify_result.stdout)
+                                                    terminal_output.append(f"[SSH] Training process found:")
+                                                    for line in stdout_filtered.strip().split("\n")[:2]:
+                                                        if line.strip():
+                                                            terminal_output.append(f"[SSH]   {line[:150]}")
+                                                    terminal_output.append(f"[SUCCESS] Training started successfully!")
                                                     
-                                                    if "no_training" not in process_check.stdout and process_check.stdout.strip():
-                                                        terminal_output.append(f"[SUCCESS] Training started successfully!")
-                                                        terminal_output.append(f"[INFO] Training is running in the background.")
-                                                        terminal_output.append(f"[INFO] Click 'Check Training Status' to monitor progress.")
-                                                        
-                                                        # Update job status
-                                                        active_job["training_status"] = {"status": "training"}
-                                                        training_manager._save_job(active_job)
+                                                    # Update job status
+                                                    active_job["training_status"] = {"status": "training"}
+                                                    training_manager._save_job(active_job)
+                                                else:
+                                                    terminal_output.append(f"[WARNING] Training command executed but process not found yet")
+                                                    
+                                                    # Check training log for errors
+                                                    check_log_cmd = [
+                                                        "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
+                                                        f"root@{ssh_host}",
+                                                        "tail -50 /workspace/output/training/training.log 2>/dev/null || echo 'no_log'"
+                                                    ]
+                                                    log_check = subprocess.run(check_log_cmd, capture_output=True, text=True, timeout=15)
+                                                    if "no_log" not in log_check.stdout:
+                                                        log_output = filter_malloc_warnings(log_check.stdout)
+                                                        terminal_output.append(f"[WARNING] Last log output (showing more lines for debugging):")
+                                                        for line in log_output.strip().split("\n"):
+                                                            if line.strip():
+                                                                terminal_output.append(f"[LOG] {line[:200]}")
                                                     else:
-                                                        # Script ran but training didn't start - check logs
-                                                        check_log_cmd = [
-                                                            "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
-                                                            f"root@{ssh_host}",
-                                                            "tail -50 /workspace/output/training/training.log 2>/dev/null || echo 'no_log'"
-                                                        ]
-                                                        log_check = subprocess.run(check_log_cmd, capture_output=True, text=True, timeout=15)
-                                                        if "no_log" not in log_check.stdout:
-                                                            log_output = filter_malloc_warnings(log_check.stdout)
-                                                            terminal_output.append(f"[WARNING] Script completed but training process not found.")
-                                                            terminal_output.append(f"[WARNING] Last log output (showing more lines for debugging):")
-                                                            for line in log_output.strip().split("\n"):
-                                                                if line.strip():
-                                                                    terminal_output.append(f"[LOG] {line[:200]}")
-                                                        else:
-                                                            terminal_output.append(f"[WARNING] Training log file not found at /workspace/output/training/training.log")
-                                                        
-                                                        # Also check if script file exists and show its contents for debugging
-                                                        check_script_cmd = [
-                                                            "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
-                                                            f"root@{ssh_host}",
-                                                            "cat /tmp/start_training.sh 2>/dev/null | tail -30 || echo 'script_not_found'"
-                                                        ]
-                                                        script_check = subprocess.run(check_script_cmd, capture_output=True, text=True, timeout=15)
-                                                        if "script_not_found" not in script_check.stdout:
-                                                            terminal_output.append(f"[DEBUG] Last 30 lines of training script:")
-                                                            for line in script_check.stdout.strip().split("\n"):
-                                                                if line.strip():
-                                                                    terminal_output.append(f"[SCRIPT] {line[:200]}")
-                                                        
-                                                        terminal_output.append(f"[ERROR] Training script completed but training process did not start.")
-                                                        terminal_output.append(f"[ACTION] Check the script output above and training.log for errors.")
-                                                        st.error("Training script ran but training process did not start. Check terminal output above.")
-                                                except subprocess.TimeoutExpired:
-                                                    terminal_output.append(f"[WARNING] Process check timed out - training may still be starting")
-                                                    terminal_output.append(f"[INFO] Check training status again in a few moments")
-                                                except Exception as e:
-                                                    terminal_output.append(f"[WARNING] Could not verify training process: {str(e)}")
-                                                    terminal_output.append(f"[INFO] Training script completed successfully - check status to verify training started")
-                                            else:
-                                                error_msg = filter_malloc_warnings(training_result.stderr or training_result.stdout)
-                                                terminal_output.append(f"[ERROR] Training script failed with return code {training_result.returncode}")
-                                                if training_result.stdout:
-                                                    terminal_output.append(f"[ERROR] Script stdout (last 50 lines):")
-                                                    for line in training_result.stdout.strip().split("\n")[-50:]:
-                                                        if line.strip():
-                                                            terminal_output.append(f"[STDOUT] {line[:200]}")
-                                                if training_result.stderr:
-                                                    terminal_output.append(f"[ERROR] Script stderr (last 50 lines):")
-                                                    for line in training_result.stderr.strip().split("\n")[-50:]:
-                                                        if line.strip():
-                                                            terminal_output.append(f"[STDERR] {line[:200]}")
-                                                st.error(f"Failed to start training. Check terminal output above for details.")
+                                                        terminal_output.append(f"[WARNING] Training log file not found at /workspace/output/training/training.log")
+                                                    
+                                                    terminal_output.append(f"[INFO] Training may still be starting. Use 'Check Training Status' to verify.")
+                                            except subprocess.TimeoutExpired:
+                                                terminal_output.append(f"[WARNING] Process verification timed out - training may still be starting")
+                                                terminal_output.append(f"[INFO] Check training status again in a few moments")
+                                            except Exception as e:
+                                                terminal_output.append(f"[WARNING] Could not verify training process: {str(e)}")
+                                                terminal_output.append(f"[INFO] Training command was sent - check status to verify training started")
+                                            
+                                            # Training verification is already handled above - no duplicate code needed
                                         else:
                                             terminal_output.append(f"[ERROR] Training files not found on instance!")
                                             terminal_output.append(f"[ACTION] Please go back to Phase 2 and upload files first.")
@@ -3702,33 +3806,109 @@ def render():
                                 training_error = None
                                 
                                 # Get SSH info - prefer saved SSH details from job over API
-                                ssh_host = active_job.get("ssh_host")
-                                ssh_port = active_job.get("ssh_port", 22)
+                                # Always reload active_job first to get latest saved SSH info
+                                # Reload from active_jobs list (which should have latest saved data after rerun)
+                                for idx, job in enumerate(active_jobs):
+                                    if job.get("instance_id") == instance_id:
+                                        active_job = job
+                                        break
+                                
+                                ssh_host = active_job.get("ssh_host") if active_job else None
+                                # Check for SSH port override first (user-specified port takes precedence)
+                                ssh_port_override = active_job.get("ssh_port_override") if active_job else None
+                                if ssh_port_override:
+                                    ssh_port = ssh_port_override
+                                else:
+                                    ssh_port = active_job.get("ssh_port", 22) if active_job else 22
                                 
                                 # If not in job, get from API
                                 if not ssh_host:
-                                    job_status = training_manager.get_job_status(instance_id)
-                                    ssh_host = job_status.get("ssh_host")
-                                    ssh_port = job_status.get("ssh_port", 22)
-                                    # Save to job for future use
-                                    if ssh_host:
-                                        active_job["ssh_host"] = ssh_host
-                                        active_job["ssh_port"] = ssh_port
-                                        training_manager._save_job(active_job)
+                                    try:
+                                        job_status = training_manager.get_job_status(instance_id)
+                                        ssh_host = job_status.get("ssh_host")
+                                        api_ssh_port = job_status.get("ssh_port", 22)
+                                        
+                                        # Use override port if set, otherwise use API port
+                                        if ssh_port_override:
+                                            ssh_port = ssh_port_override
+                                        else:
+                                            ssh_port = api_ssh_port
+                                        
+                                        # Save to job for future use
+                                        if ssh_host and active_job:
+                                            active_job["ssh_host"] = ssh_host
+                                            active_job["ssh_port"] = ssh_port
+                                            training_manager._save_job(active_job)
+                                            # Update active_jobs list too
+                                            for idx, job in enumerate(active_jobs):
+                                                if job.get("instance_id") == instance_id:
+                                                    active_jobs[idx] = active_job
+                                                    break
+                                    except Exception as e:
+                                        terminal_output.append(f"[WARNING] Could not retrieve SSH info from API: {str(e)[:200]}")
                                 
                                 if ssh_host:
                                     terminal_output.append(f"[SSH] Connecting to {ssh_host}:{ssh_port}")
                                     st.session_state[terminal_output_key] = list(terminal_output)  # Save as fresh copy
                                     st.session_state[f"{terminal_output_key}_updated"] = datetime.now().isoformat()
                                     
+                                    # First test SSH connection with a simple command
+                                    terminal_output.append(f"[SSH] Testing SSH connection...")
+                                    test_connection_cmd = [
+                                        "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
+                                        "-o", "ServerAliveInterval=5", "-o", "ServerAliveCountMax=2",
+                                        f"root@{ssh_host}",
+                                        "echo 'SSH connection successful'"
+                                    ]
+                                    try:
+                                        test_result = subprocess.run(test_connection_cmd, capture_output=True, text=True, timeout=15)
+                                        if test_result.returncode == 0:
+                                            terminal_output.append(f"[SSH] ✓ SSH connection successful")
+                                        else:
+                                            terminal_output.append(f"[SSH] ⚠️ SSH connection test failed (returncode: {test_result.returncode})")
+                                            if test_result.stderr:
+                                                terminal_output.append(f"[SSH] Error: {test_result.stderr[:300]}")
+                                            terminal_output.append(f"[SSH] Attempting to continue anyway...")
+                                    except subprocess.TimeoutExpired:
+                                        terminal_output.append(f"[SSH] ⚠️ SSH connection test timed out")
+                                        terminal_output.append(f"[SSH] This may indicate network issues or the instance is not ready")
+                                        terminal_output.append(f"[SSH] Attempting to continue anyway...")
+                                    except Exception as e:
+                                        terminal_output.append(f"[SSH] ⚠️ SSH connection test error: {str(e)[:200]}")
+                                        terminal_output.append(f"[SSH] Attempting to continue anyway...")
+                                    
+                                    st.session_state[terminal_output_key] = list(terminal_output)
+                                    st.session_state[f"{terminal_output_key}_updated"] = datetime.now().isoformat()
+                                    
                                     # Check for output directory
                                     terminal_output.append(f"[SSH] Checking output directory...")
+                                    terminal_output.append(f"[DEBUG] SSH command: ssh -p {ssh_port} root@{ssh_host} 'ls -la /workspace/output/training'")
                                     check_output_cmd = [
                                         "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
+                                        "-o", "ServerAliveInterval=5", "-o", "ServerAliveCountMax=2",
                                         f"root@{ssh_host}",
                                         "ls -la /workspace/output/training 2>/dev/null | tail -5 || echo 'no_output'"
                                     ]
-                                    output_result = subprocess.run(check_output_cmd, capture_output=True, text=True, timeout=15)
+                                    try:
+                                        output_result = subprocess.run(check_output_cmd, capture_output=True, text=True, timeout=15)
+                                        terminal_output.append(f"[DEBUG] Output directory check returncode: {output_result.returncode}")
+                                        if output_result.stdout:
+                                            terminal_output.append(f"[DEBUG] Output directory stdout: {output_result.stdout[:300]}")
+                                        if output_result.stderr:
+                                            terminal_output.append(f"[DEBUG] Output directory stderr: {output_result.stderr[:200]}")
+                                    except subprocess.TimeoutExpired as e:
+                                        terminal_output.append(f"[SSH] ⚠️ Output directory check timed out")
+                                        terminal_output.append(f"[SSH] SSH connection may be slow or unstable")
+                                        terminal_output.append(f"[DEBUG] Timeout exception: {str(e)}")
+                                        st.session_state[terminal_output_key] = list(terminal_output)
+                                        st.session_state[f"{terminal_output_key}_updated"] = datetime.now().isoformat()
+                                        output_result = type('obj', (object,), {'stdout': 'no_output', 'returncode': 1})()
+                                    except Exception as e:
+                                        terminal_output.append(f"[SSH] ⚠️ Output directory check failed: {str(e)[:200]}")
+                                        terminal_output.append(f"[DEBUG] Exception type: {type(e).__name__}")
+                                        st.session_state[terminal_output_key] = list(terminal_output)
+                                        st.session_state[f"{terminal_output_key}_updated"] = datetime.now().isoformat()
+                                        output_result = type('obj', (object,), {'stdout': 'no_output', 'returncode': 1})()
                                     if "no_output" not in output_result.stdout:
                                         terminal_output.append(f"[SSH] Output directory exists")
                                         stdout_filtered = filter_malloc_warnings(output_result.stdout)
@@ -3740,12 +3920,22 @@ def render():
                                     
                                     # Check if training files exist
                                     terminal_output.append(f"[SSH] Checking if training files are present...")
+                                    terminal_output.append(f"[DEBUG] SSH command: ssh -p {ssh_port} root@{ssh_host} 'ls -la /workspace/data/'")
                                     check_files_cmd = [
                                         "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
                                         f"root@{ssh_host}",
                                         "ls -la /workspace/data/ 2>/dev/null | grep -E '(training_data|axolotl_config)' || echo 'files_missing'"
                                     ]
-                                    files_result = subprocess.run(check_files_cmd, capture_output=True, text=True, timeout=15)
+                                    try:
+                                        files_result = subprocess.run(check_files_cmd, capture_output=True, text=True, timeout=15)
+                                        terminal_output.append(f"[DEBUG] Training files check returncode: {files_result.returncode}")
+                                        if files_result.stdout:
+                                            terminal_output.append(f"[DEBUG] Training files stdout: {files_result.stdout[:300]}")
+                                        if files_result.stderr:
+                                            terminal_output.append(f"[DEBUG] Training files stderr: {files_result.stderr[:200]}")
+                                    except Exception as e:
+                                        terminal_output.append(f"[ERROR] Training files check failed: {str(e)}")
+                                        files_result = type('obj', (object,), {'stdout': 'files_missing', 'returncode': 1})()
                                     # Capture whether files exist for diagnostics
                                     ssh_files_exist = "files_missing" not in files_result.stdout
                                     if not ssh_files_exist:
@@ -3807,6 +3997,7 @@ def render():
                                     
                                     # Check for training processes (ignore onstart script for existing instances)
                                     terminal_output.append(f"[SSH] Checking for training processes...")
+                                    terminal_output.append(f"[DEBUG] SSH command: ssh -p {ssh_port} root@{ssh_host} 'ps aux | grep -E ...'")
                                     check_training_cmd = [
                                         "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
                                         f"root@{ssh_host}",
@@ -3814,8 +4005,20 @@ def render():
                                     ]
                                     try:
                                         training_process_result = subprocess.run(check_training_cmd, capture_output=True, text=True, timeout=15)
-                                    except subprocess.TimeoutExpired:
-                                        terminal_output.append(f"[WARNING] Process check timed out")
+                                        terminal_output.append(f"[DEBUG] Process check returncode: {training_process_result.returncode}")
+                                        if training_process_result.stdout:
+                                            terminal_output.append(f"[DEBUG] Process check stdout length: {len(training_process_result.stdout)}")
+                                            terminal_output.append(f"[DEBUG] Process check stdout preview: {training_process_result.stdout[:200]}")
+                                        if training_process_result.stderr:
+                                            terminal_output.append(f"[DEBUG] Process check stderr: {training_process_result.stderr[:200]}")
+                                    except subprocess.TimeoutExpired as e:
+                                        terminal_output.append(f"[WARNING] Process check timed out after 15 seconds")
+                                        terminal_output.append(f"[DEBUG] Timeout exception: {str(e)}")
+                                        st.session_state[terminal_output_key] = terminal_output
+                                        training_process_result = type('obj', (object,), {'stdout': 'no_training', 'returncode': 1})()
+                                    except Exception as e:
+                                        terminal_output.append(f"[ERROR] Process check failed with exception: {str(e)}")
+                                        terminal_output.append(f"[DEBUG] Exception type: {type(e).__name__}")
                                         st.session_state[terminal_output_key] = terminal_output
                                         training_process_result = type('obj', (object,), {'stdout': 'no_training', 'returncode': 1})()
                                     
@@ -3826,6 +4029,7 @@ def render():
                                         "no_training" not in stdout_text and
                                         len(stdout_text.strip()) > 0
                                     )
+                                    terminal_output.append(f"[DEBUG] ssh_training_running determined as: {ssh_training_running}")
                                     
                                     if ssh_training_running:
                                         # Show raw output first for debugging
@@ -3999,6 +4203,8 @@ def render():
                                         terminal_output.append(f"[SSH] Training log file: {log_exists_result.stdout.strip()}")
                                         st.session_state[terminal_output_key] = terminal_output
                                     
+                                    terminal_output.append(f"[SSH] Checking training logs...")
+                                    terminal_output.append(f"[DEBUG] SSH command: ssh -p {ssh_port} root@{ssh_host} 'tail -100 /workspace/output/training/training.log'")
                                     check_training_log_cmd = [
                                         "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
                                         "-o", "ServerAliveInterval=5", "-o", "ServerAliveCountMax=2",
@@ -4007,8 +4213,20 @@ def render():
                                     ]
                                     try:
                                         training_log_result = subprocess.run(check_training_log_cmd, capture_output=True, text=True, timeout=15)
+                                        terminal_output.append(f"[DEBUG] Training log check returncode: {training_log_result.returncode}")
+                                        if training_log_result.stdout:
+                                            terminal_output.append(f"[DEBUG] Training log check stdout length: {len(training_log_result.stdout)}")
+                                            terminal_output.append(f"[DEBUG] Training log check stdout preview: {training_log_result.stdout[:300]}")
+                                        if training_log_result.stderr:
+                                            terminal_output.append(f"[DEBUG] Training log check stderr: {training_log_result.stderr[:200]}")
                                     except subprocess.TimeoutExpired:
                                         terminal_output.append(f"[WARNING] Training log check timed out")
+                                        terminal_output.append(f"[DEBUG] Timeout after 15 seconds")
+                                        st.session_state[terminal_output_key] = terminal_output
+                                        training_log_result = type('obj', (object,), {'stdout': 'no_training_log', 'returncode': 1})()
+                                    except Exception as e:
+                                        terminal_output.append(f"[ERROR] Training log check failed: {str(e)}")
+                                        terminal_output.append(f"[DEBUG] Exception type: {type(e).__name__}")
                                         st.session_state[terminal_output_key] = terminal_output
                                         training_log_result = type('obj', (object,), {'stdout': 'no_training_log', 'returncode': 1})()
                                     training_logs_content = None
@@ -4150,12 +4368,22 @@ def render():
                                     
                                     # Check debug.log if it exists
                                     terminal_output.append(f"[SSH] Checking debug.log for errors...")
+                                    terminal_output.append(f"[DEBUG] SSH command: ssh -p {ssh_port} root@{ssh_host} 'tail debug.log'")
                                     debug_log_cmd = [
                                         "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
                                         f"root@{ssh_host}",
                                         "if [ -f /workspace/output/training/debug.log ]; then tail -30 /workspace/output/training/debug.log; else echo 'no_debug_log'; fi"
                                     ]
-                                    debug_result = subprocess.run(debug_log_cmd, capture_output=True, text=True, timeout=15)
+                                    try:
+                                        debug_result = subprocess.run(debug_log_cmd, capture_output=True, text=True, timeout=15)
+                                        terminal_output.append(f"[DEBUG] Debug log check returncode: {debug_result.returncode}")
+                                        if debug_result.stdout:
+                                            terminal_output.append(f"[DEBUG] Debug log check stdout length: {len(debug_result.stdout)}")
+                                        if debug_result.stderr:
+                                            terminal_output.append(f"[DEBUG] Debug log check stderr: {debug_result.stderr[:200]}")
+                                    except Exception as e:
+                                        terminal_output.append(f"[ERROR] Debug log check failed: {str(e)}")
+                                        debug_result = type('obj', (object,), {'stdout': 'no_debug_log', 'returncode': 1})()
                                     debug_log_content = None
                                     if "no_debug_log" not in debug_result.stdout and debug_result.stdout.strip():
                                         stdout_filtered = filter_malloc_warnings(debug_result.stdout)
@@ -4167,6 +4395,7 @@ def render():
                                     
                                     # Get training logs
                                     terminal_output.append(f"[SSH] Retrieving training logs...")
+                                    terminal_output.append(f"[DEBUG] SSH command: ssh -p {ssh_port} root@{ssh_host} 'tail training.log'")
                                     st.session_state[terminal_output_key] = terminal_output
                                     log_command = (
                                         "if [ -f /workspace/output/training/training.log ]; then "
@@ -4183,18 +4412,27 @@ def render():
                                         f"root@{ssh_host}",
                                         log_command
                                     ]
+                                    terminal_output.append(f"[DEBUG] Log retrieval command: {log_command[:200]}...")
                                     try:
                                         terminal_output.append(f"[SSH] Attempting to retrieve logs (timeout: 15s)...")
                                         st.session_state[terminal_output_key] = terminal_output
                                         log_result = subprocess.run(log_cmd, capture_output=True, text=True, timeout=15)
+                                        terminal_output.append(f"[DEBUG] Log retrieval returncode: {log_result.returncode}")
+                                        if log_result.stdout:
+                                            terminal_output.append(f"[DEBUG] Log retrieval stdout length: {len(log_result.stdout)}")
+                                            terminal_output.append(f"[DEBUG] Log retrieval stdout preview: {log_result.stdout[:300]}")
+                                        if log_result.stderr:
+                                            terminal_output.append(f"[DEBUG] Log retrieval stderr: {log_result.stderr[:200]}")
                                     except subprocess.TimeoutExpired:
                                         terminal_output.append(f"[WARNING] Log retrieval timed out after 15 seconds")
+                                        terminal_output.append(f"[DEBUG] Timeout exception occurred")
                                         terminal_output.append(f"[INFO] Log file may be very large or SSH connection is slow")
                                         terminal_output.append(f"[INFO] Training may still be initializing - logs will appear once training starts")
                                         st.session_state[terminal_output_key] = terminal_output
                                         log_result = type('obj', (object,), {'stdout': 'no_logs', 'returncode': 1})()
                                     except Exception as e:
                                         terminal_output.append(f"[ERROR] Log retrieval failed: {str(e)}")
+                                        terminal_output.append(f"[DEBUG] Exception type: {type(e).__name__}")
                                         st.session_state[terminal_output_key] = terminal_output
                                         log_result = type('obj', (object,), {'stdout': 'no_logs', 'returncode': 1})()
                                     if "no_logs" not in log_result.stdout and log_result.stdout.strip():
@@ -4267,6 +4505,8 @@ def render():
                                                         f"root@{ssh_host}",
                                                         "cd /workspace/data && python3 << 'PYTHON_EOF'\n"
                                                         "import yaml\n"
+                                                        "import os\n"
+                                                        "import json\n"
                                                         "try:\n"
                                                         "    with open('axolotl_config.yaml', 'r') as f:\n"
                                                         "        config = yaml.safe_load(f) or {}\n"
@@ -4278,15 +4518,46 @@ def render():
                                                         "    has_valid_adapter_path = adapter_val and isinstance(adapter_val, str) and adapter_val.startswith('/')\n"
                                                         "    merge_lora = config.get('merge_lora', True)\n"
                                                         "    save_merged_lora = config.get('save_merged_lora', True)\n"
+                                                        "    base_model = config.get('base_model', '')\n"
                                                         "    \n"
-                                                        "    # LoRA mode is enabled if lora_* parameters are set (Axolotl infers from these)\n"
-                                                        "    # OR if there's a valid adapter path (for incremental training)\n"
-                                                        "    is_lora_mode = (has_lora_r and has_lora_alpha) or has_valid_adapter_path\n"
+                                                        "    # Check if adapter path exists (for incremental training)\n"
+                                                        "    adapter_exists = False\n"
+                                                        "    adapter_config_exists = False\n"
+                                                        "    if has_valid_adapter_path:\n"
+                                                        "        adapter_config_path = os.path.join(adapter_val, 'adapter_config.json')\n"
+                                                        "        adapter_exists = os.path.exists(adapter_val)\n"
+                                                        "        adapter_config_exists = os.path.exists(adapter_config_path)\n"
+                                                        "        \n"
+                                                        "        # If adapter config exists, check base model match\n"
+                                                        "        base_model_match = False\n"
+                                                        "        if adapter_config_exists:\n"
+                                                        "            try:\n"
+                                                        "                with open(adapter_config_path, 'r') as f:\n"
+                                                        "                    adapter_config = json.load(f)\n"
+                                                        "                    adapter_base_model = adapter_config.get('base_model_name', '')\n"
+                                                        "                    base_model_match = (adapter_base_model == base_model) if adapter_base_model and base_model else False\n"
+                                                        "            except:\n"
+                                                        "                pass\n"
+                                                        "    \n"
+                                                        "    # LoRA mode is enabled if adapter: 'lora' is set OR if there's a valid adapter path\n"
+                                                        "    is_lora_mode = (adapter_val == 'lora' and has_lora_r and has_lora_alpha) or (has_valid_adapter_path and adapter_config_exists)\n"
                                                         "    \n"
                                                         "    print('LORA_CONFIG_CHECK:')\n"
+                                                        "    print(f'base_model={base_model}')\n"
                                                         "    print(f'lora_r={config.get(\"lora_r\")}')\n"
                                                         "    print(f'lora_alpha={config.get(\"lora_alpha\")}')\n"
                                                         "    print(f'adapter={adapter_val}')\n"
+                                                        "    print(f'adapter_exists={adapter_exists}')\n"
+                                                        "    print(f'adapter_config_exists={adapter_config_exists}')\n"
+                                                        "    if has_valid_adapter_path and adapter_config_exists:\n"
+                                                        "        try:\n"
+                                                        "            with open(os.path.join(adapter_val, 'adapter_config.json'), 'r') as f:\n"
+                                                        "                adapter_config = json.load(f)\n"
+                                                        "                adapter_base = adapter_config.get('base_model_name', 'unknown')\n"
+                                                        "                print(f'adapter_base_model={adapter_base}')\n"
+                                                        "                print(f'base_model_match={adapter_base == base_model}')\n"
+                                                        "        except:\n"
+                                                        "            pass\n"
                                                         "    print(f'merge_lora={merge_lora}')\n"
                                                         "    print(f'save_merged_lora={save_merged_lora}')\n"
                                                         "    print(f'has_lora_params={has_lora_r and has_lora_alpha}')\n"
@@ -4306,9 +4577,29 @@ def render():
                                                                     elif "lora_r=" in line and "None" not in line:
                                                                         lora_r_val = line.split("=")[1].strip()
                                                                         lora_indicators.append(f"✓ Config has lora_r={lora_r_val}")
-                                                                    elif "adapter=" in line and "None" not in line and "/" in line:
-                                                                        adapter_path = line.split("=")[1].strip()
-                                                                        lora_indicators.append(f"✓ Config has adapter path: {adapter_path}")
+                                                                    elif "adapter=" in line and "None" not in line:
+                                                                        adapter_val = line.split("=")[1].strip()
+                                                                        if adapter_val == "lora":
+                                                                            lora_indicators.append("✓ Config has adapter: lora (LoRA mode enabled)")
+                                                                        elif adapter_val.startswith("/"):
+                                                                            lora_indicators.append(f"✓ Config has adapter path: {adapter_val} (incremental training)")
+                                                                    elif "adapter_exists=True" in line:
+                                                                        lora_indicators.append("✓ Adapter directory exists on remote")
+                                                                    elif "adapter_config_exists=True" in line:
+                                                                        lora_indicators.append("✓ Adapter config file found (adapter is valid)")
+                                                                    elif "base_model_match=True" in line:
+                                                                        lora_indicators.append("✓ Base model matches between adapter and config")
+                                                                    elif "base_model_match=False" in line and "adapter_base_model=" in config_output:
+                                                                        # Extract both models for comparison
+                                                                        adapter_base = None
+                                                                        config_base = None
+                                                                        for l in config_output.split("\n"):
+                                                                            if "adapter_base_model=" in l:
+                                                                                adapter_base = l.split("=")[1].strip()
+                                                                            elif "base_model=" in l and "adapter_base_model" not in l:
+                                                                                config_base = l.split("=")[1].strip()
+                                                                        if adapter_base and config_base:
+                                                                            lora_indicators.append(f"⚠ Base model mismatch: adapter={adapter_base}, config={config_base}")
                                                                     elif "merge_lora=False" in line:
                                                                         lora_indicators.append("✓ Config has merge_lora: false (adapters will be saved separately)")
                                                 except:
@@ -4529,13 +4820,33 @@ def render():
                                         updated_job_status = training_manager.get_job_status(instance_id)
                                         if updated_job_status and not updated_job_status.get("error"):
                                             ssh_host_from_api = updated_job_status.get("ssh_host")
-                                            ssh_port_from_api = updated_job_status.get("ssh_port", 22)
+                                            api_ssh_port = updated_job_status.get("ssh_port", 22)
+                                            
+                                            # Check for SSH port override (user-specified port takes precedence)
+                                            ssh_port_override = active_job.get("ssh_port_override")
+                                            if ssh_port_override:
+                                                ssh_port_from_api = ssh_port_override
+                                            else:
+                                                ssh_port_from_api = api_ssh_port
+                                            
                                             if ssh_host_from_api:
                                                 active_job["ssh_host"] = ssh_host_from_api
-                                                active_job["ssh_port"] = ssh_port_from_api
+                                                # Only update port if no override is set (override takes precedence)
+                                                if not ssh_port_override:
+                                                    active_job["ssh_port"] = api_ssh_port
                                                 training_manager._save_job(active_job)
-                                                terminal_output.append(f"[SUCCESS] Retrieved SSH info from API: {ssh_host_from_api}:{ssh_port_from_api}")
+                                                # Update active_jobs list too
+                                                for idx, job in enumerate(active_jobs):
+                                                    if job.get("instance_id") == instance_id:
+                                                        active_jobs[idx] = active_job
+                                                        break
+                                                port_source = "override" if ssh_port_override else "API"
+                                                terminal_output.append(f"[SUCCESS] Retrieved SSH info from API: {ssh_host_from_api}:{ssh_port_from_api} ({port_source})")
+                                                terminal_output.append(f"[INFO] SSH info saved to job. Refreshing...")
                                                 st.session_state[terminal_output_key] = terminal_output
+                                                # Update the local variables immediately before rerun
+                                                ssh_host = ssh_host_from_api
+                                                ssh_port = ssh_port_from_api
                                                 st.rerun()  # Rerun to use the new SSH info
                                             else:
                                                 terminal_output.append(f"[WARNING] SSH host still not available from API - instance may still be initializing")
@@ -4543,6 +4854,20 @@ def render():
                                     except Exception as e:
                                         terminal_output.append(f"[WARNING] Could not retrieve SSH info from API: {str(e)}")
                                     st.session_state[terminal_output_key] = terminal_output
+                                
+                                # Reload active_job from active_jobs list to get any SSH info that was just saved
+                                # This ensures we have the latest saved SSH info after a rerun
+                                for idx, job in enumerate(active_jobs):
+                                    if job.get("instance_id") == instance_id:
+                                        # Reload active_job from the list (may have been updated)
+                                        active_job = job
+                                        # Update SSH variables from reloaded job
+                                        ssh_host = active_job.get("ssh_host")
+                                        if ssh_port_override:
+                                            ssh_port = ssh_port_override
+                                        else:
+                                            ssh_port = active_job.get("ssh_port", 22)
+                                        break
                                 
                                 # Get fresh job status from manager FIRST (this updates the job with latest info from API)
                                 # This ensures we have the most up-to-date status before checking training
@@ -4555,12 +4880,37 @@ def render():
                                         if job.get("instance_id") == instance_id:
                                             active_jobs[idx] = active_job
                                             break
+                                    # Update SSH variables from updated job status (if SSH info is in the update)
+                                    if updated_job_status.get("ssh_host"):
+                                        ssh_host = updated_job_status.get("ssh_host")
+                                        if ssh_port_override:
+                                            ssh_port = ssh_port_override
+                                        else:
+                                            ssh_port = updated_job_status.get("ssh_port", 22)
+                                
+                                terminal_output.append(f"[DEBUG] Calling check_training_status for instance {instance_id}")
+                                terminal_output.append(f"[DEBUG] Using SSH: {ssh_host}:{ssh_port}")
                                 
                                 training_status = training_manager.check_training_status(instance_id)
+                                
+                                # Log the raw response for debugging
+                                terminal_output.append(f"[DEBUG] check_training_status returned: status={training_status.get('status') if training_status else 'None'}")
+                                if training_status:
+                                    terminal_output.append(f"[DEBUG] Training status details:")
+                                    terminal_output.append(f"[DEBUG]   - training_running: {training_status.get('training_running')}")
+                                    terminal_output.append(f"[DEBUG]   - training_started: {training_status.get('training_started')}")
+                                    terminal_output.append(f"[DEBUG]   - training_files_exist: {training_status.get('training_files_exist')}")
+                                    terminal_output.append(f"[DEBUG]   - has_output: {training_status.get('has_output')}")
+                                    terminal_output.append(f"[DEBUG]   - logs_length: {training_status.get('logs_length', 0)}")
+                                    if training_status.get('error'):
+                                        terminal_output.append(f"[DEBUG]   - error: {training_status.get('error')}")
+                                    if training_status.get('failure_reason'):
+                                        terminal_output.append(f"[DEBUG]   - failure_reason: {training_status.get('failure_reason')[:200]}")
                                 
                                 # Ensure training_status is a dict
                                 if training_status is None:
                                     training_status = {}
+                                    terminal_output.append(f"[WARNING] check_training_status returned None - using empty dict")
                                     
                                     # Override status if we found errors in logs
                                     if training_error and training_status.get("status") != "completed":
@@ -4869,11 +5219,23 @@ def render():
                                         
                                         # Get SSH info for adapter verification
                                         ssh_host = active_job.get("ssh_host")
-                                        ssh_port = active_job.get("ssh_port", 22)
+                                        # Check for SSH port override first (user-specified port takes precedence)
+                                        ssh_port_override = active_job.get("ssh_port_override")
+                                        if ssh_port_override:
+                                            ssh_port = ssh_port_override
+                                        else:
+                                            ssh_port = active_job.get("ssh_port", 22)
+                                        
                                         if not ssh_host:
                                             job_status = training_manager.get_job_status(instance_id)
                                             ssh_host = job_status.get("ssh_host")
-                                            ssh_port = job_status.get("ssh_port", 22)
+                                            api_ssh_port = job_status.get("ssh_port", 22)
+                                            
+                                            # Use override port if set, otherwise use API port
+                                            if ssh_port_override:
+                                                ssh_port = ssh_port_override
+                                            else:
+                                                ssh_port = api_ssh_port
                                         
                                         if ssh_host:
                                             check_adapter_files_cmd = [
@@ -5466,20 +5828,29 @@ def render():
                                                     f"    \n"
                                                     f"    fixed = False\n"
                                                     f"    \n"
-                                                    f"    # Handle adapter field: Always remove adapter: 'lora' as it causes path interpretation issues\n"
-                                                    f"    # Axolotl will infer LoRA mode from lora_* parameters\n"
+                                                    f"    # Ensure adapter: 'lora' is set if lora_* parameters exist (required for LoRA mode)\n"
+                                                    f"    # BUT preserve adapter paths for incremental training (V2+)\n"
+                                                    f"    # The path issue is prevented by NOT setting lora_model_dir to output_dir\n"
+                                                    f"    has_lora_params = config.get('lora_r') is not None and config.get('lora_alpha') is not None\n"
                                                     f"    if 'adapter' in config:\n"
                                                     f"        adapter_val = config['adapter']\n"
-                                                    f"        # If adapter is set to a string (not a path), remove it\n"
+                                                    f"        # If adapter is set to an invalid string (not 'lora' and not a path), remove it\n"
                                                     f"        if isinstance(adapter_val, str) and adapter_val != 'lora' and not adapter_val.startswith('/'):\n"
                                                     f"            del config['adapter']\n"
                                                     f"            fixed = True\n"
                                                     f"            print('Removed invalid adapter field')\n"
                                                     f"        elif adapter_val == 'lora':\n"
-                                                    f"            # Always remove adapter: 'lora' - Axolotl will infer from lora_* parameters\n"
-                                                    f"            del config['adapter']\n"
-                                                    f"            fixed = True\n"
-                                                    f"            print('Removed adapter: lora (lora_* parameters are sufficient)')\n"
+                                                    f"            # Keep adapter: 'lora' - it's required for LoRA mode\n"
+                                                    f"            print('Adapter: lora already set (LoRA mode enabled)')\n"
+                                                    f"        elif isinstance(adapter_val, str) and adapter_val.startswith('/'):\n"
+                                                    f"            # Keep adapter path for incremental training (V2+)\n"
+                                                    f"            print(f'Keeping adapter path for incremental training: {{adapter_val}}')\n"
+                                                    f"    elif has_lora_params:\n"
+                                                    f"        # Add adapter: 'lora' if lora_* parameters exist but adapter is missing\n"
+                                                    f"        # Only for new training (not incremental)\n"
+                                                    f"        config['adapter'] = 'lora'\n"
+                                                    f"        fixed = True\n"
+                                                    f"        print('Added adapter: lora (required for LoRA mode)')\n"
                                                     f"    \n"
                                                     f"    # CRITICAL: Remove lora_model_dir if it's set to output_dir (causes Axolotl to try loading from there)\n"
                                                     f"    # lora_model_dir should only be set to a valid adapter path (for incremental training)\n"
@@ -6388,18 +6759,28 @@ def render():
                                         f"        fixed = True\n"
                                         f"        print('Set train_on_inputs=True to maximize sample retention')\n"
                                         f"    \n"
-                                        f"    # Fix adapter/lora_model_dir issue: Remove adapter if set to 'lora' or null\n"
-                                        f"    # Remove lora_model_dir if it points to output_dir without a valid adapter path\n"
+                                        f"    # Fix adapter/lora_model_dir issue: Ensure adapter: 'lora' is set for LoRA mode\n"
+                                        f"    # Remove lora_model_dir if it points to output_dir (causes path issues)\n"
                                         f"    adapter_val = config.get('adapter')\n"
                                         f"    output_dir = config.get('output_dir', '')\n"
                                         f"    lora_model_dir = config.get('lora_model_dir', '')\n"
                                         f"    \n"
-                                        f"    # If adapter is 'lora' (string) or null/None, remove it\n"
-                                        f"    if adapter_val == 'lora' or adapter_val is None:\n"
-                                        f"        if 'adapter' in config:\n"
-                                        f"            del config['adapter']\n"
+                                        f"    # CRITICAL: Ensure adapter: 'lora' is set if lora_* parameters exist (required for Axolotl to enable LoRA)\n"
+                                        f"    # BUT preserve adapter paths for incremental training (V2+)\n"
+                                        f"    # Axolotl needs explicit adapter: 'lora' to enable LoRA mode, not just lora_* parameters\n"
+                                        f"    has_lora_params = config.get('lora_r') is not None and config.get('lora_alpha') is not None\n"
+                                        f"    if has_lora_params:\n"
+                                        f"        # Set adapter to 'lora' if it's missing or null (but keep it if already set to 'lora' or a path)\n"
+                                        f"        if not adapter_val or adapter_val is None:\n"
+                                        f"            config['adapter'] = 'lora'\n"
                                         f"            fixed = True\n"
-                                        f"            print('Removed adapter field (will infer from lora_* parameters)')\n"
+                                        f"            print('Set adapter: lora (required for LoRA mode)')\n"
+                                        f"        elif adapter_val == 'lora':\n"
+                                        f"            # Keep it - don't remove adapter: 'lora'\n"
+                                        f"            print('Adapter: lora already set (LoRA mode enabled)')\n"
+                                        f"        elif isinstance(adapter_val, str) and adapter_val.startswith('/'):\n"
+                                        f"            # Keep adapter path for incremental training (V2+) - don't override it\n"
+                                        f"            print(f'Keeping adapter path for incremental training: {{adapter_val}}')\n"
                                         f"    \n"
                                         f"    # CRITICAL: Remove lora_model_dir if it's set to output_dir (causes Axolotl to try loading from there)\n"
                                         f"    # lora_model_dir should only be set to a valid adapter path (for incremental training)\n"
@@ -6412,8 +6793,30 @@ def render():
                                         f"                fixed = True\n"
                                         f"                print('Removed lora_model_dir (was pointing to output_dir - causes adapter loading errors)')\n"
                                         f"    \n"
-                                        f"    # Ensure lora_* parameters are set so Axolotl can infer LoRA mode\n"
-                                        f"    # These are required when adapter field is not set (for new training)\n"
+                                        f"    # Verify adapter path exists for incremental training\n"
+                                        f"    if adapter_val and isinstance(adapter_val, str) and adapter_val.startswith('/'):\n"
+                                        f"        import os\n"
+                                        f"        adapter_config_path = os.path.join(adapter_val, 'adapter_config.json')\n"
+                                        f"        if not os.path.exists(adapter_config_path):\n"
+                                        f"            print(f'WARNING: Adapter config not found at {{adapter_config_path}}')\n"
+                                        f"            print(f'Adapter path may be invalid - training may fail')\n"
+                                        f"        else:\n"
+                                        f"            # Verify base model matches\n"
+                                        f"            try:\n"
+                                        f"                import json\n"
+                                        f"                with open(adapter_config_path, 'r') as f:\n"
+                                        f"                    adapter_config = json.load(f)\n"
+                                        f"                    adapter_base = adapter_config.get('base_model_name', '')\n"
+                                        f"                    config_base = config.get('base_model', '')\n"
+                                        f"                    if adapter_base and config_base and adapter_base != config_base:\n"
+                                        f"                        print(f'WARNING: Base model mismatch - adapter: {{adapter_base}}, config: {{config_base}}')\n"
+                                        f"                    elif adapter_base == config_base:\n"
+                                        f"                        print(f'✓ Base model matches: {{config_base}}')\n"
+                                        f"            except Exception as e:\n"
+                                        f"                print(f'Could not verify base model match: {{e}}')\n"
+                                        f"    \n"
+                                        f"    # Ensure lora_* parameters are set for LoRA mode\n"
+                                        f"    # These are always required when using LoRA (with adapter: 'lora' or without)\n"
                                         f"    if not adapter_val or adapter_val == 'lora' or adapter_val is None:\n"
                                         f"        if 'lora_r' not in config:\n"
                                         f"            config['lora_r'] = 8\n"
@@ -7400,65 +7803,169 @@ REMOTE_SCRIPT"""
                                     else:
                                         terminal_output.append(f"[SSH] No weight files found in standard locations")
                                     
-                                    # Step 4: Download weights
+                                    # Step 4: Download LoRA adapter weights ONLY (not full model)
                                     weights_dir = version_dir / "weights"
                                     weights_dir.mkdir(parents=True, exist_ok=True)
-                                    terminal_output.append(f"[SCP] Downloading weights to: {weights_dir}")
+                                    terminal_output.append(f"[SCP] Downloading LoRA adapter weights to: {weights_dir}")
+                                    terminal_output.append(f"[INFO] Only downloading adapter files (adapter_config.json, adapter_model.safetensors, etc.)")
+                                    terminal_output.append(f"[INFO] Full model weights are NOT needed - adapter will be loaded onto base model locally")
+                                    
+                                    # LoRA adapter files we need (in order of preference)
+                                    adapter_files = [
+                                        "adapter_config.json",  # Required - adapter configuration
+                                        "adapter_model.safetensors",  # Preferred - adapter weights in safetensors format
+                                        "adapter_model.bin",  # Fallback - adapter weights in bin format
+                                        "training_args.bin",  # Optional - training arguments
+                                    ]
                                     
                                     # Try downloading from adapter directory first
+                                    adapter_dir_remote = "/workspace/output/training/adapter"
+                                    downloaded_count = 0
+                                    
+                                    # First, try to download the entire adapter directory (most efficient)
+                                    terminal_output.append(f"[SCP] Attempting to download adapter directory: {adapter_dir_remote}")
                                     scp_adapter_cmd = [
                                         "scp", "-P", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=30", "-r",
-                                        f"root@{ssh_host}:/workspace/output/training/adapter/*",
-                                        str(weights_dir) + "/"
+                                        f"root@{ssh_host}:{adapter_dir_remote}",
+                                        str(weights_dir)
                                     ]
                                     scp_result = subprocess.run(scp_adapter_cmd, capture_output=True, text=True, timeout=300)
-                                    if scp_result.returncode == 0:
-                                        terminal_output.append(f"[SCP] Downloaded weights from /adapter directory")
-                                    else:
-                                        # Try root output directory
-                                        terminal_output.append(f"[SCP] Trying root output directory...")
-                                        scp_output_cmd = [
-                                            "scp", "-P", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=30", "-r",
-                                            f"root@{ssh_host}:/workspace/output/training/*",
-                                            str(weights_dir) + "/"
-                                        ]
-                                        scp_result = subprocess.run(scp_output_cmd, capture_output=True, text=True, timeout=300)
-                                        if scp_result.returncode == 0:
-                                            terminal_output.append(f"[SCP] Downloaded weights from output directory")
-                                        else:
-                                            error_output = scp_result.stderr or scp_result.stdout
-                                            # Filter MallocStackLogging warnings
-                                            error_output = filter_malloc_warnings(error_output)
-                                            if "Welcome to vast.ai" in error_output:
-                                                lines = error_output.split('\n')
-                                                actual_errors = [line for line in lines if line and 'Welcome to vast.ai' not in line and 'Have fun!' not in line]
-                                                error_output = '\n'.join(actual_errors) if actual_errors else error_output
-                                            terminal_output.append(f"[SCP] Download error: {error_output[:300]}")
                                     
-                                    # Verify downloaded files
-                                    downloaded_files = list(weights_dir.rglob("*"))
-                                    downloaded_files = [f for f in downloaded_files if f.is_file()]
-                                    if downloaded_files:
-                                        terminal_output.append(f"[LOCAL] Downloaded {len(downloaded_files)} weight file(s)")
-                                        for f in downloaded_files[:5]:
-                                            terminal_output.append(f"[FILE]   - {f.name}")
-                                        
-                                        # Mark weights as downloaded
-                                        active_job["weights_downloaded"] = True
-                                        active_job["version_dir"] = str(version_dir)
-                                        active_job["weights_path"] = str(weights_dir)
-                                        training_manager._save_job(active_job)
-                                        
-                                        terminal_output.append(f"[SUCCESS] Weights downloaded successfully!")
-                                        terminal_output.append(f"[INFO] Weights saved to: {weights_dir}")
-                                        
-                                        st.session_state[terminal_output_key] = terminal_output
-                                        st.success("✅ Weights downloaded successfully! You can now proceed to end training.")
-                                        st.rerun()
+                                    if scp_result.returncode == 0:
+                                        # Check if adapter directory was downloaded
+                                        adapter_dir_local = weights_dir / "adapter"
+                                        if adapter_dir_local.exists() and any(adapter_dir_local.iterdir()):
+                                            downloaded_files_list = [f.name for f in adapter_dir_local.iterdir() if f.is_file()]
+                                            downloaded_count = len(downloaded_files_list)
+                                            terminal_output.append(f"[SCP] ✓ Downloaded adapter directory ({downloaded_count} files)")
+                                            for f in downloaded_files_list[:10]:
+                                                terminal_output.append(f"[FILE]   - {f}")
+                                            
+                                            # Verify we have the essential files
+                                            has_config = (adapter_dir_local / "adapter_config.json").exists()
+                                            has_weights = (adapter_dir_local / "adapter_model.safetensors").exists() or (adapter_dir_local / "adapter_model.bin").exists()
+                                            
+                                            if has_config and has_weights:
+                                                terminal_output.append(f"[SUCCESS] ✓ Essential adapter files downloaded (config + weights)")
+                                            elif has_config:
+                                                terminal_output.append(f"[WARNING] ⚠ Adapter config found but weights file missing")
+                                            else:
+                                                terminal_output.append(f"[ERROR] ✗ Essential adapter files missing")
                                     else:
-                                        terminal_output.append(f"[WARNING] No weight files found after download")
+                                        # Directory download failed - try downloading individual files
+                                        terminal_output.append(f"[SCP] Directory download failed, trying individual files...")
+                                        error_output = scp_result.stderr or scp_result.stdout
+                                        error_output = filter_malloc_warnings(error_output)
+                                        if "Welcome to vast.ai" in error_output:
+                                            lines = error_output.split('\n')
+                                            actual_errors = [line for line in lines if line and 'Welcome to vast.ai' not in line and 'Have fun!' not in line]
+                                            error_output = '\n'.join(actual_errors) if actual_errors else error_output
+                                        terminal_output.append(f"[SCP] Directory download error: {error_output[:200]}")
+                                        
+                                        # Create adapter subdirectory for individual files
+                                        adapter_dir_local = weights_dir / "adapter"
+                                        adapter_dir_local.mkdir(parents=True, exist_ok=True)
+                                        
+                                        # Try downloading each essential file individually
+                                        for file_name in adapter_files:
+                                            # Try adapter subdirectory first
+                                            remote_paths = [
+                                                f"{adapter_dir_remote}/{file_name}",
+                                                f"/workspace/output/training/{file_name}",  # Fallback if adapter is in root
+                                            ]
+                                            
+                                            downloaded_file = False
+                                            for remote_path in remote_paths:
+                                                terminal_output.append(f"[SCP] Trying to download: {file_name} from {remote_path}")
+                                                scp_file_cmd = [
+                                                    "scp", "-P", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=30",
+                                                    f"root@{ssh_host}:{remote_path}",
+                                                    str(adapter_dir_local / file_name)
+                                                ]
+                                                file_result = subprocess.run(scp_file_cmd, capture_output=True, text=True, timeout=300)
+                                                
+                                                if file_result.returncode == 0 and (adapter_dir_local / file_name).exists():
+                                                    file_size = (adapter_dir_local / file_name).stat().st_size
+                                                    terminal_output.append(f"[SCP] ✓ Downloaded {file_name} ({file_size / 1024 / 1024:.2f} MB)")
+                                                    downloaded_count += 1
+                                                    downloaded_file = True
+                                                    break
+                                            
+                                            if not downloaded_file:
+                                                if file_name == "adapter_config.json":
+                                                    terminal_output.append(f"[ERROR] ✗ Failed to download {file_name} (REQUIRED)")
+                                                elif file_name in ["adapter_model.safetensors", "adapter_model.bin"]:
+                                                    terminal_output.append(f"[ERROR] ✗ Failed to download {file_name} (REQUIRED)")
+                                                else:
+                                                    terminal_output.append(f"[WARNING] ⚠ Could not download {file_name} (optional)")
+                                    
+                                    # Final verification - ensure we have at least the essential files
+                                    adapter_dir_local = weights_dir / "adapter"
+                                    if adapter_dir_local.exists():
+                                        has_config = (adapter_dir_local / "adapter_config.json").exists()
+                                        has_weights = (adapter_dir_local / "adapter_model.safetensors").exists() or (adapter_dir_local / "adapter_model.bin").exists()
+                                        
+                                        if not has_config:
+                                            terminal_output.append(f"[ERROR] ✗ adapter_config.json is missing - adapter cannot be loaded")
+                                        if not has_weights:
+                                            terminal_output.append(f"[ERROR] ✗ Adapter weights file is missing - adapter cannot be loaded")
+                                        
+                                        if has_config and has_weights:
+                                            terminal_output.append(f"[SUCCESS] ✓ All essential LoRA adapter files downloaded")
+                                        else:
+                                            terminal_output.append(f"[ERROR] ✗ Missing essential adapter files - download incomplete")
+                                    
+                                    # Verify downloaded files - only check adapter directory
+                                    adapter_dir_local = weights_dir / "adapter"
+                                    if adapter_dir_local.exists():
+                                        downloaded_files = [f for f in adapter_dir_local.iterdir() if f.is_file()]
+                                        
+                                        # Filter to only show adapter files (exclude any accidentally downloaded full model files)
+                                        adapter_file_names = ["adapter_config.json", "adapter_model.safetensors", "adapter_model.bin", 
+                                                             "training_args.bin", "README.md", "tokenizer_config.json"]
+                                        adapter_files = [f for f in downloaded_files if f.name in adapter_file_names or f.name.startswith("adapter_")]
+                                        
+                                        if adapter_files:
+                                            terminal_output.append(f"[LOCAL] Downloaded {len(adapter_files)} LoRA adapter file(s)")
+                                            for f in adapter_files[:10]:
+                                                file_size = f.stat().st_size / 1024 / 1024  # Size in MB
+                                                terminal_output.append(f"[FILE]   - {f.name} ({file_size:.2f} MB)")
+                                            
+                                            # Verify essential files
+                                            has_config = (adapter_dir_local / "adapter_config.json").exists()
+                                            has_weights = (adapter_dir_local / "adapter_model.safetensors").exists() or (adapter_dir_local / "adapter_model.bin").exists()
+                                            
+                                            if has_config and has_weights:
+                                                # Mark weights as downloaded
+                                                active_job["weights_downloaded"] = True
+                                                active_job["version_dir"] = str(version_dir)
+                                                active_job["weights_path"] = str(weights_dir)
+                                                training_manager._save_job(active_job)
+                                                
+                                                terminal_output.append(f"[SUCCESS] LoRA adapter weights downloaded successfully!")
+                                                terminal_output.append(f"[INFO] Adapter saved to: {adapter_dir_local}")
+                                                terminal_output.append(f"[INFO] These adapter files will be loaded onto the base model locally")
+                                                
+                                                st.session_state[terminal_output_key] = terminal_output
+                                                st.success("✅ LoRA adapter weights downloaded successfully! You can now proceed to end training.")
+                                                st.rerun()
+                                            else:
+                                                missing = []
+                                                if not has_config:
+                                                    missing.append("adapter_config.json")
+                                                if not has_weights:
+                                                    missing.append("adapter weights (adapter_model.safetensors or .bin)")
+                                                terminal_output.append(f"[ERROR] Missing essential adapter files: {', '.join(missing)}")
+                                                st.session_state[terminal_output_key] = terminal_output
+                                                st.error(f"❌ Missing essential adapter files: {', '.join(missing)}")
+                                        else:
+                                            terminal_output.append(f"[WARNING] No adapter files found after download")
+                                            st.session_state[terminal_output_key] = terminal_output
+                                            st.warning("⚠️ No adapter files found after download. Please check the instance manually.")
+                                    else:
+                                        terminal_output.append(f"[ERROR] Adapter directory was not created/downloaded")
                                         st.session_state[terminal_output_key] = terminal_output
-                                        st.warning("⚠️ No weight files found after download. Please check the instance manually.")
+                                        st.error("❌ Adapter directory not found. Please check the instance manually.")
                                 
                             except Exception as e:
                                 error_msg = str(e)

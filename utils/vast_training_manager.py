@@ -140,11 +140,22 @@ class VastTrainingManager:
             with open(config_path, 'r') as f:
                 config = yaml.safe_load(f) or {}
             
-            # Fix adapter issue: Always remove adapter: "lora" as it causes Axolotl to treat it as a path
-            # Axolotl will automatically infer LoRA mode from lora_* parameters (lora_r, lora_alpha, etc.)
-            if config.get("adapter") == "lora" and not Path(str(config.get("adapter", ""))).exists():
-                del config["adapter"]
-                self.logger.log("INFO", "Removed 'adapter: lora' from YAML config (LoRA will be inferred from lora_* parameters)")
+            # Ensure adapter: "lora" is set if lora_* parameters exist (required for LoRA mode)
+            # BUT only if there's no existing adapter path (for incremental training)
+            # The path issue is prevented by NOT setting lora_model_dir to output_dir
+            has_lora_params = config.get("lora_r") is not None and config.get("lora_alpha") is not None
+            current_adapter = config.get("adapter")
+            # Only set adapter: "lora" if:
+            # 1. LoRA params exist
+            # 2. No adapter is set, OR adapter is None/null
+            # 3. Adapter is NOT already set to a path (for incremental training)
+            if has_lora_params and (not current_adapter or current_adapter is None):
+                # Check if adapter might be a path (incremental training) - don't override it
+                if not (isinstance(current_adapter, str) and current_adapter.startswith("/")):
+                    config["adapter"] = "lora"
+                    self.logger.log("INFO", "Added 'adapter: lora' to YAML config (required for LoRA mode)")
+                else:
+                    self.logger.log("INFO", f"Keeping existing adapter path for incremental training: {current_adapter}")
             
             # Auto-adjust config for small datasets to prevent empty batch errors
             total_examples = dataset_stats.get("total_examples", 0)
@@ -230,6 +241,22 @@ class VastTrainingManager:
             # This ensures the YAML uses the correct model even if it was set for a different one
             config["base_model"] = hf_model
             config["base_model_config"] = hf_model
+            
+            # Verify base model matches if loading a previous adapter (for incremental training)
+            if previous_adapter_path:
+                adapter_config_path = Path(previous_adapter_path) / "adapter_config.json"
+                if adapter_config_path.exists():
+                    try:
+                        import json
+                        with open(adapter_config_path, 'r') as f:
+                            adapter_config = json.load(f)
+                            adapter_base_model = adapter_config.get("base_model_name", "")
+                            if adapter_base_model and adapter_base_model != hf_model:
+                                self.logger.log("WARNING", f"Base model mismatch: adapter uses '{adapter_base_model}', but config uses '{hf_model}'. This may cause issues.")
+                            elif adapter_base_model == hf_model:
+                                self.logger.log("INFO", f"Base model matches: {hf_model}")
+                    except Exception as e:
+                        self.logger.log("WARNING", f"Could not verify base model match: {e}")
             # Ensure dataset_preparation_path is set (Axolotl needs this)
             if "dataset_preparation_path" not in config:
                 config["dataset_preparation_path"] = "/workspace/axolotl/prepared_data"
@@ -1207,6 +1234,19 @@ class VastTrainingManager:
                     result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
                     if result.returncode != 0:
                         raise Exception(f"Failed to upload previous adapter: {result.stderr}")
+                    
+                    # Verify adapter was uploaded correctly
+                    verify_cmd = [
+                        "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
+                        f"root@{ssh_host}",
+                        f"test -f {remote_adapter_path}/adapter_config.json && echo 'adapter_uploaded' || echo 'adapter_missing'"
+                    ]
+                    verify_result = subprocess.run(verify_cmd, capture_output=True, text=True, timeout=30)
+                    if "adapter_uploaded" not in verify_result.stdout:
+                        self.logger.log("WARNING", f"Adapter upload completed but adapter_config.json not found at {remote_adapter_path}")
+                    else:
+                        self.logger.log("INFO", f"Adapter uploaded and verified at {remote_adapter_path}")
+                    
                     # Update config to point to uploaded adapter
                     # The config will be updated to use /workspace/data/previous_adapter
                     package_info["remote_adapter_path"] = remote_adapter_path
@@ -1375,13 +1415,25 @@ class VastTrainingManager:
                     "error": check_result.stderr[:200] if check_result.stderr else "No output"
                 })
             
-            # Try to download adapter weights (LoRA) first
+            # Download ONLY LoRA adapter weights (not full model weights)
+            # LoRA adapters are much smaller and are loaded onto the base model locally
             adapter_path = f"{output_dir}/adapter"
             weights_downloaded = False
             downloaded_files = []
             
-            # Try adapter directory first
-            self.logger.log("INFO", f"Attempting to download adapter from {adapter_path}")
+            # Essential adapter files needed
+            essential_files = ["adapter_config.json", "adapter_model.safetensors", "adapter_model.bin"]
+            optional_files = ["training_args.bin"]
+            
+            self.logger.log("INFO", f"Downloading LoRA adapter weights ONLY (not full model)", {
+                "adapter_path": adapter_path,
+                "essential_files": essential_files
+            })
+            
+            # Try downloading adapter directory first (most efficient)
+            adapter_dir = weights_dir / "adapter"
+            adapter_dir.mkdir(parents=True, exist_ok=True)
+            
             cmd = [
                 "scp", "-r", "-P", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=30",
                 f"root@{ssh_host}:{adapter_path}",
@@ -1390,55 +1442,92 @@ class VastTrainingManager:
             result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
             
             if result.returncode == 0:
-                # Check if files were actually downloaded
-                adapter_dir = weights_dir / "adapter"
+                # Check if adapter directory was downloaded
                 if adapter_dir.exists() and any(adapter_dir.iterdir()):
                     downloaded_files = [f.name for f in adapter_dir.iterdir() if f.is_file()]
-                    weights_downloaded = True
-                    self.logger.log("SUCCESS", f"Downloaded adapter weights: {len(downloaded_files)} files", {"files": downloaded_files[:10]})
+                    
+                    # Verify we have essential files
+                    has_config = (adapter_dir / "adapter_config.json").exists()
+                    has_weights = (adapter_dir / "adapter_model.safetensors").exists() or (adapter_dir / "adapter_model.bin").exists()
+                    
+                    if has_config and has_weights:
+                        weights_downloaded = True
+                        self.logger.log("SUCCESS", f"Downloaded LoRA adapter: {len(downloaded_files)} files", {
+                            "files": downloaded_files[:10],
+                            "has_config": has_config,
+                            "has_weights": has_weights
+                        })
+                    else:
+                        self.logger.log("WARNING", "Adapter directory downloaded but missing essential files", {
+                            "has_config": has_config,
+                            "has_weights": has_weights,
+                            "downloaded_files": downloaded_files
+                        })
                 else:
                     self.logger.log("WARNING", "SCP succeeded but no files found in adapter directory")
             
-            # If adapter download failed, try full model directory
+            # If directory download failed, try downloading individual essential files
             if not weights_downloaded:
-                self.logger.log("INFO", "Adapter download failed, trying full model directory")
-                model_path = f"{output_dir}"
-                cmd = [
-                    "scp", "-r", "-P", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=30",
-                    f"root@{ssh_host}:{model_path}/*",
-                    str(weights_dir)
-                ]
-                result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
-                if result.returncode == 0:
-                    # Check if files were actually downloaded
-                    downloaded_files = [f.name for f in weights_dir.iterdir() if f.is_file()]
-                    if downloaded_files:
-                        weights_downloaded = True
-                        self.logger.log("SUCCESS", f"Downloaded model weights: {len(downloaded_files)} files", {"files": downloaded_files[:10]})
-            
-            # If still failed, try downloading specific files one by one
-            if not weights_downloaded:
-                self.logger.log("INFO", "Trying to download specific weight files")
-                for file_name in ["adapter_model.bin", "adapter_model.safetensors", "adapter_config.json", "training_args.bin"]:
-                    file_path = f"{output_dir}/adapter/{file_name}"
-                    # Also try without adapter subdirectory
-                    alt_paths = [file_path, f"{output_dir}/{file_name}"]
+                self.logger.log("INFO", "Directory download failed, trying individual adapter files")
+                
+                for file_name in essential_files + optional_files:
+                    # Try adapter subdirectory first, then root output directory
+                    alt_paths = [
+                        f"{adapter_path}/{file_name}",
+                        f"{output_dir}/adapter/{file_name}",
+                        f"{output_dir}/{file_name}"
+                    ]
+                    
+                    downloaded_file = False
                     for try_path in alt_paths:
                         cmd = [
                             "scp", "-P", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=30",
                             f"root@{ssh_host}:{try_path}",
-                            str(weights_dir / file_name)
+                            str(adapter_dir / file_name)
                         ]
                         result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
-                        if result.returncode == 0 and (weights_dir / file_name).exists():
+                        if result.returncode == 0 and (adapter_dir / file_name).exists():
                             downloaded_files.append(file_name)
                             self.logger.log("SUCCESS", f"Downloaded {file_name}")
-                            weights_downloaded = True
+                            downloaded_file = True
                             break
+                    
+                    if not downloaded_file and file_name in essential_files:
+                        self.logger.log("WARNING", f"Failed to download essential file: {file_name}")
                 
-                # Check if we got at least adapter_config.json (minimum required)
-                if not any("adapter_config.json" in f for f in downloaded_files):
-                    raise Exception(f"No weight files were downloaded. Available files on instance: {available_files[:10] if available_files else 'unknown'}. Please check if training actually completed.")
+                # Verify we have at least the essential files
+                has_config = (adapter_dir / "adapter_config.json").exists()
+                has_weights = (adapter_dir / "adapter_model.safetensors").exists() or (adapter_dir / "adapter_model.bin").exists()
+                
+                if has_config and has_weights:
+                    weights_downloaded = True
+                    self.logger.log("SUCCESS", f"Downloaded essential adapter files", {
+                        "files": downloaded_files,
+                        "has_config": has_config,
+                        "has_weights": has_weights
+                    })
+                else:
+                    missing = []
+                    if not has_config:
+                        missing.append("adapter_config.json")
+                    if not has_weights:
+                        missing.append("adapter weights")
+                    raise Exception(f"Failed to download essential LoRA adapter files: {', '.join(missing)}. Available files on instance: {available_files[:10] if available_files else 'unknown'}. Please check if training actually completed.")
+            
+            # CRITICAL: Remove any full model files that might have been accidentally downloaded
+            # We only want adapter files, not full model weights
+            if adapter_dir.exists():
+                full_model_files = ["pytorch_model.bin", "model.safetensors", "model.bin", "config.json", "tokenizer.json", "tokenizer_config.json"]
+                removed_count = 0
+                for file_name in full_model_files:
+                    full_model_file = adapter_dir / file_name
+                    if full_model_file.exists():
+                        full_model_file.unlink()
+                        removed_count += 1
+                        self.logger.log("INFO", f"Removed full model file from adapter directory: {file_name}")
+                
+                if removed_count > 0:
+                    self.logger.log("INFO", f"Cleaned up {removed_count} full model file(s) - only keeping LoRA adapter files")
             
             if not weights_downloaded:
                 raise Exception(f"Failed to download weights. SCP commands completed but no files found. Available files on instance: {available_files[:10] if available_files else 'unknown'}")
@@ -2044,11 +2133,18 @@ class VastTrainingManager:
         """
         try:
             # Get SSH connection info
+            self.logger.log("DEBUG", f"Checking training status for instance {instance_id}")
             ssh_info = self.get_instance_ssh_info(instance_id)
             ssh_host = ssh_info.get("host")
             ssh_port = ssh_info.get("port", 22)
             
+            self.logger.log("DEBUG", f"SSH connection info retrieved", {
+                "ssh_host": ssh_host,
+                "ssh_port": ssh_port
+            })
+            
             if not ssh_host:
+                self.logger.log("ERROR", f"Could not get SSH connection details for instance {instance_id}")
                 return {
                     "error": "Could not get SSH connection details",
                     "status": "unknown"
@@ -2062,6 +2158,12 @@ class VastTrainingManager:
                 "ps aux | grep -E '(axolotl|accelerate|train)' | grep -v grep || echo 'no_training'"
             ]
             
+            self.logger.log("DEBUG", f"Checking for training processes", {
+                "command": " ".join(check_process_cmd[:3]) + " ...",
+                "ssh_host": ssh_host,
+                "ssh_port": ssh_port
+            })
+            
             process_result = subprocess.run(
                 check_process_cmd,
                 capture_output=True,
@@ -2069,7 +2171,38 @@ class VastTrainingManager:
                 timeout=15
             )
             
+            self.logger.log("DEBUG", f"Process check completed", {
+                "returncode": process_result.returncode,
+                "stdout_length": len(process_result.stdout) if process_result.stdout else 0,
+                "stderr_length": len(process_result.stderr) if process_result.stderr else 0,
+                "stdout_preview": process_result.stdout[:200] if process_result.stdout else None,
+                "stderr_preview": process_result.stderr[:200] if process_result.stderr else None
+            })
+            
             training_running = "no_training" not in process_result.stdout
+            
+            # Log what processes ARE running (for debugging)
+            if process_result.stdout and "no_training" not in process_result.stdout:
+                self.logger.log("INFO", f"Training-related processes found", {
+                    "processes": process_result.stdout.strip().split('\n')[:5]  # First 5 lines
+                })
+            else:
+                # Check what processes ARE running (to help debug)
+                all_processes_cmd = [
+                    "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
+                    f"root@{ssh_host}",
+                    "ps aux | head -20"
+                ]
+                all_processes_result = subprocess.run(
+                    all_processes_cmd,
+                    capture_output=True,
+                    text=True,
+                    timeout=15
+                )
+                if all_processes_result.returncode == 0:
+                    self.logger.log("DEBUG", f"Sample of running processes (first 20)", {
+                        "processes": all_processes_result.stdout.strip().split('\n')[:10]
+                    })
             
             # Check for output directory and latest checkpoint
             check_output_cmd = [
@@ -2078,6 +2211,7 @@ class VastTrainingManager:
                 "ls -la /workspace/output/training 2>/dev/null | tail -5 || echo 'no_output'"
             ]
             
+            self.logger.log("DEBUG", f"Checking output directory")
             output_result = subprocess.run(
                 check_output_cmd,
                 capture_output=True,
@@ -2085,7 +2219,26 @@ class VastTrainingManager:
                 timeout=15
             )
             
+            self.logger.log("DEBUG", f"Output directory check completed", {
+                "returncode": output_result.returncode,
+                "stdout": output_result.stdout[:500] if output_result.stdout else None,
+                "stderr": output_result.stderr[:500] if output_result.stderr else None
+            })
+            
             has_output = "no_output" not in output_result.stdout
+            
+            # Also check if the directory exists at all
+            check_dir_exists_cmd = [
+                "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
+                f"root@{ssh_host}",
+                "test -d /workspace/output/training && echo 'dir_exists' || echo 'dir_missing'"
+            ]
+            dir_exists_result = subprocess.run(check_dir_exists_cmd, capture_output=True, text=True, timeout=15)
+            dir_exists = "dir_exists" in dir_exists_result.stdout
+            self.logger.log("DEBUG", f"Output directory existence check", {
+                "directory_exists": dir_exists,
+                "stdout": dir_exists_result.stdout.strip() if dir_exists_result.stdout else None
+            })
             
             # Get last few lines of training logs if available
             # Check multiple possible log locations and also check stdout/stderr
@@ -2112,6 +2265,7 @@ class VastTrainingManager:
                 '"""
             ]
             
+            self.logger.log("DEBUG", f"Attempting to retrieve training logs")
             log_result = subprocess.run(
                 log_cmd,
                 capture_output=True,
@@ -2120,9 +2274,27 @@ class VastTrainingManager:
                 shell=True
             )
             
+            self.logger.log("DEBUG", f"Log retrieval completed", {
+                "returncode": log_result.returncode,
+                "stdout_length": len(log_result.stdout) if log_result.stdout else 0,
+                "stderr_length": len(log_result.stderr) if log_result.stderr else 0,
+                "stdout_preview": log_result.stdout[:300] if log_result.stdout else None,
+                "stderr_preview": log_result.stderr[:300] if log_result.stderr else None,
+                "contains_no_logs": "no_logs" in log_result.stdout if log_result.stdout else False
+            })
+            
             logs = None
             if log_result.returncode == 0 and log_result.stdout.strip() and "no_logs" not in log_result.stdout:
                 logs = log_result.stdout.strip()
+                self.logger.log("INFO", f"Training logs retrieved", {
+                    "log_length": len(logs),
+                    "first_200_chars": logs[:200]
+                })
+            else:
+                self.logger.log("WARNING", f"No training logs found or log retrieval failed", {
+                    "returncode": log_result.returncode,
+                    "stdout": log_result.stdout[:200] if log_result.stdout else None
+                })
             
             # If no log file found, try to get output from any running processes
             if not logs or len(logs) < 10:
@@ -2215,7 +2387,15 @@ class VastTrainingManager:
                     fi
                 '"""
             ]
+            self.logger.log("DEBUG", f"Checking for adapter files")
             adapter_result = subprocess.run(check_adapter_cmd, capture_output=True, text=True, timeout=15, shell=True)
+            
+            self.logger.log("DEBUG", f"Adapter check completed", {
+                "returncode": adapter_result.returncode,
+                "stdout": adapter_result.stdout.strip() if adapter_result.stdout else None,
+                "stderr": adapter_result.stderr[:200] if adapter_result.stderr else None
+            })
+            
             adapter_exists = "adapter_exists" in adapter_result.stdout
             adapter_location = None
             if adapter_exists:
@@ -2224,6 +2404,9 @@ class VastTrainingManager:
                     if 'adapter_exists:' in line:
                         adapter_location = line.split('adapter_exists:')[1].strip()
                         break
+                self.logger.log("INFO", f"Adapter files found", {"location": adapter_location})
+            else:
+                self.logger.log("DEBUG", f"No adapter files found")
             
             # Also check for any weight files (bin, safetensors, etc.)
             check_weights_cmd = [
@@ -2234,10 +2417,24 @@ class VastTrainingManager:
                     find /workspace/output -type f \\( -name "*.bin" -o -name "*.safetensors" -o -name "adapter_model*" -o -name "pytorch_model*" \\) 2>/dev/null | head -5
                 '"""
             ]
+            self.logger.log("DEBUG", f"Checking for weight files")
             weights_result = subprocess.run(check_weights_cmd, capture_output=True, text=True, timeout=15, shell=True)
+            
+            self.logger.log("DEBUG", f"Weight files check completed", {
+                "returncode": weights_result.returncode,
+                "stdout": weights_result.stdout.strip() if weights_result.stdout else None,
+                "stderr": weights_result.stderr[:200] if weights_result.stderr else None
+            })
+            
             weight_files = []
             if weights_result.returncode == 0 and weights_result.stdout.strip():
                 weight_files = [f.strip() for f in weights_result.stdout.strip().split('\n') if f.strip()]
+                self.logger.log("INFO", f"Weight files found", {
+                    "count": len(weight_files),
+                    "files": weight_files[:5]  # First 5 files
+                })
+            else:
+                self.logger.log("DEBUG", f"No weight files found")
             
             # Note: We no longer use onstart scripts - all training is started manually via SSH
             # Set these to default values since onstart checks are not applicable
@@ -2252,8 +2449,36 @@ class VastTrainingManager:
                 f"root@{ssh_host}",
                 "test -f /workspace/data/training_data.jsonl && test -f /workspace/data/axolotl_config.yaml && echo 'files_exist' || echo 'no_files'"
             ]
+            self.logger.log("DEBUG", f"Checking if training files exist on instance")
             files_result = subprocess.run(check_files_cmd, capture_output=True, text=True, timeout=15)
             training_files_exist = "files_exist" in files_result.stdout
+            
+            self.logger.log("DEBUG", f"Training files check completed", {
+                "returncode": files_result.returncode,
+                "files_exist": training_files_exist,
+                "stdout": files_result.stdout.strip() if files_result.stdout else None,
+                "stderr": files_result.stderr[:200] if files_result.stderr else None
+            })
+            
+            # Also check each file individually for more detail
+            check_data_file_cmd = [
+                "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
+                f"root@{ssh_host}",
+                "ls -lh /workspace/data/training_data.jsonl 2>&1 || echo 'data_file_missing'"
+            ]
+            data_file_result = subprocess.run(check_data_file_cmd, capture_output=True, text=True, timeout=15)
+            
+            check_config_file_cmd = [
+                "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
+                f"root@{ssh_host}",
+                "ls -lh /workspace/data/axolotl_config.yaml 2>&1 || echo 'config_file_missing'"
+            ]
+            config_file_result = subprocess.run(check_config_file_cmd, capture_output=True, text=True, timeout=15)
+            
+            self.logger.log("DEBUG", f"Individual file checks", {
+                "data_file": data_file_result.stdout.strip() if data_file_result.stdout else None,
+                "config_file": config_file_result.stdout.strip() if config_file_result.stdout else None
+            })
             
             # Determine status - be more thorough
             # Check multiple indicators of completion
@@ -2285,11 +2510,25 @@ class VastTrainingManager:
                     fi
                 '"""
             ]
+            self.logger.log("DEBUG", f"Checking for evidence that training started")
             training_started_result = subprocess.run(check_training_started_cmd, capture_output=True, text=True, timeout=15, shell=True)
+            
+            self.logger.log("DEBUG", f"Training started check completed", {
+                "returncode": training_started_result.returncode,
+                "stdout_length": len(training_started_result.stdout) if training_started_result.stdout else 0,
+                "stdout_preview": training_started_result.stdout[:500] if training_started_result.stdout else None,
+                "stderr": training_started_result.stderr[:200] if training_started_result.stderr else None
+            })
+            
             if training_started_result.returncode == 0 and training_started_result.stdout.strip():
                 # If we found any files or directories in output, training likely started
                 output_lines = [l.strip() for l in training_started_result.stdout.strip().split('\n') if l.strip()]
                 training_started = len(output_lines) > 0
+                self.logger.log("DEBUG", f"Training started evidence", {
+                    "training_started": training_started,
+                    "files_found_count": len(output_lines),
+                    "files": output_lines[:10]  # First 10 files
+                })
             
             if logs:
                 log_lower = logs.lower()
@@ -2400,6 +2639,20 @@ class VastTrainingManager:
                     "onstart_status": onstart_status
                 })
             
+            # Log final status summary
+            self.logger.log("INFO", f"Training status check complete", {
+                "status": status,
+                "training_running": training_running,
+                "training_started": training_started,
+                "training_failed": training_failed,
+                "training_files_exist": training_files_exist,
+                "has_output": has_output,
+                "adapter_exists": adapter_exists,
+                "weight_files_count": len(weight_files),
+                "logs_available": logs is not None and len(logs) > 0,
+                "logs_length": len(logs) if logs else 0
+            })
+            
             return {
                 "status": status,
                 "training_running": training_running,
@@ -2420,13 +2673,22 @@ class VastTrainingManager:
                 "ssh_port": ssh_port
             }
             
-        except subprocess.TimeoutExpired:
+        except subprocess.TimeoutExpired as e:
+            self.logger.log("ERROR", f"SSH connection timed out while checking training status", {
+                "instance_id": instance_id,
+                "timeout": 15,
+                "error": str(e)
+            })
             return {
                 "error": "SSH connection timed out. This may mean SSH keys are not configured.",
                 "status": "unknown",
                 "ssh_required": True
             }
-        except FileNotFoundError:
+        except FileNotFoundError as e:
+            self.logger.log("ERROR", f"SSH client not found", {
+                "instance_id": instance_id,
+                "error": str(e)
+            })
             return {
                 "error": "SSH client not found. Please install OpenSSH client.",
                 "status": "unknown",
@@ -2434,14 +2696,25 @@ class VastTrainingManager:
             }
         except subprocess.CalledProcessError as e:
             # SSH authentication failed - likely missing SSH keys
+            error_details = {
+                "instance_id": instance_id,
+                "returncode": e.returncode,
+                "stderr": str(e.stderr)[:500] if e.stderr else None,
+                "stdout": str(e.stdout)[:500] if e.stdout else None,
+                "cmd": str(e.cmd)[:200] if hasattr(e, 'cmd') else None
+            }
+            
             if "Permission denied" in str(e.stderr) or "publickey" in str(e.stderr).lower():
+                self.logger.log("ERROR", f"SSH authentication failed - missing SSH keys", error_details)
                 return {
                     "error": "SSH authentication failed. SSH keys are required. See instructions below.",
                     "status": "unknown",
                     "ssh_required": True,
-                    "ssh_host": ssh_host,
-                    "ssh_port": ssh_port
+                    "ssh_host": ssh_host if 'ssh_host' in locals() else None,
+                    "ssh_port": ssh_port if 'ssh_port' in locals() else None
                 }
+            
+            self.logger.log("ERROR", f"SSH command failed", error_details)
             return {
                 "error": f"SSH command failed: {str(e.stderr)}",
                 "status": "unknown",
@@ -2449,13 +2722,22 @@ class VastTrainingManager:
             }
         except Exception as e:
             error_msg = str(e)
+            error_type = type(e).__name__
+            
+            self.logger.log("ERROR", f"Unexpected error checking training status", {
+                "instance_id": instance_id,
+                "error_type": error_type,
+                "error_message": error_msg,
+                "error_repr": repr(e)
+            })
+            
             if "Permission denied" in error_msg or "publickey" in error_msg.lower():
                 return {
                     "error": "SSH authentication failed. SSH keys are required. See instructions below.",
                     "status": "unknown",
                     "ssh_required": True,
-                    "ssh_host": ssh_host,
-                    "ssh_port": ssh_port
+                    "ssh_host": ssh_host if 'ssh_host' in locals() else None,
+                    "ssh_port": ssh_port if 'ssh_port' in locals() else None
                 }
             return {
                 "error": f"Error checking training status: {error_msg}",

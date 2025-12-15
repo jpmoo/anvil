@@ -408,13 +408,11 @@ class AxolotlDataPrep:
             # This ensures Axolotl knows to load and continue from this adapter
             config["lora_model_dir"] = previous_adapter_path
         else:
-            # For new LoRA training: Do NOT set adapter or lora_model_dir
-            # Axolotl will automatically infer LoRA mode from the lora_* parameters (lora_r, lora_alpha, etc.)
-            # Setting adapter or lora_model_dir causes Axolotl to try loading from those paths
-            # which results in "Can't find 'adapter_config.json'" errors
+            # For new LoRA training: Set adapter: "lora" to explicitly enable LoRA mode
+            # Axolotl requires adapter: "lora" to enable LoRA, not just lora_* parameters
+            # We do NOT set lora_model_dir to output_dir (that causes path loading errors)
             # The lora_out_dir parameter ensures adapters are saved to output_dir/adapter/
-            # Do not set adapter or lora_model_dir - let Axolotl infer from lora_* parameters
-            pass
+            config["adapter"] = "lora"
         
         if output_path:
             import yaml
