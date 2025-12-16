@@ -29,20 +29,50 @@ def render():
     client = None
     use_fine_tuned = False
     
-    if has_fine_tuned:
+    # REMOTE-ONLY MODE: Check for remote inference server
+    remote_inference_url = None
+    if 'active_job' in st.session_state and st.session_state.active_job:
+        active_job = st.session_state.active_job
+        remote_inference_ready = active_job.get("inference_ready", False)
+        remote_inference_url = active_job.get("inference_url", "")
+        if remote_inference_url and remote_inference_ready:
+            # Verify the URL is accessible
+            try:
+                import requests
+                health_check = requests.get(f"{remote_inference_url}/health", timeout=5)
+                if health_check.status_code != 200:
+                    remote_inference_url = None
+            except:
+                remote_inference_url = None
+    
+    if remote_inference_url:
         try:
             from utils.fine_tuned_client import FineTunedModelClient
-            # Get token from session state if available
-            hf_token = st.session_state.get('hf_token', '')
-            client = FineTunedModelClient(str(fine_tuned_path), hf_token=hf_token if hf_token else None)
+            # Use remote server - determine which model to use
+            # Try to use fine-tuned version if available, otherwise base
+            model_for_remote = "v1" if has_fine_tuned else "base"
+            client = FineTunedModelClient(remote_url=remote_inference_url, remote_model=model_for_remote)
             use_fine_tuned = True
-            training_count = metadata.get("training_count", 0) if metadata else 0
-            if training_count > 0:
-                st.success(f"✅ Using fine-tuned model (configured {training_count} time{'s' if training_count > 1 else ''})")
+            st.success(f"✅ Using remote GPU inference server (model: {model_for_remote})")
         except Exception as e:
-            st.warning(f"⚠️ Failed to load fine-tuned model: {str(e)}")
-            st.info("Falling back to base Ollama model...")
+            st.error(f"❌ Failed to connect to remote server: {str(e)}")
+            st.info("💡 Please set up the remote inference server in Phase 4 of the training workflow.")
             use_fine_tuned = False
+            client = None
+    elif has_fine_tuned:
+        # Local mode disabled - show error
+        st.error("❌ **Remote inference server required**")
+        st.markdown("""
+        This application is configured for **remote-only mode**.
+        
+        **To use fine-tuned models:**
+        1. Complete training (Phase 3)
+        2. Go to Phase 4: Finalize  
+        3. Click "🔧 Setup Inference Server" to deploy the server on your Vast.ai instance
+        4. Once the server is running, you can use this mode
+        """)
+        use_fine_tuned = False
+        client = None
     
     if not use_fine_tuned:
         ollama_client = OllamaClient(base_model)

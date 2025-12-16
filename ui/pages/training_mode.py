@@ -9,7 +9,7 @@ from datetime import datetime
 from utils.training_data import TrainingDataManager
 from utils.fine_tuner import FineTuner
 from utils.model_status import ModelStatus
-from utils.ollama_client import OllamaClient
+# Ollama removed - using HuggingFace models directly
 from utils.config import get_model_context_dir, get_model_behavioral_path, get_model_preferences, save_model_preferences, get_hf_token
 
 
@@ -1290,7 +1290,7 @@ def render():
                                     terminal_output.append(f"[SSH] Cleaning up old training files on instance...")
                                     cleanup_cmd = [
                                         "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
-                                        f"root@{ssh_host}",
+                                        f"root@{setup_ssh_host}",
                                         "cd /workspace/data && "
                                         "echo 'Cleaning up all old training files...' && "
                                         "# Remove all training files (numbered and active) "
@@ -1721,7 +1721,7 @@ def render():
                                     terminal_output.append(f"[SSH] Phase 2: Cleaning up old training files...")
                                     cleanup_cmd = [
                                         "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
-                                        f"root@{ssh_host}",
+                                        f"root@{setup_ssh_host}",
                                         "cd /workspace/data && "
                                         "echo 'Cleaning up old training files...' && "
                                         "# Remove old numbered files (from old naming scheme) and any stale active files "
@@ -1776,7 +1776,7 @@ def render():
                                     terminal_output.append(f"[SSH] Cleaning up old training files...")
                                     cleanup_cmd = [
                                         "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
-                                        f"root@{ssh_host}",
+                                        f"root@{setup_ssh_host}",
                                         "cd /workspace/data && "
                                         "echo 'Cleaning up old training files...' && "
                                         "# Remove old numbered files (from old naming scheme) and any stale active files "
@@ -1800,7 +1800,7 @@ def render():
                                     import subprocess
                                     test_cmd = [
                                         "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
-                                        f"root@{ssh_host}",
+                                        f"root@{setup_ssh_host}",
                                         "echo 'SSH connection test'"
                                     ]
                                     test_result = subprocess.run(test_cmd, capture_output=True, text=True, timeout=15)
@@ -1825,7 +1825,7 @@ def render():
                                             "-o", "StrictHostKeyChecking=no", 
                                             "-o", "ConnectTimeout=30",
                                             "-o", "UserKnownHostsFile=/dev/null",
-                                            f"root@{ssh_host}",
+                                            f"root@{setup_ssh_host}",
                                             "echo 'Deleting output directory...' && rm -rf /workspace/output 2>&1 && echo 'Output directory deleted' && mkdir -p /workspace/data && mkdir -p /workspace/output/training && echo 'Directories recreated' && ls -la /workspace/output/ 2>&1 && echo 'Output directories forcefully deleted and recreated'"
                                         ]
                                         mkdir_result = subprocess.run(mkdir_cmd, capture_output=True, text=True, timeout=30)
@@ -1841,7 +1841,7 @@ def render():
                                             try:
                                                 check_onstart_cmd = [
                                                     "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
-                                                    f"root@{ssh_host}",
+                                                    f"root@{setup_ssh_host}",
                                                     "tail -30 /var/log/onstart.log 2>/dev/null || tail -30 /tmp/onstart.log 2>/dev/null || echo 'no_onstart_log'"
                                                 ]
                                                 onstart_check = subprocess.run(check_onstart_cmd, capture_output=True, text=True, timeout=15)
@@ -2054,7 +2054,7 @@ def render():
                                             # If not, create them
                                             check_dirs_cmd = [
                                                 "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
-                                                f"root@{ssh_host}",
+                                                f"root@{setup_ssh_host}",
                                                 "test -d /workspace/data && test -d /workspace/output/training && echo 'exists' || echo 'missing'"
                                             ]
                                             import subprocess
@@ -2077,7 +2077,7 @@ def render():
                                                         "-o", "StrictHostKeyChecking=no", 
                                                         "-o", "ConnectTimeout=30",
                                                         "-o", "UserKnownHostsFile=/dev/null",
-                                                        f"root@{ssh_host}",
+                                                        f"root@{setup_ssh_host}",
                                                         "echo 'Deleting output directory...' && rm -rf /workspace/output 2>&1 && echo 'Output directory deleted' && mkdir -p /workspace/data && mkdir -p /workspace/output/training && echo 'Directories recreated' && ls -la /workspace/output/ 2>&1 && echo 'Output directories forcefully deleted and recreated'"
                                                     ]
                                                     mkdir_result = subprocess.run(mkdir_cmd, capture_output=True, text=True, timeout=30)
@@ -2409,7 +2409,7 @@ def render():
                                                     "-o", "StrictHostKeyChecking=no", 
                                                     "-o", "ConnectTimeout=30",
                                                     "-o", "UserKnownHostsFile=/dev/null",
-                                                    f"root@{ssh_host}",
+                                                    f"root@{setup_ssh_host}",
                                                     "rm -rf /workspace/data/* /workspace/output/training/* && echo 'Cleanup complete'"
                                                 ]
                                                 cleanup_result = subprocess.run(cleanup_cmd, capture_output=True, text=True, timeout=30)
@@ -2437,7 +2437,7 @@ def render():
                                                     "-o", "StrictHostKeyChecking=no", 
                                                     "-o", "ConnectTimeout=30",
                                                     "-o", "UserKnownHostsFile=/dev/null",
-                                                    f"root@{ssh_host}",
+                                                    f"root@{setup_ssh_host}",
                                                     "mkdir -p /workspace/data && mkdir -p /workspace/output/training && echo 'Directories recreated'"
                                                 ]
                                                 mkdir_result = subprocess.run(mkdir_cmd, capture_output=True, text=True, timeout=30)
@@ -2560,7 +2560,7 @@ def render():
                                 terminal_output.append(f"[SSH] Cleaning up old numbered training files (keeping active files)...")
                                 cleanup_cmd = [
                                     "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
-                                    f"root@{ssh_host}",
+                                    f"root@{setup_ssh_host}",
                                     f"cd /workspace/data && "
                                     f"echo 'Cleaning up old numbered training files...' && "
                                     f"# Verify active files exist before cleaning "
@@ -2597,7 +2597,7 @@ def render():
                                 
                                 check_files_cmd = [
                                     "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
-                                    f"root@{ssh_host}",
+                                    f"root@{setup_ssh_host}",
                                     f"cd /workspace/data && "
                                     f"if [ -f {expected_config_name} ] && [ -f {expected_data_name} ]; then "
                                     f"  config_size=$(stat -c%s {expected_config_name} 2>/dev/null || echo 0) "
@@ -2827,7 +2827,7 @@ def render():
                                     )
                                     fix_config_cmd = [
                                         "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
-                                        f"root@{ssh_host}",
+                                        f"root@{setup_ssh_host}",
                                         fix_config_remote_cmd
                                     ]
                                     fix_config_result = subprocess.run(fix_config_cmd, capture_output=True, text=True, timeout=30)
@@ -2945,7 +2945,7 @@ def render():
                                     terminal_output.append(f"[YAML DEBUG] Checking for YAML file on remote: {yaml_to_check}")
                                     check_yaml_cmd = [
                                         "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
-                                        f"root@{ssh_host}",
+                                        f"root@{setup_ssh_host}",
                                         f"test -f /workspace/data/{yaml_to_check} && echo 'found' || echo 'not_found'"
                                     ]
                                     yaml_check_result = subprocess.run(check_yaml_cmd, capture_output=True, text=True, timeout=15)
@@ -2964,7 +2964,7 @@ def render():
                                 # Also check config file to see if it references YAML settings
                                 check_config_cmd = [
                                     "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
-                                    f"root@{ssh_host}",
+                                    f"root@{setup_ssh_host}",
                                     "test -f /workspace/data/axolotl_config.yaml && cat /workspace/data/axolotl_config.yaml | head -50 || echo 'config_not_found'"
                                 ]
                                 config_check_result = subprocess.run(check_config_cmd, capture_output=True, text=True, timeout=15)
@@ -3021,7 +3021,7 @@ def render():
                             if ssh_host:
                                 lora_verify_cmd = [
                                     "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
-                                    f"root@{ssh_host}",
+                                    f"root@{setup_ssh_host}",
                                     "cd /workspace/data && python3 << 'PYTHON_EOF'\n"
                                     "import yaml\n"
                                     "import os\n"
@@ -3161,7 +3161,7 @@ def render():
                             try:
                                 check_process_cmd = [
                                     "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
-                                    f"root@{ssh_host}",
+                                    f"root@{setup_ssh_host}",
                                     "ps aux | grep -E '(accelerate|axolotl.cli.train)' | grep -v grep | wc -l"
                                 ]
                                 process_check_result = subprocess.run(check_process_cmd, capture_output=True, text=True, timeout=10)
@@ -3223,7 +3223,7 @@ def render():
                                         terminal_output.append(f"[LOCAL] Looking for most recent version weights to embed...")
                                         from utils.model_manager import ModelManager
                                         model_manager = ModelManager()
-                                        latest_version = model_manager.get_latest_version(model_name)
+                                        latest_version = model_manager.get_most_recent_version(model_name)
                                         
                                         if latest_version:
                                             weights_path = model_manager.get_version_weights_path(model_name, latest_version)
@@ -3248,7 +3248,7 @@ def render():
                                                     # Update config file to use the adapter
                                                     update_config_cmd = [
                                                         "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
-                                                        f"root@{ssh_host}",
+                                                        f"root@{setup_ssh_host}",
                                                         f"cd /workspace/data && "
                                                         f"python3 << 'PYTHON_EOF'\n"
                                                         f"import yaml\n"
@@ -3294,7 +3294,7 @@ def render():
                                         # Check for active files (single job, no suffix)
                                         check_active_cmd = [
                                             "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
-                                            f"root@{ssh_host}",
+                                            f"root@{setup_ssh_host}",
                                             f"cd /workspace/data && "
                                             f"if [ -f axolotl_config.yaml ] && [ -f training_data.jsonl ]; then "
                                             f"  # Check file sizes to ensure they're not empty "
@@ -3345,7 +3345,7 @@ def render():
                                         import subprocess
                                         check_files_cmd = [
                                             "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
-                                            f"root@{ssh_host}",
+                                            f"root@{setup_ssh_host}",
                                             "test -f /workspace/data/axolotl_config.yaml && test -f /workspace/data/training_data.jsonl && echo 'files_exist' || echo 'files_missing'"
                                         ]
                                         files_check = subprocess.run(check_files_cmd, capture_output=True, text=True, timeout=15)
@@ -3357,7 +3357,7 @@ def render():
                                             # Check for existing processes
                                             check_processes_cmd = [
                                                 "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
-                                                f"root@{ssh_host}",
+                                                f"root@{setup_ssh_host}",
                                                 "ps aux | grep -E '(accelerate|axolotl|train)' | grep -v grep | head -5 || echo 'no_processes'"
                                             ]
                                             check_processes_result = subprocess.run(check_processes_cmd, capture_output=True, text=True, timeout=15)
@@ -3378,7 +3378,7 @@ def render():
                                             terminal_output.append(f"[SSH] Cleaning output directory...")
                                             cleanup_cmd = [
                                                 "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
-                                                f"root@{ssh_host}",
+                                                f"root@{setup_ssh_host}",
                                                 "rm -rf /workspace/output/training/* && echo 'Output directory cleaned'"
                                             ]
                                             cleanup_result = subprocess.run(cleanup_cmd, capture_output=True, text=True, timeout=30)
@@ -3389,7 +3389,7 @@ def render():
                                             terminal_output.append(f"[SSH] Final verification: Checking files exist and are valid before starting training...")
                                             final_verify_cmd = [
                                                 "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
-                                                f"root@{ssh_host}",
+                                                f"root@{setup_ssh_host}",
                                                 f"cd /workspace/data && "
                                                 f"echo '=== FINAL FILE VERIFICATION ===' && "
                                                 f"if [ ! -f axolotl_config.yaml ]; then "
@@ -3438,7 +3438,7 @@ def render():
                                             terminal_output.append(f"[SSH] Verifying config file points to correct dataset path...")
                                             verify_config_cmd = [
                                                 "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
-                                                f"root@{ssh_host}",
+                                                f"root@{setup_ssh_host}",
                                                 f"cd /workspace/data && "
                                                 f"python3 << 'PYTHON_EOF'\n"
                                                 f"import yaml\n"
@@ -3515,7 +3515,7 @@ def render():
                                             terminal_output.append(f"[SSH] Ensuring sample_packing is disabled...")
                                             fix_sample_packing_cmd = [
                                                 "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
-                                                f"root@{ssh_host}",
+                                                f"root@{setup_ssh_host}",
                                                 f"cd /workspace/data && "
                                                 f"python3 << 'PYTHON_EOF'\n"
                                                 f"import yaml\n"
@@ -3557,7 +3557,7 @@ def render():
                                             
                                             terminal_output.append(f"[SSH] Starting training...")
                                             terminal_output.append(f"[DEBUG] Using SSH port: {ssh_port} for training command")
-                                            
+
                                             # Build HF token export section - same as Redo Phase 3
                                             token_exports = ""
                                             if hf_token and isinstance(hf_token, str) and hf_token.strip():
@@ -3605,7 +3605,7 @@ REMOTE_SCRIPT"""
                                             training_cmd = [
                                                 "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
                                                 "-o", "ServerAliveInterval=5", "-o", "ServerAliveCountMax=2",
-                                                f"root@{ssh_host}",
+                                                f"root@{setup_ssh_host}",
                                                 ssh_command
                                             ]
                                             terminal_output.append(f"[DEBUG] Executing training command via SSH on port: {ssh_port}")
@@ -3617,10 +3617,10 @@ REMOTE_SCRIPT"""
                                                 
                                                 if training_result.returncode == 0:
                                                     terminal_output.append(f"[SSH] Training command executed")
-                                                    if training_result.stdout:
-                                                        stdout_filtered = filter_malloc_warnings(training_result.stdout)
-                                                        for line in stdout_filtered.strip().split("\n"):
-                                                            if line.strip():
+                                                if training_result.stdout:
+                                                    stdout_filtered = filter_malloc_warnings(training_result.stdout)
+                                                    for line in stdout_filtered.strip().split("\n"):
+                                                        if line.strip():
                                                                 terminal_output.append(f"[SSH] {line[:200]}")
                                                 else:
                                                     terminal_output.append(f"[SSH] Training command sent (return code: {training_result.returncode}, checking process status...)")
@@ -3629,10 +3629,10 @@ REMOTE_SCRIPT"""
                                                         for line in stdout_filtered.strip().split("\n"):
                                                             if line.strip():
                                                                 terminal_output.append(f"[STDOUT] {line[:200]}")
-                                                    if training_result.stderr:
-                                                        stderr_filtered = filter_malloc_warnings(training_result.stderr)
-                                                        for line in stderr_filtered.strip().split("\n"):
-                                                            if line.strip():
+                                                if training_result.stderr:
+                                                    stderr_filtered = filter_malloc_warnings(training_result.stderr)
+                                                    for line in stderr_filtered.strip().split("\n"):
+                                                        if line.strip():
                                                                 terminal_output.append(f"[STDERR] {line[:200]}")
                                             except subprocess.TimeoutExpired:
                                                 # Timeout is expected - the process is running in background
@@ -3643,14 +3643,14 @@ REMOTE_SCRIPT"""
                                                 terminal_output.append(f"[ERROR] Traceback: {traceback.format_exc()[:300]}")
                                             
                                             # Wait a moment and then check if the process actually started
-                                            import time
+                                                import time
                                             time.sleep(3)
-                                            
+                                                
                                             # Quick check to see if log file is being created
                                             try:
                                                 quick_log_check_cmd = [
                                                     "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
-                                                    f"root@{ssh_host}",
+                                                    f"root@{setup_ssh_host}",
                                                     "test -f /workspace/output/training/training.log && (wc -l /workspace/output/training/training.log && tail -20 /workspace/output/training/training.log) || echo 'log_not_created'"
                                                 ]
                                                 quick_log_check = subprocess.run(quick_log_check_cmd, capture_output=True, text=True, timeout=10)
@@ -3681,48 +3681,48 @@ REMOTE_SCRIPT"""
                                             try:
                                                 verify_cmd = [
                                                     "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
-                                                    f"root@{ssh_host}",
+                                                    f"root@{setup_ssh_host}",
                                                     "sleep 3 && ps aux | grep -E '(accelerate|axolotl)' | grep -v grep | head -2 || echo 'no_process'"
                                                 ]
                                                 verify_result = subprocess.run(verify_cmd, capture_output=True, text=True, timeout=15)
-                                                
+                                                    
                                                 if "no_process" not in verify_result.stdout:
                                                     stdout_filtered = filter_malloc_warnings(verify_result.stdout)
                                                     terminal_output.append(f"[SSH] Training process found:")
                                                     for line in stdout_filtered.strip().split("\n")[:2]:
                                                         if line.strip():
                                                             terminal_output.append(f"[SSH]   {line[:150]}")
-                                                    terminal_output.append(f"[SUCCESS] Training started successfully!")
-                                                    
-                                                    # Update job status
-                                                    active_job["training_status"] = {"status": "training"}
-                                                    training_manager._save_job(active_job)
-                                                else:
-                                                    terminal_output.append(f"[WARNING] Training command executed but process not found yet")
-                                                    
-                                                    # Check training log for errors
-                                                    check_log_cmd = [
-                                                        "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
-                                                        f"root@{ssh_host}",
-                                                        "tail -50 /workspace/output/training/training.log 2>/dev/null || echo 'no_log'"
-                                                    ]
-                                                    log_check = subprocess.run(check_log_cmd, capture_output=True, text=True, timeout=15)
-                                                    if "no_log" not in log_check.stdout:
-                                                        log_output = filter_malloc_warnings(log_check.stdout)
-                                                        terminal_output.append(f"[WARNING] Last log output (showing more lines for debugging):")
-                                                        for line in log_output.strip().split("\n"):
-                                                            if line.strip():
-                                                                terminal_output.append(f"[LOG] {line[:200]}")
+                                                        terminal_output.append(f"[SUCCESS] Training started successfully!")
+                                                        
+                                                        # Update job status
+                                                        active_job["training_status"] = {"status": "training"}
+                                                        training_manager._save_job(active_job)
                                                     else:
-                                                        terminal_output.append(f"[WARNING] Training log file not found at /workspace/output/training/training.log")
-                                                    
+                                                        terminal_output.append(f"[WARNING] Training command executed but process not found yet")
+                                                        
+                                                        # Check training log for errors
+                                                        check_log_cmd = [
+                                                            "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
+                                                            f"root@{setup_ssh_host}",
+                                                            "tail -50 /workspace/output/training/training.log 2>/dev/null || echo 'no_log'"
+                                                        ]
+                                                        log_check = subprocess.run(check_log_cmd, capture_output=True, text=True, timeout=15)
+                                                        if "no_log" not in log_check.stdout:
+                                                            log_output = filter_malloc_warnings(log_check.stdout)
+                                                            terminal_output.append(f"[WARNING] Last log output (showing more lines for debugging):")
+                                                            for line in log_output.strip().split("\n"):
+                                                                if line.strip():
+                                                                    terminal_output.append(f"[LOG] {line[:200]}")
+                                                        else:
+                                                            terminal_output.append(f"[WARNING] Training log file not found at /workspace/output/training/training.log")
+                                                        
                                                     terminal_output.append(f"[INFO] Training may still be starting. Use 'Check Training Status' to verify.")
                                             except subprocess.TimeoutExpired:
                                                 terminal_output.append(f"[WARNING] Process verification timed out - training may still be starting")
                                                 terminal_output.append(f"[INFO] Check training status again in a few moments")
                                             except Exception as e:
                                                 terminal_output.append(f"[WARNING] Could not verify training process: {str(e)}")
-                                                terminal_output.append(f"[INFO] Training command was sent - check status to verify training started")
+                                            terminal_output.append(f"[INFO] Training command was sent - check status to verify training started")
                                             
                                             # Training verification is already handled above - no duplicate code needed
                                         else:
@@ -3857,7 +3857,7 @@ REMOTE_SCRIPT"""
                                     test_connection_cmd = [
                                         "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
                                         "-o", "ServerAliveInterval=5", "-o", "ServerAliveCountMax=2",
-                                        f"root@{ssh_host}",
+                                        f"root@{setup_ssh_host}",
                                         "echo 'SSH connection successful'"
                                     ]
                                     try:
@@ -3886,7 +3886,7 @@ REMOTE_SCRIPT"""
                                     check_output_cmd = [
                                         "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
                                         "-o", "ServerAliveInterval=5", "-o", "ServerAliveCountMax=2",
-                                        f"root@{ssh_host}",
+                                        f"root@{setup_ssh_host}",
                                         "ls -la /workspace/output/training 2>/dev/null | tail -5 || echo 'no_output'"
                                     ]
                                     try:
@@ -3923,7 +3923,7 @@ REMOTE_SCRIPT"""
                                     terminal_output.append(f"[DEBUG] SSH command: ssh -p {ssh_port} root@{ssh_host} 'ls -la /workspace/data/'")
                                     check_files_cmd = [
                                         "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
-                                        f"root@{ssh_host}",
+                                        f"root@{setup_ssh_host}",
                                         "ls -la /workspace/data/ 2>/dev/null | grep -E '(training_data|axolotl_config)' || echo 'files_missing'"
                                     ]
                                     try:
@@ -3986,7 +3986,7 @@ REMOTE_SCRIPT"""
                                         terminal_output.append(f"[SSH] Removing old _0 files...")
                                         remove_old_files_cmd = [
                                             "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
-                                            f"root@{ssh_host}",
+                                            f"root@{setup_ssh_host}",
                                             "cd /workspace/data && rm -f axolotl_config_0.yaml training_data_0.jsonl && echo 'Removed _0 files' || echo 'No _0 files to remove'"
                                         ]
                                         remove_result = subprocess.run(remove_old_files_cmd, capture_output=True, text=True, timeout=15)
@@ -4000,7 +4000,7 @@ REMOTE_SCRIPT"""
                                     terminal_output.append(f"[DEBUG] SSH command: ssh -p {ssh_port} root@{ssh_host} 'ps aux | grep -E ...'")
                                     check_training_cmd = [
                                         "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
-                                        f"root@{ssh_host}",
+                                        f"root@{setup_ssh_host}",
                                         "ps aux | grep -E '(accelerate|axolotl|train)' | grep -v grep | head -5 || echo 'no_training'"
                                     ]
                                     try:
@@ -4059,7 +4059,7 @@ REMOTE_SCRIPT"""
                                                 for pid in pids:
                                                     get_parent_cmd = [
                                                         "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
-                                                        f"root@{ssh_host}",
+                                                        f"root@{setup_ssh_host}",
                                                         f"ps -o ppid= -p {pid} 2>/dev/null | tr -d ' '"
                                                     ]
                                                     parent_result = subprocess.run(get_parent_cmd, capture_output=True, text=True, timeout=5)
@@ -4116,7 +4116,7 @@ REMOTE_SCRIPT"""
                                         check_process_cmd_full = [
                                             "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
                                             "-o", "ServerAliveInterval=5", "-o", "ServerAliveCountMax=2",
-                                            f"root@{ssh_host}",
+                                            f"root@{setup_ssh_host}",
                                             "ps aux | grep -E '(accelerate|axolotl|train)' | grep -v grep | head -1"
                                         ]
                                         try:
@@ -4189,7 +4189,7 @@ REMOTE_SCRIPT"""
                                     check_log_exists_cmd = [
                                         "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
                                         "-o", "ServerAliveInterval=5", "-o", "ServerAliveCountMax=2",
-                                        f"root@{ssh_host}",
+                                        f"root@{setup_ssh_host}",
                                         "ls -lh /workspace/output/training/training.log 2>/dev/null | awk '{print $5, $9}' || echo 'log_not_found'"
                                     ]
                                     try:
@@ -4208,7 +4208,7 @@ REMOTE_SCRIPT"""
                                     check_training_log_cmd = [
                                         "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
                                         "-o", "ServerAliveInterval=5", "-o", "ServerAliveCountMax=2",
-                                        f"root@{ssh_host}",
+                                        f"root@{setup_ssh_host}",
                                         "tail -100 /workspace/output/training/training.log 2>/dev/null || echo 'no_training_log'"
                                     ]
                                     try:
@@ -4238,7 +4238,7 @@ REMOTE_SCRIPT"""
                                         full_log_cmd = [
                                             "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
                                             "-o", "ServerAliveInterval=5", "-o", "ServerAliveCountMax=2",
-                                            f"root@{ssh_host}",
+                                            f"root@{setup_ssh_host}",
                                             "cat /workspace/output/training/training.log 2>/dev/null | head -500 || echo 'no_full_log'"
                                         ]
                                         try:
@@ -4264,7 +4264,7 @@ REMOTE_SCRIPT"""
                                             check_dataset_cmd = [
                                                 "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
                                                 "-o", "ServerAliveInterval=5", "-o", "ServerAliveCountMax=2",
-                                                f"root@{ssh_host}",
+                                                f"root@{setup_ssh_host}",
                                                 "find /workspace/axolotl/prepared_data -name 'train.jsonl' -type f 2>/dev/null | head -1 | xargs -I {} sh -c 'if [ -f \"{}\" ]; then wc -l \"{}\" | awk \"{print \\$1}\"; else echo \"0\"; fi' || echo 'cannot_count'"
                                             ]
                                             try:
@@ -4324,7 +4324,7 @@ REMOTE_SCRIPT"""
                                             # Check if the log file is being created but is empty (process might be starting)
                                             check_log_size_cmd = [
                                                 "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
-                                                f"root@{ssh_host}",
+                                                f"root@{setup_ssh_host}",
                                                 "test -f /workspace/output/training/training.log && wc -l /workspace/output/training/training.log || echo 'log_not_exists'"
                                             ]
                                             log_size_result = subprocess.run(check_log_size_cmd, capture_output=True, text=True, timeout=15)
@@ -4341,7 +4341,7 @@ REMOTE_SCRIPT"""
                                             try:
                                                 check_tmp_output_cmd = [
                                                     "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
-                                                    f"root@{ssh_host}",
+                                                    f"root@{setup_ssh_host}",
                                                     "ls -lht /tmp/*.log /tmp/*.out /tmp/*.err 2>/dev/null | head -3 || echo 'no_tmp_output'"
                                                 ]
                                                 tmp_output_result = subprocess.run(check_tmp_output_cmd, capture_output=True, text=True, timeout=10)
@@ -4358,7 +4358,7 @@ REMOTE_SCRIPT"""
                                             # Check if we can see the process's file descriptors to see if it's writing
                                             check_process_fds_cmd = [
                                                 "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
-                                                f"root@{ssh_host}",
+                                                f"root@{setup_ssh_host}",
                                                 "ps aux | grep -E '(accelerate|axolotl|train)' | grep -v grep | awk '{print $2}' | head -1 | xargs -I {} sh -c 'if [ -n \"{}\" ]; then ls -l /proc/{}/fd/ 2>/dev/null | grep -E \"(training.log|stdout|stderr)\" || echo \"no_fds\"; else echo \"no_pid\"; fi'"
                                             ]
                                             process_fds_result = subprocess.run(check_process_fds_cmd, capture_output=True, text=True, timeout=15)
@@ -4371,7 +4371,7 @@ REMOTE_SCRIPT"""
                                     terminal_output.append(f"[DEBUG] SSH command: ssh -p {ssh_port} root@{ssh_host} 'tail debug.log'")
                                     debug_log_cmd = [
                                         "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
-                                        f"root@{ssh_host}",
+                                        f"root@{setup_ssh_host}",
                                         "if [ -f /workspace/output/training/debug.log ]; then tail -30 /workspace/output/training/debug.log; else echo 'no_debug_log'; fi"
                                     ]
                                     try:
@@ -4409,7 +4409,7 @@ REMOTE_SCRIPT"""
                                     log_cmd = [
                                         "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
                                         "-o", "ServerAliveInterval=5", "-o", "ServerAliveCountMax=2",
-                                        f"root@{ssh_host}",
+                                        f"root@{setup_ssh_host}",
                                         log_command
                                     ]
                                     terminal_output.append(f"[DEBUG] Log retrieval command: {log_command[:200]}...")
@@ -4502,7 +4502,7 @@ REMOTE_SCRIPT"""
                                                 try:
                                                     check_config_cmd = [
                                                         "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
-                                                        f"root@{ssh_host}",
+                                                        f"root@{setup_ssh_host}",
                                                         "cd /workspace/data && python3 << 'PYTHON_EOF'\n"
                                                         "import yaml\n"
                                                         "import os\n"
@@ -5240,7 +5240,7 @@ REMOTE_SCRIPT"""
                                         if ssh_host:
                                             check_adapter_files_cmd = [
                                                 "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
-                                                f"root@{ssh_host}",
+                                                f"root@{setup_ssh_host}",
                                                 """bash -c '
                                                     adapter_found=false
                                                     if [ -f /workspace/output/training/adapter/adapter_config.json ]; then
@@ -5333,7 +5333,7 @@ REMOTE_SCRIPT"""
                                                     terminal_output.append(f"[QUEUE] Verifying job {current_job_index + 1} has completed...")
                                                     verify_complete_cmd = [
                                                         "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
-                                                        f"root@{ssh_host}",
+                                                        f"root@{setup_ssh_host}",
                                                         "ps aux | grep -E '(accelerate|axolotl|train)' | grep -v grep | wc -l"
                                                     ]
                                                     verify_complete_result = subprocess.run(verify_complete_cmd, capture_output=True, text=True, timeout=15)
@@ -5358,7 +5358,7 @@ REMOTE_SCRIPT"""
                                                     terminal_output.append(f"[CLEANUP] Step 1: Saving results from job {current_job_index + 1}...")
                                                     save_results_cmd = [
                                                         "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
-                                                        f"root@{ssh_host}",
+                                                        f"root@{setup_ssh_host}",
                                                         f"mkdir -p /workspace/data/job_{current_job_index}_results && "
                                                         f"cp -r /workspace/output/training/* /workspace/data/job_{current_job_index}_results/ 2>/dev/null && "
                                                         f"ls -la /workspace/data/job_{current_job_index}_results/ | head -10 && "
@@ -5382,7 +5382,7 @@ REMOTE_SCRIPT"""
                                                     # Check multiple possible adapter locations
                                                     copy_adapter_cmd = [
                                                         "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
-                                                        f"root@{ssh_host}",
+                                                        f"root@{setup_ssh_host}",
                                                         f"mkdir -p /workspace/data/previous_adapter_{current_job_index} && "
                                                         f"(test -d /workspace/data/job_{current_job_index}_results/adapter && cp -r /workspace/data/job_{current_job_index}_results/adapter/* /workspace/data/previous_adapter_{current_job_index}/ 2>/dev/null && echo 'adapter_from_subdir' || "
                                                         f"test -f /workspace/data/job_{current_job_index}_results/adapter_config.json && cp -r /workspace/data/job_{current_job_index}_results/* /workspace/data/previous_adapter_{current_job_index}/ 2>/dev/null && echo 'adapter_from_root' || "
@@ -5415,7 +5415,7 @@ REMOTE_SCRIPT"""
                                                     terminal_output.append(f"[CLEANUP]   Removing old checkpoints and files from /workspace/output/training/...")
                                                     cleanup_cmd = [
                                                         "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
-                                                        f"root@{ssh_host}",
+                                                        f"root@{setup_ssh_host}",
                                                         f"ls -la /workspace/output/training/ 2>/dev/null | head -5 && "
                                                         f"rm -rf /workspace/output/training/* && "
                                                         f"mkdir -p /workspace/output/training && "
@@ -5465,7 +5465,7 @@ REMOTE_SCRIPT"""
                                                         )
                                                         update_config_cmd = [
                                                             "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
-                                                            f"root@{ssh_host}",
+                                                            f"root@{setup_ssh_host}",
                                                             update_config_remote_cmd
                                                         ]
                                                         update_result = subprocess.run(update_config_cmd, capture_output=True, text=True, timeout=30)
@@ -5500,7 +5500,7 @@ REMOTE_SCRIPT"""
                                                         terminal_output.append(f"[SSH]   Just removing previous job files and verifying job 1 files exist...")
                                                         rename_cmd = [
                                                             "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
-                                                            f"root@{ssh_host}",
+                                                            f"root@{setup_ssh_host}",
                                                             f"cd /workspace/data && "
                                                             f"echo 'Step 1: Removing previous job active files...' && "
                                                             f"rm -f axolotl_config.yaml training_data.jsonl && "
@@ -5519,7 +5519,7 @@ REMOTE_SCRIPT"""
                                                         terminal_output.append(f"[SSH]   Files to activate (job {next_job_index + 1}): training_data_{next_job_index}.jsonl → training_data.jsonl")
                                                         rename_cmd = [
                                                             "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
-                                                            f"root@{ssh_host}",
+                                                            f"root@{setup_ssh_host}",
                                                             f"cd /workspace/data && "
                                                             f"echo '=== File Rename Operation ===' && "
                                                             f"echo 'Step 1: Removing old active files (job {current_job_index + 1})...' && "
@@ -5585,7 +5585,7 @@ REMOTE_SCRIPT"""
                                                         terminal_output.append(f"[SSH] Verifying no training processes are running before starting job {next_job_index + 1}...")
                                                         verify_no_processes_cmd = [
                                                             "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
-                                                            f"root@{ssh_host}",
+                                                            f"root@{setup_ssh_host}",
                                                             "ps aux | grep -E '(accelerate|axolotl|train)' | grep -v grep | wc -l"
                                                         ]
                                                         verify_no_processes_result = subprocess.run(verify_no_processes_cmd, capture_output=True, text=True, timeout=15)
@@ -5648,7 +5648,7 @@ REMOTE_SCRIPT"""
                                                         restart_training_cmd = [
                                                             "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
                                                             "-o", "ServerAliveInterval=5", "-o", "ServerAliveCountMax=2",
-                                                            f"root@{ssh_host}",
+                                                            f"root@{setup_ssh_host}",
                                                             restart_training_remote_cmd
                                                         ]
                                                         try:
@@ -5665,7 +5665,7 @@ REMOTE_SCRIPT"""
                                                         terminal_output.append(f"[SSH] Verifying training process started...")
                                                         verify_cmd = [
                                                             "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
-                                                            f"root@{ssh_host}",
+                                                            f"root@{setup_ssh_host}",
                                                             "sleep 3 && ps aux | grep -E '(accelerate|axolotl)' | grep -v grep | head -2 || echo 'no_process'"
                                                         ]
                                                         verify_result = subprocess.run(verify_cmd, capture_output=True, text=True, timeout=15)
@@ -5777,7 +5777,7 @@ REMOTE_SCRIPT"""
                                                         )
                                                         fix_multipack_cmd = [
                                                             "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
-                                                            f"root@{ssh_host}",
+                                                            f"root@{setup_ssh_host}",
                                                             fix_multipack_remote_cmd
                                                         ]
                                                         fix_multipack_result = subprocess.run(fix_multipack_cmd, capture_output=True, text=True, timeout=30)
@@ -5879,7 +5879,7 @@ REMOTE_SCRIPT"""
                                                 )
                                                     fix_adapter_cmd = [
                                                         "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
-                                                        f"root@{ssh_host}",
+                                                        f"root@{setup_ssh_host}",
                                                         fix_adapter_remote_cmd
                                                     ]
                                                     fix_adapter_result = subprocess.run(fix_adapter_cmd, capture_output=True, text=True, timeout=30)
@@ -5963,7 +5963,7 @@ REMOTE_SCRIPT"""
                                                 )
                                                 fix_tokenizer_cmd = [
                                                     "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
-                                                    f"root@{ssh_host}",
+                                                    f"root@{setup_ssh_host}",
                                                     fix_tokenizer_remote_cmd
                                                 ]
                                                 fix_result = subprocess.run(fix_tokenizer_cmd, capture_output=True, text=True, timeout=30)
@@ -6013,7 +6013,7 @@ REMOTE_SCRIPT"""
                                                 )
                                                 fix_dataset_path_cmd = [
                                                     "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
-                                                    f"root@{ssh_host}",
+                                                    f"root@{setup_ssh_host}",
                                                     fix_dataset_path_remote_cmd
                                                 ]
                                                 fix_result = subprocess.run(fix_dataset_path_cmd, capture_output=True, text=True, timeout=30)
@@ -6080,7 +6080,7 @@ REMOTE_SCRIPT"""
                                                 )
                                                 fix_oom_cmd = [
                                                     "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
-                                                    f"root@{ssh_host}",
+                                                    f"root@{setup_ssh_host}",
                                                     fix_oom_remote_cmd
                                                 ]
                                                 fix_oom_result = subprocess.run(fix_oom_cmd, capture_output=True, text=True, timeout=30)
@@ -6127,7 +6127,7 @@ REMOTE_SCRIPT"""
                                             # First, check if train_on_inputs is set correctly (this is critical for sample retention)
                                             check_train_on_inputs_cmd = [
                                                 "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
-                                                f"root@{ssh_host}",
+                                                f"root@{setup_ssh_host}",
                                                 "cd /workspace/data && python3 << 'PYTHON_EOF'\n"
                                                 "import yaml\n"
                                                 "try:\n"
@@ -6167,7 +6167,7 @@ REMOTE_SCRIPT"""
                                             # First, check if data actually survived filtering
                                             check_survived_cmd = [
                                                 "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
-                                                f"root@{ssh_host}",
+                                                f"root@{setup_ssh_host}",
                                                 "python3 << 'PYTHON_EOF'\n"
                                                 "import os\n"
                                                 "import json\n"
@@ -6334,7 +6334,7 @@ REMOTE_SCRIPT"""
                                                 )
                                                 fix_multipack_cmd = [
                                                     "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
-                                                    f"root@{ssh_host}",
+                                                    f"root@{setup_ssh_host}",
                                                     fix_multipack_remote_cmd
                                                 ]
                                                 fix_multipack_result = subprocess.run(fix_multipack_cmd, capture_output=True, text=True, timeout=30)
@@ -6576,7 +6576,7 @@ REMOTE_SCRIPT"""
                                     terminal_output.append(f"[SSH] Forcefully deleting output directories...")
                                     cleanup_cmd = [
                                         "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
-                                        f"root@{ssh_host}",
+                                        f"root@{setup_ssh_host}",
                                         "echo 'Deleting output directory...' && rm -rf /workspace/output 2>&1 && echo 'Output directory deleted' && mkdir -p /workspace/output/training && echo 'Directories recreated' && ls -la /workspace/output/ 2>&1 && echo 'Output directories forcefully deleted and recreated'"
                                     ]
                                     cleanup_result = subprocess.run(cleanup_cmd, capture_output=True, text=True, timeout=30)
@@ -6598,7 +6598,7 @@ REMOTE_SCRIPT"""
                                         # Try to verify if deletion actually happened despite error
                                         verify_cmd = [
                                             "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
-                                            f"root@{ssh_host}",
+                                            f"root@{setup_ssh_host}",
                                             "if [ -d /workspace/output ]; then echo 'DIRECTORY_EXISTS' && ls -la /workspace/output/; else echo 'DIRECTORY_DELETED'; fi"
                                         ]
                                         verify_result = subprocess.run(verify_cmd, capture_output=True, text=True, timeout=10)
@@ -6616,7 +6616,7 @@ REMOTE_SCRIPT"""
                                         # Read current config
                                         read_config_cmd = [
                                             "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
-                                            f"root@{ssh_host}",
+                                            f"root@{setup_ssh_host}",
                                             "cd /workspace/data && python3 << 'PYTHON_EOF'\n"
                                             "import yaml\n"
                                             "import sys\n"
@@ -6665,7 +6665,7 @@ REMOTE_SCRIPT"""
                                             # Check GPU memory to suggest optimal batch size
                                             check_memory_cmd = [
                                                 "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
-                                                f"root@{ssh_host}",
+                                                f"root@{setup_ssh_host}",
                                                 "nvidia-smi --query-gpu=memory.total,memory.used,memory.free --format=csv,noheader,nounits 2>/dev/null | head -1"
                                             ]
                                             memory_result = subprocess.run(check_memory_cmd, capture_output=True, text=True, timeout=10)
@@ -6889,7 +6889,7 @@ REMOTE_SCRIPT"""
                                     )
                                     fix_tokenizer_cmd = [
                                         "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
-                                        f"root@{ssh_host}",
+                                        f"root@{setup_ssh_host}",
                                         fix_tokenizer_remote_cmd_redo
                                     ]
                                     fix_result = subprocess.run(fix_tokenizer_cmd, capture_output=True, text=True, timeout=30)
@@ -7047,7 +7047,7 @@ REMOTE_SCRIPT"""
                                                         terminal_output.append(f"[SSH] Verifying uploaded config file...")
                                                         verify_cmd = [
                                                             "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
-                                                            f"root@{ssh_host}",
+                                                            f"root@{setup_ssh_host}",
                                                             "grep -E 'base_model|base_model_config' /workspace/data/axolotl_config.yaml | head -2"
                                                         ]
                                                         verify_result = subprocess.run(verify_cmd, capture_output=True, text=True, timeout=15)
@@ -7143,7 +7143,7 @@ REMOTE_SCRIPT"""
                                                             )
                                                             fix_config_cmd_redo = [
                                                                 "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
-                                                                f"root@{ssh_host}",
+                                                                f"root@{setup_ssh_host}",
                                                                 fix_config_remote_cmd_redo
                                                             ]
                                                             fix_config_result_redo = subprocess.run(fix_config_cmd_redo, capture_output=True, text=True, timeout=30)
@@ -7160,7 +7160,7 @@ REMOTE_SCRIPT"""
                                                                 # Verify the actual config value
                                                                 verify_path_cmd = [
                                                                     "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
-                                                                    f"root@{ssh_host}",
+                                                                    f"root@{setup_ssh_host}",
                                                                     "grep 'dataset_preparation_path' /workspace/data/axolotl_config.yaml"
                                                                 ]
                                                                 verify_path_result = subprocess.run(verify_path_cmd, capture_output=True, text=True, timeout=15)
@@ -7356,7 +7356,7 @@ REMOTE_SCRIPT"""
                                     restart_cmd = [
                                         "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
                                         "-o", "ServerAliveInterval=5", "-o", "ServerAliveCountMax=2",
-                                        f"root@{ssh_host}",
+                                        f"root@{setup_ssh_host}",
                                         ssh_command
                                     ]
                                     terminal_output.append(f"[DEBUG] Executing training command via SSH on port: {ssh_port}")
@@ -7403,7 +7403,7 @@ REMOTE_SCRIPT"""
                                     try:
                                         quick_log_check_cmd = [
                                             "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
-                                            f"root@{ssh_host}",
+                                            f"root@{setup_ssh_host}",
                                             "test -f /workspace/output/training/training.log && (wc -l /workspace/output/training/training.log && tail -20 /workspace/output/training/training.log) || echo 'log_not_created'"
                                         ]
                                         quick_log_check = subprocess.run(quick_log_check_cmd, capture_output=True, text=True, timeout=10)
@@ -7427,7 +7427,7 @@ REMOTE_SCRIPT"""
                                             # Check if there are any Python processes that might have failed
                                             check_python_errors_cmd = [
                                                 "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
-                                                f"root@{ssh_host}",
+                                                f"root@{setup_ssh_host}",
                                                 "ps aux | grep python | grep -E '(axolotl|accelerate|train)' | grep -v grep | head -5 || echo 'no_python_process'"
                                             ]
                                             python_process_check = subprocess.run(check_python_errors_cmd, capture_output=True, text=True, timeout=10)
@@ -7450,7 +7450,7 @@ REMOTE_SCRIPT"""
                                     try:
                                         verify_cmd = [
                                             "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
-                                            f"root@{ssh_host}",
+                                            f"root@{setup_ssh_host}",
                                             "sleep 3 && ps aux | grep -E '(accelerate|axolotl)' | grep -v grep | head -2 || echo 'no_process'"
                                         ]
                                         verify_result = subprocess.run(verify_cmd, capture_output=True, text=True, timeout=15)
@@ -7473,7 +7473,7 @@ REMOTE_SCRIPT"""
                                             # Check training log for errors
                                             check_log_cmd = [
                                                 "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
-                                                f"root@{ssh_host}",
+                                                f"root@{setup_ssh_host}",
                                                 "tail -50 /workspace/output/training/training.log 2>/dev/null || echo 'no_log'"
                                             ]
                                             log_check = subprocess.run(check_log_cmd, capture_output=True, text=True, timeout=15)
@@ -7641,7 +7641,7 @@ REMOTE_SCRIPT"""
                                 )
                                 log_cmd = [
                                     "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
-                                    f"root@{ssh_host}",
+                                    f"root@{setup_ssh_host}",
                                     log_command
                                 ]
                                 log_result = subprocess.run(log_cmd, capture_output=True, text=True, timeout=30)
@@ -7790,7 +7790,7 @@ REMOTE_SCRIPT"""
                                     import subprocess
                                     check_files_cmd = [
                                         "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
-                                        f"root@{ssh_host}",
+                                        f"root@{setup_ssh_host}",
                                         "find /workspace/output -type f \\( -name '*.bin' -o -name '*.safetensors' -o -name 'adapter_config.json' \\) 2>/dev/null | head -20"
                                     ]
                                     check_result = subprocess.run(check_files_cmd, capture_output=True, text=True, timeout=30)
@@ -7818,12 +7818,53 @@ REMOTE_SCRIPT"""
                                         "training_args.bin",  # Optional - training arguments
                                     ]
                                     
-                                    # Try downloading from adapter directory first
-                                    adapter_dir_remote = "/workspace/output/training/adapter"
+                                    # Step 4a: Find the adapter location (may be in checkpoint directory)
+                                    terminal_output.append(f"[SSH] Locating adapter files on remote instance...")
+                                    find_adapter_cmd = [
+                                        "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
+                                        f"root@{setup_ssh_host}",
+                                        """bash -c '
+                                        # First, try to find the latest checkpoint directory with adapter
+                                        latest_checkpoint=$(find /workspace/output/training -type d -name "checkpoint-*" 2>/dev/null | sort -V | tail -1)
+                                        if [ -n "$latest_checkpoint" ] && [ -f "$latest_checkpoint/adapter/adapter_config.json" ]; then
+                                            echo "adapter_path:$latest_checkpoint/adapter"
+                                        # Check if adapter is directly in output/training/adapter
+                                        elif [ -f /workspace/output/training/adapter/adapter_config.json ]; then
+                                            echo "adapter_path:/workspace/output/training/adapter"
+                                        # Check other common locations
+                                        elif [ -f /workspace/output/adapter/adapter_config.json ]; then
+                                            echo "adapter_path:/workspace/output/adapter"
+                                        # Use find to locate adapter_config.json anywhere
+                                        elif adapter_found=$(find /workspace/output -name "adapter_config.json" -type f 2>/dev/null | head -1); then
+                                            adapter_dir=$(dirname "$adapter_found")
+                                            echo "adapter_path:$adapter_dir"
+                                        else
+                                            echo "adapter_path:not_found"
+                                        fi
+                                        '"""
+                                    ]
+                                    find_result = subprocess.run(find_adapter_cmd, capture_output=True, text=True, timeout=30)
+                                    adapter_dir_remote = "/workspace/output/training/adapter"  # Default fallback
+                                    
+                                    if find_result.returncode == 0 and "adapter_path:" in find_result.stdout:
+                                        for line in find_result.stdout.split('\n'):
+                                            if 'adapter_path:' in line:
+                                                found_path = line.split('adapter_path:')[1].strip()
+                                                if found_path != "not_found":
+                                                    adapter_dir_remote = found_path
+                                                    terminal_output.append(f"[SSH] ✓ Found adapter at: {adapter_dir_remote}")
+                                                    break
+                                                else:
+                                                    terminal_output.append(f"[SSH] ⚠ Adapter not found, will try default locations")
+                                    else:
+                                        terminal_output.append(f"[SSH] ⚠ Could not locate adapter, will try default locations")
+                                    
                                     downloaded_count = 0
                                     
                                     # First, try to download the entire adapter directory (most efficient)
                                     terminal_output.append(f"[SCP] Attempting to download adapter directory: {adapter_dir_remote}")
+                                    # SCP will create weights_dir/adapter when downloading remote:/path/to/adapter
+                                    # This is the desired behavior - files go to weights_dir/adapter/
                                     scp_adapter_cmd = [
                                         "scp", "-P", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=30", "-r",
                                         f"root@{ssh_host}:{adapter_dir_remote}",
@@ -7837,7 +7878,7 @@ REMOTE_SCRIPT"""
                                         if adapter_dir_local.exists() and any(adapter_dir_local.iterdir()):
                                             downloaded_files_list = [f.name for f in adapter_dir_local.iterdir() if f.is_file()]
                                             downloaded_count = len(downloaded_files_list)
-                                            terminal_output.append(f"[SCP] ✓ Downloaded adapter directory ({downloaded_count} files)")
+                                            terminal_output.append(f"[SCP] ✓ Downloaded adapter directory ({downloaded_count} files) to: {adapter_dir_local}")
                                             for f in downloaded_files_list[:10]:
                                                 terminal_output.append(f"[FILE]   - {f}")
                                             
@@ -7847,12 +7888,17 @@ REMOTE_SCRIPT"""
                                             
                                             if has_config and has_weights:
                                                 terminal_output.append(f"[SUCCESS] ✓ Essential adapter files downloaded (config + weights)")
+                                                # Skip individual file download - we already have everything
+                                                downloaded_count = len(downloaded_files_list)
                                             elif has_config:
                                                 terminal_output.append(f"[WARNING] ⚠ Adapter config found but weights file missing")
                                             else:
                                                 terminal_output.append(f"[ERROR] ✗ Essential adapter files missing")
+                                        else:
+                                            # Directory doesn't exist or is empty
+                                            terminal_output.append(f"[SCP] ⚠ Adapter directory not found or empty at: {adapter_dir_remote}")
                                     else:
-                                        # Directory download failed - try downloading individual files
+                                        # SCP command failed - try downloading individual files
                                         terminal_output.append(f"[SCP] Directory download failed, trying individual files...")
                                         error_output = scp_result.stderr or scp_result.stdout
                                         error_output = filter_malloc_warnings(error_output)
@@ -7861,18 +7907,41 @@ REMOTE_SCRIPT"""
                                             actual_errors = [line for line in lines if line and 'Welcome to vast.ai' not in line and 'Have fun!' not in line]
                                             error_output = '\n'.join(actual_errors) if actual_errors else error_output
                                         terminal_output.append(f"[SCP] Directory download error: {error_output[:200]}")
-                                        
-                                        # Create adapter subdirectory for individual files
-                                        adapter_dir_local = weights_dir / "adapter"
+                                    
+                                    # If directory download didn't work OR essential files are missing, try individual files
+                                    adapter_dir_local = weights_dir / "adapter"
+                                    # Check if we already have all essential files (skip individual download if we do)
+                                    has_all_essential = False
+                                    if adapter_dir_local.exists():
+                                        has_config = (adapter_dir_local / "adapter_config.json").exists()
+                                        has_weights = (adapter_dir_local / "adapter_model.safetensors").exists() or (adapter_dir_local / "adapter_model.bin").exists()
+                                        has_all_essential = has_config and has_weights
+                                    
+                                    if not has_all_essential and (not adapter_dir_local.exists() or not any(adapter_dir_local.iterdir())):
                                         adapter_dir_local.mkdir(parents=True, exist_ok=True)
                                         
                                         # Try downloading each essential file individually
                                         for file_name in adapter_files:
-                                            # Try adapter subdirectory first
+                                            # Try multiple possible locations
                                             remote_paths = [
-                                                f"{adapter_dir_remote}/{file_name}",
-                                                f"/workspace/output/training/{file_name}",  # Fallback if adapter is in root
+                                                f"{adapter_dir_remote}/{file_name}",  # Found location
+                                                f"/workspace/output/training/adapter/{file_name}",  # Standard location
+                                                f"/workspace/output/training/{file_name}",  # Root training dir
+                                                # Also try latest checkpoint if we haven't already
                                             ]
+                                            
+                                            # If adapter_dir_remote doesn't contain "checkpoint", also try latest checkpoint
+                                            if "checkpoint" not in adapter_dir_remote:
+                                                find_checkpoint_cmd = [
+                                                    "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
+                                                    f"root@{setup_ssh_host}",
+                                                    "find /workspace/output/training -type d -name 'checkpoint-*' 2>/dev/null | sort -V | tail -1"
+                                                ]
+                                                checkpoint_result = subprocess.run(find_checkpoint_cmd, capture_output=True, text=True, timeout=15)
+                                                if checkpoint_result.returncode == 0 and checkpoint_result.stdout.strip():
+                                                    latest_checkpoint = checkpoint_result.stdout.strip()
+                                                    remote_paths.insert(1, f"{latest_checkpoint}/adapter/{file_name}")
+                                                    remote_paths.insert(2, f"{latest_checkpoint}/{file_name}")
                                             
                                             downloaded_file = False
                                             for remote_path in remote_paths:
@@ -7930,7 +7999,7 @@ REMOTE_SCRIPT"""
                                             for f in adapter_files[:10]:
                                                 file_size = f.stat().st_size / 1024 / 1024  # Size in MB
                                                 terminal_output.append(f"[FILE]   - {f.name} ({file_size:.2f} MB)")
-                                            
+                                        
                                             # Verify essential files
                                             has_config = (adapter_dir_local / "adapter_config.json").exists()
                                             has_weights = (adapter_dir_local / "adapter_model.safetensors").exists() or (adapter_dir_local / "adapter_model.bin").exists()
@@ -8042,6 +8111,14 @@ REMOTE_SCRIPT"""
                                 expected_files = []
                                 expected_metadata_files = []
                                 
+                                # Initialize package_info early to avoid undefined variable errors
+                                package_info = active_job.get("package_info")
+                                if not package_info:
+                                    # Try all_package_infos as fallback
+                                    all_package_infos = active_job.get("all_package_infos", [])
+                                    if all_package_infos and len(all_package_infos) > 0:
+                                        package_info = all_package_infos[0]
+                                
                                 if job_queue and current_job_index is not None:
                                     current_job = job_queue[current_job_index]
                                     file_group = current_job.get("file_group", [])
@@ -8062,9 +8139,12 @@ REMOTE_SCRIPT"""
                                     # Fallback: check package_info or try to infer from moved files
                                     terminal_output.append(f"[FILE DEBUG] No job queue - inferring from package_info")
                                     # If we have package_info, we can check dataset_path
-                                    dataset_path = package_info.get("dataset_path")
-                                    if dataset_path:
-                                        terminal_output.append(f"[FILE DEBUG] Dataset path: {dataset_path}")
+                                    if package_info:
+                                        dataset_path = package_info.get("dataset_path")
+                                        if dataset_path:
+                                            terminal_output.append(f"[FILE DEBUG] Dataset path: {dataset_path}")
+                                        else:
+                                            terminal_output.append(f"[FILE DEBUG] No package_info available - using moved files only")
                                 
                                 terminal_output.append(f"[FILE DEBUG] ========================================")
                                 terminal_output.append(f"[FILE DEBUG] Expected files: {len(expected_files)}")
@@ -8119,25 +8199,28 @@ REMOTE_SCRIPT"""
                                     terminal_output.append(f"[FILE DEBUG]   Processed {len(actual_files)} file(s) total")
                                 
                                 # Also check what files were processed into the training dataset
-                                dataset_path = package_info.get("dataset_path")
-                                if dataset_path and Path(dataset_path).exists():
-                                    terminal_output.append(f"[FILE DEBUG] Checking training dataset: {dataset_path}")
-                                    try:
-                                        dataset_line_count = 0
-                                        with open(dataset_path, 'r', encoding='utf-8') as f:
-                                            for line in f:
-                                                if line.strip():
-                                                    dataset_line_count += 1
-                                        terminal_output.append(f"[FILE DEBUG] Dataset contains {dataset_line_count} training examples")
-                                        
-                                        # Try to infer source files from dataset if possible
-                                        # (This is approximate - dataset combines all files)
-                                        if expected_files:
-                                            terminal_output.append(f"[FILE DEBUG] Dataset should contain data from {len(expected_files)} source file(s)")
-                                    except Exception as e:
-                                        terminal_output.append(f"[FILE DEBUG] Could not analyze dataset: {str(e)}")
+                                if package_info:
+                                    dataset_path = package_info.get("dataset_path")
+                                    if dataset_path and Path(dataset_path).exists():
+                                        terminal_output.append(f"[FILE DEBUG] Checking training dataset: {dataset_path}")
+                                        try:
+                                            dataset_line_count = 0
+                                            with open(dataset_path, 'r', encoding='utf-8') as f:
+                                                for line in f:
+                                                    if line.strip():
+                                                        dataset_line_count += 1
+                                            terminal_output.append(f"[FILE DEBUG] Dataset contains {dataset_line_count} training examples")
+                                            
+                                            # Try to infer source files from dataset if possible
+                                            # (This is approximate - dataset combines all files)
+                                            if expected_files:
+                                                terminal_output.append(f"[FILE DEBUG] Dataset should contain data from {len(expected_files)} source file(s)")
+                                        except Exception as e:
+                                            terminal_output.append(f"[FILE DEBUG] Could not analyze dataset: {str(e)}")
+                                    else:
+                                        terminal_output.append(f"[FILE DEBUG] Dataset file not found at: {dataset_path}")
                                 else:
-                                    terminal_output.append(f"[FILE DEBUG] Dataset file not found at: {dataset_path}")
+                                    terminal_output.append(f"[FILE DEBUG] No package_info available - cannot check dataset path")
                                 
                                 # Final summary
                                 terminal_output.append(f"[FILE DEBUG] ========================================")
@@ -8179,12 +8262,335 @@ REMOTE_SCRIPT"""
                                 st.session_state[terminal_output_key] = terminal_output
                                 st.error(f"Error: {error_msg}")
                     
+                    # Check if instance is still running and offer inference setup
+                    instance_id = active_job.get("instance_id")
+                    ssh_host = active_job.get("ssh_host")
+                    # Check for SSH port override first (user-specified port takes precedence)
+                    ssh_port_override = active_job.get("ssh_port_override")
+                    if ssh_port_override:
+                        ssh_port = ssh_port_override
+                    else:
+                        ssh_port = active_job.get("ssh_port", 22)
+                    instance_running = False
+                    inference_ready = active_job.get("inference_ready", False)
+                    inference_url = active_job.get("inference_url", "")
+                    
+                    if instance_id and vast_api_key:
+                        try:
+                            from utils.vast_ai_client import VastAIClient
+                            vast_client = VastAIClient(api_key=vast_api_key)
+                            instance_status = vast_client.get_instance_status(instance_id)
+                            
+                            # Check if instance is actually running
+                            if "instances" in instance_status:
+                                instance_data = instance_status["instances"]
+                            else:
+                                instance_data = instance_status
+                            
+                            actual_status = instance_data.get("actual_status", "unknown")
+                            instance_running = actual_status in ["running", "starting"]
+                            
+                        except Exception as e:
+                            error_msg = str(e)
+                            if "INSTANCE_NOT_FOUND" in error_msg or "404" in error_msg:
+                                instance_running = False
+                            else:
+                                # Instance might still exist, try SSH check
+                                if ssh_host:
+                                    try:
+                                        import subprocess
+                                        test_cmd = [
+                                            "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", 
+                                            "-o", "ConnectTimeout=5", "-o", "BatchMode=yes",
+                                            f"root@{setup_ssh_host}",
+                                            "echo 'connected'"
+                                        ]
+                                        test_result = subprocess.run(test_cmd, capture_output=True, text=True, timeout=5)
+                                        instance_running = test_result.returncode == 0
+                                    except:
+                                        instance_running = False
+                    
+                    # Show inference setup section if instance is running
+                    if instance_running:
+                        st.markdown("---")
+                        st.markdown("#### 🚀 Inference Server Setup")
+                        
+                        if inference_ready and inference_url:
+                            st.success(f"✅ Inference server is ready!")
+                            st.info(f"**Server URL:** `{inference_url}`")
+                            st.caption("You can now use this URL in the Interact tab to chat with your model on the GPU instance.")
+                            
+                            if st.button("🔄 Restart TGI Server", key="restart_inference_btn", type="secondary"):
+                                # Stop existing TGI container
+                                try:
+                                    import subprocess
+                                    stop_cmd = [
+                                        "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no",
+                                        f"root@{setup_ssh_host}",
+                                        "docker stop tgi-server 2>/dev/null && docker rm tgi-server 2>/dev/null || true"
+                                    ]
+                                    subprocess.run(stop_cmd, capture_output=True, text=True, timeout=30)
+                                except:
+                                    pass
+                                
+                                active_job["inference_ready"] = False
+                                active_job["inference_url"] = ""
+                                training_manager._save_job(active_job)
+                                st.rerun()
+                        else:
+                            st.info("💡 Your Vast.ai instance is still running. You can set it up as an inference server to get faster GPU-accelerated responses.")
+                            
+                            prep_key = f"prep_inference_{instance_id}"
+                            if prep_key not in st.session_state:
+                                st.session_state[prep_key] = False
+                            
+                            if st.session_state[prep_key]:
+                                st.warning("⚠️ This will set up Hugging Face TGI (Text Generation Inference) on your Vast.ai instance.")
+                                st.markdown("**What will happen:**")
+                                st.markdown("""
+                                - Install TGI (Text Generation Inference) via Docker
+                                - Download/load the base model (if not already cached)
+                                - Start TGI server with the model
+                                - Configure it to serve on port 8000
+                                - Make it accessible for chat requests via OpenAI-compatible API
+                                """)
+                                
+                                col1, col2 = st.columns(2)
+                                with col1:
+                                    if st.button("✅ Confirm Setup", key="confirm_prep_inference", type="primary"):
+                                        # Prep the instance for inference
+                                        terminal_output = st.session_state.get(terminal_output_key, [])
+                                        terminal_output.append(f"[INFERENCE] Starting inference server setup...")
+                                        st.session_state[terminal_output_key] = terminal_output
+                                        
+                                        try:
+                                            import subprocess
+                                            
+                                            # Step 1: Get model information
+                                            terminal_output.append(f"[TGI] Step 1: Determining model configuration...")
+                                            st.session_state[terminal_output_key] = terminal_output
+                                            
+                                            # Get base model from job metadata
+                                            version_metadata = model_manager.get_version_metadata(model_name, 1) if model_manager.list_available_versions(model_name) else None
+                                            hf_model_name = None
+                                            if version_metadata:
+                                                hf_model_name = version_metadata.get("hf_model") or version_metadata.get("hf_model_name")
+                                            
+                                            if not hf_model_name:
+                                                from utils.axolotl_prep import AxolotlDataPrep
+                                                axolotl_prep = AxolotlDataPrep(model_name)
+                                                hf_model_name = axolotl_prep.get_hf_model_name(base_model)
+                                            
+                                            if not hf_model_name:
+                                                raise Exception("Could not determine HuggingFace model name. Please check model configuration.")
+                                            
+                                            terminal_output.append(f"[TGI] Model: {hf_model_name}")
+                                            
+                                            hf_token = st.session_state.get('hf_token', '') or get_hf_token()
+                                            if not hf_token:
+                                                terminal_output.append(f"[WARNING] No HF token found - some models may require authentication")
+                                            
+                                            # Step 2: Check if Docker is available
+                                            terminal_output.append(f"[TGI] Step 2: Checking Docker installation...")
+                                            st.session_state[terminal_output_key] = terminal_output
+                                            
+                                            docker_check_cmd = [
+                                                "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no",
+                                                f"root@{setup_ssh_host}",
+                                                "which docker && docker --version || echo 'docker_not_found'"
+                                            ]
+                                            docker_check = subprocess.run(docker_check_cmd, capture_output=True, text=True, timeout=10)
+                                            
+                                            if "docker_not_found" in docker_check.stdout or docker_check.returncode != 0:
+                                                terminal_output.append(f"[TGI] Docker not found, installing...")
+                                                st.session_state[terminal_output_key] = terminal_output
+                                                
+                                                # Install Docker
+                                                install_docker_cmd = [
+                                                    "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no",
+                                                    f"root@{setup_ssh_host}",
+                                                    "curl -fsSL https://get.docker.com -o get-docker.sh && sh get-docker.sh && rm get-docker.sh"
+                                                ]
+                                                install_docker = subprocess.run(install_docker_cmd, capture_output=True, text=True, timeout=180)
+                                                if install_docker.returncode != 0:
+                                                    terminal_output.append(f"[WARNING] Docker installation had issues: {install_docker.stderr[:200]}")
+                                                else:
+                                                    terminal_output.append(f"[SUCCESS] Docker installed")
+                                            else:
+                                                terminal_output.append(f"[SUCCESS] Docker is available")
+                                            
+                                            # Step 3: Stop any existing TGI container
+                                            terminal_output.append(f"[TGI] Step 3: Stopping any existing TGI containers...")
+                                            st.session_state[terminal_output_key] = terminal_output
+                                            
+                                            stop_tgi_cmd = [
+                                                    "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no",
+                                                    f"root@{setup_ssh_host}",
+                                                "docker stop tgi-server 2>/dev/null || true && docker rm tgi-server 2>/dev/null || true"
+                                            ]
+                                            subprocess.run(stop_tgi_cmd, capture_output=True, text=True, timeout=30)
+                                            
+                                            # Step 4: Start TGI server
+                                            terminal_output.append(f"[TGI] Step 4: Starting TGI server with model {hf_model_name}...")
+                                            st.session_state[terminal_output_key] = terminal_output
+                                            
+                                            # Build TGI Docker command
+                                            # TGI runs on port 80 inside container, we map to 8000 on host
+                                            tgi_docker_cmd_parts = [
+                                                "docker run -d",
+                                                "--name tgi-server",
+                                                "--gpus all",
+                                                "-p 8000:80",
+                                                f"-e HUGGING_FACE_HUB_TOKEN={hf_token}" if hf_token else "",
+                                                f"ghcr.io/huggingface/text-generation-inference:latest",
+                                                f"--model-id {hf_model_name}",
+                                                "--port 80",
+                                                "--hostname 0.0.0.0"
+                                            ]
+                                            tgi_docker_cmd = " ".join([p for p in tgi_docker_cmd_parts if p])
+                                            
+                                            start_tgi_cmd = [
+                                                "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no",
+                                                f"root@{setup_ssh_host}",
+                                                tgi_docker_cmd
+                                            ]
+                                            
+                                            terminal_output.append(f"[TGI] Running: docker run ... {hf_model_name}")
+                                            st.session_state[terminal_output_key] = terminal_output
+                                            
+                                            start_tgi = subprocess.run(start_tgi_cmd, capture_output=True, text=True, timeout=300)
+                                            
+                                            if start_tgi.returncode != 0:
+                                                error_output = start_tgi.stderr or start_tgi.stdout
+                                                terminal_output.append(f"[ERROR] Failed to start TGI: {error_output[:500]}")
+                                                st.session_state[terminal_output_key] = terminal_output
+                                                raise Exception(f"TGI startup failed: {error_output[:200]}")
+                                            
+                                            terminal_output.append(f"[SUCCESS] TGI container started")
+                                            
+                                            # Step 5: Wait for TGI to be ready
+                                            terminal_output.append(f"[TGI] Step 5: Waiting for TGI server to be ready...")
+                                            st.session_state[terminal_output_key] = terminal_output
+                                            
+                                            import time
+                                            max_wait = 120  # Wait up to 2 minutes
+                                            wait_interval = 5
+                                            tgi_ready = False
+                                            
+                                            for i in range(0, max_wait, wait_interval):
+                                                time.sleep(wait_interval)
+                                                
+                                                # Check if container is running
+                                                check_container_cmd = [
+                                                    "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no",
+                                                    f"root@{setup_ssh_host}",
+                                                    "docker ps | grep tgi-server || echo 'not_running'"
+                                                ]
+                                                check_container = subprocess.run(check_container_cmd, capture_output=True, text=True, timeout=10)
+                                                
+                                                if "not_running" in check_container.stdout:
+                                                    terminal_output.append(f"[WARNING] TGI container not running, checking logs...")
+                                                    log_cmd = [
+                                                        "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no",
+                                                        f"root@{setup_ssh_host}",
+                                                        "docker logs --tail 50 tgi-server 2>&1 || echo 'no_logs'"
+                                                    ]
+                                                    log_result = subprocess.run(log_cmd, capture_output=True, text=True, timeout=10)
+                                                    if "no_logs" not in log_result.stdout:
+                                                        terminal_output.append(f"[LOG] {log_result.stdout[-500:]}")
+                                                    st.session_state[terminal_output_key] = terminal_output
+                                                    break
+                                                
+                                                # Try to connect to TGI health endpoint
+                                                try:
+                                                    import requests
+                                                    health_check = requests.get(f"http://{ssh_host}:8000/health", timeout=5)
+                                                    if health_check.status_code == 200:
+                                                        terminal_output.append(f"[SUCCESS] TGI server is ready!")
+                                                        tgi_ready = True
+                                                        break
+                                                except:
+                                                    pass  # Not ready yet
+                                                
+                                                terminal_output.append(f"[TGI] Waiting for server... ({i+wait_interval}s/{max_wait}s)")
+                                                st.session_state[terminal_output_key] = terminal_output
+                                            
+                                            if not tgi_ready:
+                                                # Check logs one more time
+                                                log_cmd = [
+                                                    "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no",
+                                                    f"root@{setup_ssh_host}",
+                                                    "docker logs --tail 100 tgi-server 2>&1 || echo 'no_logs'"
+                                                ]
+                                                log_result = subprocess.run(log_cmd, capture_output=True, text=True, timeout=10)
+                                                if "no_logs" not in log_result.stdout:
+                                                    terminal_output.append(f"[LOG] TGI logs: {log_result.stdout[-1000:]}")
+                                                terminal_output.append(f"[WARNING] TGI server may still be starting. Check logs above.")
+                                                st.session_state[terminal_output_key] = terminal_output
+                                            
+                                            # Step 6: Get server URL and verify
+                                            terminal_output.append(f"[TGI] Step 6: Verifying TGI server connection...")
+                                            st.session_state[terminal_output_key] = terminal_output
+                                            
+                                            # Test the connection
+                                            inference_url = f"http://{ssh_host}:8000"
+                                            try:
+                                                import requests
+                                                # Try /v1/models endpoint
+                                                models_check = requests.get(f"{inference_url}/v1/models", timeout=10)
+                                                if models_check.status_code == 200:
+                                                    models_data = models_check.json()
+                                                    terminal_output.append(f"[SUCCESS] TGI server is accessible!")
+                                                    terminal_output.append(f"[INFO] Available models: {models_data}")
+                                                else:
+                                                    # Try /health as fallback
+                                                    health_check = requests.get(f"{inference_url}/health", timeout=10)
+                                                    if health_check.status_code == 200:
+                                                        terminal_output.append(f"[SUCCESS] TGI server is accessible (via /health)!")
+                                                    else:
+                                                        terminal_output.append(f"[WARNING] TGI server may not be fully ready yet")
+                                            except Exception as e:
+                                                terminal_output.append(f"[WARNING] Could not verify TGI connection: {str(e)}")
+                                                terminal_output.append(f"[INFO] Server may still be starting. You can test it manually.")
+                                            
+                                            active_job["inference_ready"] = True
+                                            active_job["inference_url"] = inference_url
+                                            training_manager._save_job(active_job)
+                                            
+                                            terminal_output.append(f"[SUCCESS] TGI server setup complete!")
+                                            terminal_output.append(f"[INFO] Server URL: {inference_url}")
+                                            terminal_output.append(f"[INFO] Model: {hf_model_name}")
+                                            terminal_output.append(f"[INFO] API Endpoint: {inference_url}/v1/chat/completions")
+                                            terminal_output.append(f"[INFO] Note: You may need to set up SSH port forwarding to access the server:")
+                                            terminal_output.append(f"[INFO]   ssh -L 8000:localhost:8000 -p {ssh_port} root@{ssh_host}")
+                                            terminal_output.append(f"[INFO]   Then use: http://localhost:8000")
+                                            terminal_output.append(f"[INFO] To check TGI logs: ssh -p {ssh_port} root@{ssh_host} 'docker logs tgi-server'")
+                                            st.session_state[terminal_output_key] = terminal_output
+                                            st.session_state[prep_key] = False
+                                            st.rerun()
+                                        except Exception as e:
+                                            terminal_output.append(f"[ERROR] Setup failed: {str(e)}")
+                                            import traceback
+                                            terminal_output.append(f"[ERROR] Traceback: {traceback.format_exc()}")
+                                            st.session_state[terminal_output_key] = terminal_output
+                                            st.error(f"Setup failed: {str(e)}")
+                                
+                                with col2:
+                                    if st.button("❌ Cancel", key="cancel_prep_inference"):
+                                        st.session_state[prep_key] = False
+                                        st.rerun()
+                            else:
+                                if st.button("🔧 Setup Inference Server", key="prep_inference_btn", type="primary"):
+                                    st.session_state[prep_key] = True
+                                    st.rerun()
+                    elif instance_id:
+                        st.info("ℹ️ Instance is not running. Inference server setup requires the instance to be active.")
+                    
                     # Additional actions
                     if active_job.get("finalized"):
                         st.success("✅ Training finalized! All phases complete.")
-                        instance_id = active_job.get("instance_id")
-                        if instance_id:
-                            st.warning(f"⚠️ **Important:** The Vast.ai instance ({instance_id[:8]}...) may still be running. Check Vast.ai and stop or destroy it manually to stop charges.")
+                        if instance_id and not instance_running:
+                            st.info("ℹ️ Instance has been stopped or destroyed.")
                     else:
                         # Allow going back to Phase 3 to redo training if needed
                         confirm_key_phase3_from4 = f"confirm_redo_phase_3_from_4_{active_job.get('instance_id')}"
@@ -8624,6 +9030,168 @@ REMOTE_SCRIPT"""
         if 'chat_history' not in st.session_state:
             st.session_state.chat_history = []
         
+        # SSH Connection Settings - Independent from Tab 1 and active_job
+        # Use session state keys specific to Tab 3
+        tab3_ssh_host_key = f"tab3_ssh_host_{model_name}"
+        tab3_ssh_port_key = f"tab3_ssh_port_{model_name}"
+        tab3_instance_id_key = f"tab3_instance_id_{model_name}"
+        
+        # Get SSH connection info from session state (Tab 3 specific)
+        ssh_host = st.session_state.get(tab3_ssh_host_key, "")
+        ssh_port = st.session_state.get(tab3_ssh_port_key, 22)
+        instance_id = st.session_state.get(tab3_instance_id_key, "")
+        
+        # SSH Connection Settings section
+        with st.expander("🔌 SSH Connection Settings", expanded=True):
+            st.markdown("**SSH Connection Information (Independent from Training Tab):**")
+            
+            # SSH Host configuration
+            col_host, col_port = st.columns([2, 1])
+                
+            with col_host:
+                manual_ssh_host = st.text_input(
+                    "SSH Host (IP address or hostname):",
+                    value=ssh_host,
+                    placeholder="e.g., 123.45.67.89 or instance-12345.vast.ai",
+                    key=f"manual_ssh_host_input_{model_name}",
+                    help="Enter the SSH host/IP address for your inference instance"
+                )
+            
+            with col_port:
+                manual_ssh_port = st.number_input(
+                    "SSH Port:",
+                    min_value=1,
+                    max_value=65535,
+                    value=int(ssh_port),
+                    key=f"manual_ssh_port_input_{model_name}",
+                    help="SSH port number (default: 22)"
+                )
+            
+            # Instance ID for fetching from API (optional)
+            manual_instance_id = st.text_input(
+                "Instance ID (optional, for fetching from Vast.ai API):",
+                value=instance_id,
+                placeholder="e.g., 12345678",
+                key=f"manual_instance_id_input_{model_name}",
+                help="Vast.ai instance ID - leave empty if you'll enter SSH info manually"
+            )
+            
+            # Action buttons
+            col_fetch, col_save, col_clear = st.columns(3)
+            
+            with col_fetch:
+                if manual_instance_id and vast_api_key:
+                    if st.button("🔍 Fetch from Vast.ai API", key=f"fetch_ssh_info_{model_name}", type="primary"):
+                        with st.spinner("Fetching SSH information from Vast.ai..."):
+                            try:
+                                from utils.vast_training_manager import VastTrainingManager
+                                training_manager = VastTrainingManager(model_name, vast_api_key)
+                                ssh_info = training_manager.get_instance_ssh_info(manual_instance_id)
+                                fetched_host = ssh_info.get("host")
+                                fetched_port = ssh_info.get("port", 22)
+                                
+                                if fetched_host:
+                                    # Save to session state
+                                    st.session_state[tab3_ssh_host_key] = fetched_host
+                                    st.session_state[tab3_ssh_port_key] = fetched_port
+                                    st.session_state[tab3_instance_id_key] = manual_instance_id
+                                    st.success(f"✅ SSH info fetched: {fetched_host}:{fetched_port}")
+                                    st.rerun()
+                                else:
+                                    st.warning("⚠️ SSH info not yet available from Vast.ai. The instance may still be initializing.")
+                            except Exception as e:
+                                st.error(f"❌ Error fetching SSH info: {str(e)}")
+                                print(f"[UI LOG] Error fetching SSH info: {str(e)}")
+                else:
+                    if not vast_api_key:
+                        st.caption("💡 Enter Vast.ai API key in settings to fetch SSH info")
+                    else:
+                        st.caption("💡 Enter Instance ID above to fetch")
+            
+            with col_save:
+                if manual_ssh_host:
+                    if st.button("💾 Save SSH Settings", key=f"save_ssh_settings_{model_name}", type="primary"):
+                        # Save to session state
+                        st.session_state[tab3_ssh_host_key] = manual_ssh_host
+                        st.session_state[tab3_ssh_port_key] = int(manual_ssh_port)
+                        if manual_instance_id:
+                            st.session_state[tab3_instance_id_key] = manual_instance_id
+                        st.success(f"✅ SSH settings saved: {manual_ssh_host}:{manual_ssh_port}")
+                        st.rerun()
+            
+            with col_clear:
+                if ssh_host:
+                    if st.button("🗑️ Clear", key=f"clear_ssh_settings_{model_name}"):
+                        st.session_state[tab3_ssh_host_key] = ""
+                        st.session_state[tab3_ssh_port_key] = 22
+                        st.session_state[tab3_instance_id_key] = ""
+                        st.success("✅ SSH settings cleared")
+                    st.rerun()
+            
+            # Display current settings
+            if ssh_host:
+                st.info(f"**Current SSH Host:** `{ssh_host}` | **Port:** `{ssh_port}`")
+                st.code(f"ssh -p {ssh_port} root@{ssh_host}", language="bash")
+                st.caption("Use this command to SSH into your instance manually if needed.")
+            
+            if ssh_host:
+                st.code(f"ssh -p {ssh_port} root@{ssh_host}", language="bash")
+                st.caption("Use this command to SSH into your instance manually if needed.")
+                
+                # SSH Connection Test/Initiation button
+                st.markdown("---")
+                st.markdown("#### Test SSH Connection")
+                if st.button("🔍 Test SSH Connection", key=f"test_ssh_interact_{model_name}", type="secondary"):
+                    with st.spinner(f"Testing SSH connection to {ssh_host}:{ssh_port}..."):
+                        try:
+                            import subprocess
+                            test_connection_cmd = [
+                                "ssh", "-p", str(ssh_port),
+                                "-o", "StrictHostKeyChecking=accept-new",
+                                "-o", "PasswordAuthentication=no",
+                                "-o", "IdentitiesOnly=no",
+                                "-o", "ConnectTimeout=10",
+                                "-o", "ServerAliveInterval=5",
+                                "-o", "ServerAliveCountMax=2",
+                                f"root@{setup_ssh_host}",
+                                "echo 'SSH connection successful'"
+                            ]
+                            test_result = subprocess.run(test_connection_cmd, capture_output=True, text=True, timeout=15)
+                            
+                            if test_result.returncode == 0:
+                                st.success(f"✅ SSH connection successful to {ssh_host}:{ssh_port}")
+                                st.info("You can now use TGI server setup and other features that require SSH access.")
+                            else:
+                                error_output = test_result.stderr or test_result.stdout
+                                if "Connection refused" in error_output or "Connection timed out" in error_output:
+                                    st.error(f"❌ SSH connection refused or timed out. Instance may not be ready yet.")
+                                    st.info("💡 Make sure:")
+                                    st.markdown("""
+                                    - The instance is running
+                                    - The SSH port is correct
+                                    - The instance has finished initializing
+                                    """)
+                                elif "Permission denied" in error_output or "publickey" in error_output.lower():
+                                    st.error(f"❌ SSH authentication failed.")
+                                    st.info("💡 **Troubleshooting SSH key authentication:**")
+                                    st.markdown("""
+                                    - Make sure your SSH keys are in `~/.ssh/` (typically `id_rsa`, `id_ed25519`, etc.)
+                                    - Ensure your SSH agent is running: `eval $(ssh-agent) && ssh-add ~/.ssh/id_rsa`
+                                    - Test manually: `ssh -p {port} root@{host} echo 'test'`
+                                    - Check that the public key is added to the server's `~/.ssh/authorized_keys`
+                                    - If using a custom key, specify it: `ssh -i ~/.ssh/your_key -p {port} root@{host}`
+                                    """.format(port=ssh_port, host=ssh_host))
+                                    st.code(f"ssh -p {ssh_port} root@{ssh_host} echo 'test'", language="bash")
+                                else:
+                                    st.error(f"❌ SSH connection test failed: {error_output[:200]}")
+                        except subprocess.TimeoutExpired:
+                            st.error("❌ SSH connection test timed out. The instance may not be responding.")
+                        except Exception as e:
+                            st.error(f"❌ Error testing SSH connection: {str(e)}")
+                            print(f"[UI LOG] SSH test error: {str(e)}")
+            else:
+                st.info("💡 Enter SSH host and port above to configure your inference instance connection.")
+        
         # Get base model and check for available versions
         from utils.model_manager import ModelManager
         model_manager = ModelManager()
@@ -8634,198 +9202,665 @@ REMOTE_SCRIPT"""
         available_versions = model_manager.list_available_versions(model_name)
         most_recent_version = model_manager.get_most_recent_version(model_name)
         
-        # Initialize version selection in session state
-        version_key = f"selected_version_{model_name}"
-        if version_key not in st.session_state:
-            # Default to most recent version, or "base" if no versions
-            st.session_state[version_key] = most_recent_version if most_recent_version else "base"
+        # Define session state keys for model selection (used in TGI setup and model selection)
+        instance_model_1_key = f"instance_model_1_{model_name}"
+        instance_model_2_key = f"instance_model_2_{model_name}"
         
-        # Version selection dropdown
-        version_options = ["base"] + [f"V{v}" for v in available_versions]
-        version_labels = ["Base (no weights)"] + [f"V{v}" for v in available_versions]
+        # Initialize with defaults
+        if instance_model_1_key not in st.session_state:
+            st.session_state[instance_model_1_key] = "base"
+        if instance_model_2_key not in st.session_state:
+            st.session_state[instance_model_2_key] = None
         
-        # Find current selection index
-        current_selection = st.session_state[version_key]
-        if isinstance(current_selection, int):
-            current_index = available_versions.index(current_selection) + 1 if current_selection in available_versions else 0
-        else:
-            current_index = 0
+        # Model Versions for Instance - Select up to 2 versions to load on the instance
+        # MOVED UP: Model selection before TGI setup
+        st.markdown("---")
+        st.markdown("#### 📦 Model Versions for Instance")
+        st.info("💡 Select up to 2 model versions to load on your instance. These will be available for switching during chat.")
         
-        selected_version_label = st.selectbox(
-            "Select Model Version:",
-            options=version_labels,
-            index=current_index,
-            key=f"version_select_{model_name}",
-            help="Choose which version of weights to use. Defaults to most recent version."
-        )
+        available_model_options = ["base"] + [f"v{v}" for v in available_versions]
+        available_model_labels = ["Base Model"] + [f"V{v}" for v in available_versions]
         
-        # Update session state based on selection
-        if selected_version_label == "Base (no weights)":
-            selected_version = "base"
-        else:
-            # Extract version number from "V1", "V2", etc.
-            selected_version = int(selected_version_label[1:])
+        col1, col2 = st.columns(2)
+        with col1:
+            model_1_index = available_model_options.index(st.session_state[instance_model_1_key]) if st.session_state[instance_model_1_key] in available_model_options else 0
+            instance_model_1 = st.selectbox(
+                "Model Version 1 (required):",
+                options=available_model_options,
+                index=model_1_index,
+                key=f"instance_model_1_select_{model_name}",
+                help="First model version to load on the instance. This will be used by default."
+            )
+            st.session_state[instance_model_1_key] = instance_model_1
         
-        st.session_state[version_key] = selected_version
+        with col2:
+            model_2_options = [None] + [opt for opt in available_model_options if opt != instance_model_1]
+            current_model_2 = st.session_state.get(instance_model_2_key)
+            model_2_index = 0
+            if current_model_2 and current_model_2 in model_2_options:
+                model_2_index = model_2_options.index(current_model_2)
+            
+            instance_model_2 = st.selectbox(
+                "Model Version 2 (optional):",
+                options=model_2_options,
+                index=model_2_index,
+                format_func=lambda x: "None (single model)" if x is None else x.upper(),
+                key=f"instance_model_2_select_{model_name}",
+                help="Second model version to load (optional). Allows switching between models during chat."
+            )
+            st.session_state[instance_model_2_key] = instance_model_2
         
-        # Initialize Ollama client for status checks (always needed)
-        ollama_client = OllamaClient(base_model)
+        # Display selected models
+        selected_models = [instance_model_1]
+        if instance_model_2:
+            selected_models.append(instance_model_2)
+        st.success(f"✅ Selected models for instance: {', '.join([m.upper() for m in selected_models])}")
+        
+        # Default to first selected model for chat
+        selected_version = "base" if instance_model_1 == "base" else int(instance_model_1[1:]) if instance_model_1.startswith("v") else 1
+        
+        # Check if remote inference server is available
+        remote_inference_url = None
+        remote_inference_ready = False
+        
+        # First, check session state for Tab 3's TGI URL (set after successful setup)
+        tab3_tgi_url_key = f"tab3_tgi_url_{model_name}"
+        saved_tgi_url = st.session_state.get(tab3_tgi_url_key, "")
+        if saved_tgi_url:
+            # Test the saved URL
+            try:
+                import requests
+                models_check = requests.get(f"{saved_tgi_url}/v1/models", timeout=5)
+                if models_check.status_code == 200:
+                    remote_inference_url = saved_tgi_url
+                    remote_inference_ready = True
+                else:
+                    health_check = requests.get(f"{saved_tgi_url}/health", timeout=5)
+                    if health_check.status_code == 200:
+                        remote_inference_url = saved_tgi_url
+                        remote_inference_ready = True
+            except:
+                pass  # URL might not be accessible yet
+        
+        # Also check active_job (optional, for compatibility)
+        if not remote_inference_url and active_job:
+            remote_inference_ready = active_job.get("inference_ready", False)
+            remote_inference_url = active_job.get("inference_url", "")
+            if remote_inference_url and remote_inference_ready:
+                # Verify the TGI server is accessible
+                try:
+                    import requests
+                    try:
+                        health_check = requests.get(f"{remote_inference_url}/health", timeout=5)
+                        if health_check.status_code == 200:
+                            remote_inference_url = remote_inference_url
+                        else:
+                            models_check = requests.get(f"{remote_inference_url}/v1/models", timeout=5)
+                            if models_check.status_code == 200:
+                                remote_inference_url = remote_inference_url
+                            else:
+                                remote_inference_url = None
+                    except requests.exceptions.RequestException:
+                        remote_inference_url = None
+                except Exception:
+                    remote_inference_url = None
+        
+        # TGI Server Setup Section (after model selection)
+        # Use current input values (manual_ssh_host/manual_ssh_port) if available, otherwise use saved values
+        tgi_ssh_host = manual_ssh_host if manual_ssh_host else ssh_host
+        tgi_ssh_port = int(manual_ssh_port) if manual_ssh_port else ssh_port
+        
+        if tgi_ssh_host and not remote_inference_url:
+            st.markdown("---")
+            st.markdown("#### 🚀 Set Up TGI Server on Instance")
+            st.info(f"💡 Your Vast.ai instance is available at `{tgi_ssh_host}:{tgi_ssh_port}`. Set up TGI server to enable chat.")
+            
+            setup_key = f"setup_tgi_interact_{model_name}"
+            if setup_key not in st.session_state:
+                st.session_state[setup_key] = False
+            
+            # Terminal output key for TGI setup
+            terminal_output_key = f"tgi_setup_output_{model_name}"
+            if terminal_output_key not in st.session_state:
+                st.session_state[terminal_output_key] = []
+            
+            if st.session_state[setup_key]:
+                st.warning("⚠️ This will set up Hugging Face TGI (Text Generation Inference) on your Vast.ai instance.")
+                st.markdown("**What will happen:**")
+                st.markdown("""
+                - Install TGI (Text Generation Inference) via Docker
+                - Download/load the selected models (if not already cached)
+                - Start TGI server with the models
+                - Configure it to serve on port 8000
+                - Make it accessible for chat requests via OpenAI-compatible API
+                """)
+                
+                # Show selected models
+                st.markdown("**Models to Load:**")
+                st.info(f"**Model 1:** {instance_model_1.upper()}")
+                if instance_model_2:
+                    st.info(f"**Model 2:** {instance_model_2.upper()}")
+                else:
+                    st.info("**Model 2:** None (single model)")
+                
+                col_confirm, col_cancel = st.columns(2)
+                with col_confirm:
+                    if st.button("✅ Confirm Setup", key="confirm_tgi_setup_interact", type="primary"):
+                        # Start TGI setup with full output
+                        st.session_state[terminal_output_key] = []
+                        st.session_state[setup_key] = False  # Hide confirmation, show progress
+                        st.rerun()
+                with col_cancel:
+                    if st.button("❌ Cancel", key="cancel_tgi_setup_interact"):
+                        st.session_state[setup_key] = False
+                        st.session_state[terminal_output_key] = []
+                        st.rerun()
+            
+            # Show setup progress if terminal output exists
+            terminal_output = st.session_state.get(terminal_output_key, [])
+            if terminal_output or (not st.session_state.get(setup_key, False) and not remote_inference_url):
+                if terminal_output:
+                    st.markdown("---")
+                    st.markdown("#### 📊 Setup Progress")
+                    terminal_container = st.container()
+                    with terminal_container:
+                        for line in terminal_output[-50:]:  # Show last 50 lines
+                            st.text(line)
+                    
+                    # Check if setup completed successfully
+                    if any("[SUCCESS] TGI server setup complete!" in line for line in terminal_output):
+                        # Extract URL from output or construct it
+                        inference_url = f"http://{ssh_host}:8000"
+                        # Save to session state
+                        st.session_state[tab3_tgi_url_key] = inference_url
+                        st.session_state[terminal_output_key] = []  # Clear output
+                        st.success(f"✅ TGI server setup complete! URL: {inference_url}")
+                        st.info("🚀 Launching chat mode...")
+                        st.rerun()
+                elif not remote_inference_url:
+                    if st.button("🔧 Set Up TGI Server", key="setup_tgi_btn_interact", type="primary"):
+                        # Get selected model
+                        model_1 = st.session_state.get(instance_model_1_key, "base")
+                        
+                        # Get model path based on selection
+                        if model_1 == "base":
+                            hf_model_name = base_model
+                        else:
+                            version_num = int(model_1[1:]) if model_1.startswith("v") else 1
+                            version_metadata = model_manager.get_version_metadata(model_name, version_num)
+                            hf_model_name = version_metadata.get("hf_model") or version_metadata.get("hf_model_name") if version_metadata else base_model
+                        
+                        # Get HF token
+                        from utils.config import get_hf_token
+                        hf_token = get_hf_token()
+                        
+                        # Start TGI setup process
+                        # Use current input values for setup
+                        setup_ssh_host = manual_ssh_host if manual_ssh_host else ssh_host
+                        setup_ssh_port = int(manual_ssh_port) if manual_ssh_port else ssh_port
+                        
+                        # Auto-save the settings if they're different from saved values
+                        if manual_ssh_host and manual_ssh_host != ssh_host:
+                            st.session_state[tab3_ssh_host_key] = manual_ssh_host
+                        if manual_ssh_port and int(manual_ssh_port) != ssh_port:
+                            st.session_state[tab3_ssh_port_key] = int(manual_ssh_port)
+                        
+                        terminal_output = []
+                        terminal_output.append(f"[TGI] Starting TGI server setup...")
+                        terminal_output.append(f"[TGI] Model: {hf_model_name}")
+                        terminal_output.append(f"[TGI] Instance: {setup_ssh_host}:{setup_ssh_port}")
+                        st.session_state[terminal_output_key] = terminal_output
+                        
+                        try:
+                            import subprocess
+                            import time
+                            from datetime import datetime
+                            
+                            # Step 1: Check Docker
+                            terminal_output.append(f"[TGI] Step 1: Checking Docker installation...")
+                            st.session_state[terminal_output_key] = terminal_output
+                            
+                            docker_check_cmd = [
+                                "ssh", "-p", str(setup_ssh_port), 
+                                "-o", "StrictHostKeyChecking=accept-new",
+                                "-o", "PasswordAuthentication=no",
+                                "-o", "IdentitiesOnly=no",
+                                "-o", "ConnectTimeout=10",
+                                f"root@{setup_ssh_host}",
+                                "which docker && docker --version || echo 'docker_not_found'"
+                            ]
+                            docker_check = subprocess.run(docker_check_cmd, capture_output=True, text=True, timeout=10)
+                            
+                            if "docker_not_found" in docker_check.stdout or docker_check.returncode != 0:
+                                terminal_output.append(f"[TGI] Docker not found, installing...")
+                                st.session_state[terminal_output_key] = terminal_output
+                                
+                                install_docker_cmd = [
+                                    "ssh", "-p", str(setup_ssh_port),
+                                    "-o", "StrictHostKeyChecking=accept-new",
+                                    "-o", "PasswordAuthentication=no",
+                                    "-o", "IdentitiesOnly=no",
+                                    "-o", "ConnectTimeout=30",
+                                    f"root@{setup_ssh_host}",
+                                    "curl -fsSL https://get.docker.com -o get-docker.sh && sh get-docker.sh && rm get-docker.sh"
+                                ]
+                                install_docker = subprocess.run(install_docker_cmd, capture_output=True, text=True, timeout=180)
+                                if install_docker.returncode != 0:
+                                    terminal_output.append(f"[WARNING] Docker installation had issues: {install_docker.stderr[:200]}")
+                                else:
+                                    terminal_output.append(f"[SUCCESS] Docker installed")
+                            else:
+                                terminal_output.append(f"[SUCCESS] Docker is available")
+                            
+                            # Step 2: Stop any existing TGI container
+                            terminal_output.append(f"[TGI] Step 2: Stopping any existing TGI containers...")
+                            st.session_state[terminal_output_key] = terminal_output
+                            
+                            stop_tgi_cmd = [
+                                "ssh", "-p", str(setup_ssh_port),
+                                "-o", "StrictHostKeyChecking=accept-new",
+                                "-o", "PasswordAuthentication=no",
+                                "-o", "IdentitiesOnly=no",
+                                "-o", "ConnectTimeout=10",
+                                f"root@{setup_ssh_host}",
+                                "docker stop tgi-server 2>/dev/null || true && docker rm tgi-server 2>/dev/null || true"
+                            ]
+                            subprocess.run(stop_tgi_cmd, capture_output=True, text=True, timeout=30)
+                            
+                            # Step 3: Start TGI server
+                            terminal_output.append(f"[TGI] Step 3: Starting TGI server with model {hf_model_name}...")
+                            st.session_state[terminal_output_key] = terminal_output
+                            
+                            tgi_docker_cmd_parts = [
+                                "docker run -d",
+                                "--name tgi-server",
+                                "--gpus all",
+                                "-p 8000:80",
+                                f"-e HUGGING_FACE_HUB_TOKEN={hf_token}" if hf_token else "",
+                                f"ghcr.io/huggingface/text-generation-inference:latest",
+                                f"--model-id {hf_model_name}",
+                                "--port 80",
+                                "--hostname 0.0.0.0"
+                            ]
+                            tgi_docker_cmd = " ".join([p for p in tgi_docker_cmd_parts if p])
+                            
+                            start_tgi_cmd = [
+                                "ssh", "-p", str(setup_ssh_port),
+                                "-o", "StrictHostKeyChecking=accept-new",
+                                "-o", "PasswordAuthentication=no",
+                                "-o", "IdentitiesOnly=no",
+                                "-o", "ConnectTimeout=30",
+                                f"root@{setup_ssh_host}",
+                                tgi_docker_cmd
+                            ]
+                            
+                            terminal_output.append(f"[TGI] Running: docker run ... {hf_model_name}")
+                            st.session_state[terminal_output_key] = terminal_output
+                            
+                            start_tgi = subprocess.run(start_tgi_cmd, capture_output=True, text=True, timeout=300)
+                            
+                            if start_tgi.returncode != 0:
+                                error_output = start_tgi.stderr or start_tgi.stdout
+                                terminal_output.append(f"[ERROR] Failed to start TGI: {error_output[:500]}")
+                                st.session_state[terminal_output_key] = terminal_output
+                                raise Exception(f"TGI startup failed: {error_output[:200]}")
+                            
+                            terminal_output.append(f"[SUCCESS] TGI container started")
+                            
+                            # Step 4: Wait for TGI to be ready
+                            terminal_output.append(f"[TGI] Step 4: Waiting for TGI server to be ready...")
+                            st.session_state[terminal_output_key] = terminal_output
+                            
+                            max_wait = 120
+                            wait_interval = 5
+                            tgi_ready = False
+                            
+                            for i in range(0, max_wait, wait_interval):
+                                time.sleep(wait_interval)
+                                
+                                # Check if container is running
+                                check_container_cmd = [
+                                    "ssh", "-p", str(setup_ssh_port),
+                                    "-o", "StrictHostKeyChecking=accept-new",
+                                    "-o", "PasswordAuthentication=no",
+                                    "-o", "IdentitiesOnly=no",
+                                    "-o", "ConnectTimeout=10",
+                                    f"root@{setup_ssh_host}",
+                                    "docker ps | grep tgi-server || echo 'not_running'"
+                                ]
+                                check_container = subprocess.run(check_container_cmd, capture_output=True, text=True, timeout=10)
+                                
+                                if "not_running" in check_container.stdout:
+                                    terminal_output.append(f"[WARNING] TGI container not running, checking logs...")
+                                    log_cmd = [
+                                        "ssh", "-p", str(setup_ssh_port),
+                                        "-o", "StrictHostKeyChecking=accept-new",
+                                        "-o", "PasswordAuthentication=no",
+                                        "-o", "IdentitiesOnly=no",
+                                        "-o", "ConnectTimeout=10",
+                                        f"root@{setup_ssh_host}",
+                                        "docker logs --tail 50 tgi-server 2>&1 || echo 'no_logs'"
+                                    ]
+                                    log_result = subprocess.run(log_cmd, capture_output=True, text=True, timeout=10)
+                                    if "no_logs" not in log_result.stdout:
+                                        terminal_output.append(f"[LOG] {log_result.stdout[-500:]}")
+                                    st.session_state[terminal_output_key] = terminal_output
+                                    break
+                                
+                                # Try to connect to TGI health endpoint
+                                try:
+                                    import requests
+                                    health_check = requests.get(f"http://{setup_ssh_host}:8000/health", timeout=5)
+                                    if health_check.status_code == 200:
+                                        terminal_output.append(f"[SUCCESS] TGI server is ready!")
+                                        tgi_ready = True
+                                        break
+                                except:
+                                    pass
+                                
+                                terminal_output.append(f"[TGI] Waiting for server... ({i+wait_interval}s/{max_wait}s)")
+                                st.session_state[terminal_output_key] = terminal_output
+                            
+                            # Step 5: Verify and save URL
+                            inference_url = f"http://{setup_ssh_host}:8000"
+                            terminal_output.append(f"[TGI] Step 5: Verifying TGI server connection...")
+                            st.session_state[terminal_output_key] = terminal_output
+                            
+                            try:
+                                import requests
+                                models_check = requests.get(f"{inference_url}/v1/models", timeout=10)
+                                if models_check.status_code == 200:
+                                    terminal_output.append(f"[SUCCESS] TGI server is accessible!")
+                                    terminal_output.append(f"[INFO] Server URL: {inference_url}")
+                                    terminal_output.append(f"[SUCCESS] TGI server setup complete!")
+                                    st.session_state[terminal_output_key] = terminal_output
+                                    
+                                    # Save URL to session state
+                                    st.session_state[tab3_tgi_url_key] = inference_url
+                                    st.rerun()
+                                else:
+                                    health_check = requests.get(f"{inference_url}/health", timeout=10)
+                                    if health_check.status_code == 200:
+                                        terminal_output.append(f"[SUCCESS] TGI server is accessible (via /health)!")
+                                        terminal_output.append(f"[SUCCESS] TGI server setup complete!")
+                                        st.session_state[terminal_output_key] = terminal_output
+                                        st.session_state[tab3_tgi_url_key] = inference_url
+                                        st.rerun()
+                            except Exception as e:
+                                terminal_output.append(f"[WARNING] Could not verify TGI connection: {str(e)}")
+                                terminal_output.append(f"[INFO] Server may still be starting. URL: {inference_url}")
+                                st.session_state[terminal_output_key] = terminal_output
+                                # Still save URL - user can test manually
+                                st.session_state[tab3_tgi_url_key] = inference_url
+                                st.rerun()
+                                
+                        except Exception as e:
+                            terminal_output.append(f"[ERROR] Setup failed: {str(e)}")
+                            import traceback
+                            terminal_output.append(f"[ERROR] Traceback: {traceback.format_exc()}")
+                            st.session_state[terminal_output_key] = terminal_output
+                            st.error(f"Setup failed: {str(e)}")
+        
+        # If not found in active_job, check for manual input in session state
+        if not remote_inference_url:
+            manual_tgi_key = f"manual_tgi_url_{model_name}"
+            if manual_tgi_key not in st.session_state:
+                st.session_state[manual_tgi_key] = ""
+            
+            # Check if there's a saved manual URL
+            saved_manual_url = st.session_state.get(manual_tgi_key, "")
+            if saved_manual_url:
+                # Test the saved URL
+                try:
+                    import requests
+                    # Try /v1/models endpoint (most reliable for TGI)
+                    models_check = requests.get(f"{saved_manual_url}/v1/models", timeout=5)
+                    if models_check.status_code == 200:
+                        print(f"[UI LOG] Manual TGI server accessible: {saved_manual_url}")
+                        remote_inference_url = saved_manual_url
+                        remote_inference_ready = True
+                    else:
+                        # Try /health as fallback
+                        health_check = requests.get(f"{saved_manual_url}/health", timeout=5)
+                        if health_check.status_code == 200:
+                            print(f"[UI LOG] Manual TGI server accessible via /health: {saved_manual_url}")
+                            remote_inference_url = saved_manual_url
+                            remote_inference_ready = True
+                except Exception as e:
+                    print(f"[UI LOG] Manual TGI server check failed: {str(e)}")
+                    # URL might be invalid, clear it
+                    st.session_state[manual_tgi_key] = ""
         
         # Initialize client based on selected version
+        # Cache the client in session state to avoid reloading model on every rerun
+        client_cache_key = f"fine_tuned_client_{model_name}_{selected_version}"
         client = None
         use_fine_tuned = False
+        use_remote = False
         
-        if selected_version != "base" and selected_version in available_versions:
-            # Load weights from selected version
-            weights_path = model_manager.get_version_weights_path(model_name, selected_version)
-            if weights_path and weights_path.exists():
+        # REMOTE-ONLY MODE: Only use remote inference server, never fall back to local
+        if not remote_inference_url:
+            # Only show manual input if TGI setup hasn't been completed
+            # (If setup was successful, URL should already be populated)
+            if not st.session_state.get(tab3_tgi_url_key):
+                print(f"[UI LOG] TGI server not detected - manual input available")
+            
+                # Show manual input option (fallback)
+                st.info("🔧 **Connect to TGI Server (Manual)**")
+            st.markdown("""
+                If you've already set up a TGI server manually, enter the URL below.
+            
+            **Format:** `http://your-instance-ip:port` (e.g., `http://123.45.67.89:8000`)
+            
+                **Note:** For automatic setup, use the "Set Up TGI Server" button above.
+            """)
+            
+            manual_tgi_key = f"manual_tgi_url_{model_name}"
+            manual_url = st.text_input(
+                "TGI Server URL:",
+                value=st.session_state.get(manual_tgi_key, ""),
+                placeholder="http://your-instance-ip:8000",
+                key=f"tgi_url_input_{model_name}",
+                help="Enter the full URL of your TGI server (including http:// and port)"
+            )
+            
+            # Update session state
+            st.session_state[manual_tgi_key] = manual_url
+            
+            # Test connection button
+            if manual_url:
+                if st.button("🔍 Test Connection", key=f"test_tgi_{model_name}"):
+                    with st.spinner("Testing TGI server connection..."):
+                        try:
+                            import requests
+                            print(f"[UI LOG] Testing TGI server: {manual_url}")
+                            
+                            # Try /v1/models endpoint first (most reliable)
+                            try:
+                                models_check = requests.get(f"{manual_url}/v1/models", timeout=5)
+                                if models_check.status_code == 200:
+                                    st.success(f"✅ TGI server is accessible!")
+                                    st.json(models_check.json())
+                                    # Save the working URL
+                                    st.session_state[manual_tgi_key] = manual_url
+                                    st.rerun()
+                                else:
+                                    st.warning(f"⚠️ Server responded with status {models_check.status_code}")
+                            except requests.exceptions.RequestException as e:
+                                # Try /health as fallback
+                                try:
+                                    health_check = requests.get(f"{manual_url}/health", timeout=5)
+                                    if health_check.status_code == 200:
+                                        st.success(f"✅ TGI server is accessible (via /health endpoint)!")
+                                        st.session_state[manual_tgi_key] = manual_url
+                                        st.rerun()
+                                    else:
+                                        st.error(f"❌ Server responded with status {health_check.status_code}")
+                                except Exception as e2:
+                                    st.error(f"❌ Cannot connect to TGI server: {str(e2)}")
+                                    st.info("💡 Make sure:")
+                                    st.markdown("""
+                                    - The server URL is correct (including http:// and port)
+                                    - The TGI server is running on your Vast.ai instance
+                                    - The port is accessible (check firewall/security groups)
+                                    - You're using the correct IP address
+                                    """)
+                        except Exception as e:
+                            st.error(f"❌ Error testing connection: {str(e)}")
+            
+        # If we have a manual URL that was previously validated, use it
+        if manual_url:
+            # Re-test to make sure it's still working
+            try:
+                import requests
+                models_check = requests.get(f"{manual_url}/v1/models", timeout=5)
+                if models_check.status_code == 200:
+                    print(f"[UI LOG] Using validated manual TGI server: {manual_url}")
+                    remote_inference_url = manual_url
+                    remote_inference_ready = True
+                else:
+                    # Try /health as fallback
+                    health_check = requests.get(f"{manual_url}/health", timeout=5)
+                    if health_check.status_code == 200:
+                        print(f"[UI LOG] Using validated manual TGI server (via /health): {manual_url}")
+                        remote_inference_url = manual_url
+                        remote_inference_ready = True
+            except Exception as e:
+                print(f"[UI LOG] Manual TGI URL validation failed: {str(e)}")
+                # Don't set remote_inference_url, will show input form
+            
+            if not remote_inference_url:
+                st.error("❌ **Hugging Face TGI server required**")
+                st.markdown("""
+                This application is configured to use **Hugging Face Text Generation Inference (TGI)** on your Vast.ai instance.
+                
+                **To connect:**
+                1. Enter your TGI server URL above (e.g., `http://your-instance-ip:8000`)
+                2. Click "Test Connection" to verify
+                3. Once connected, you can use the Interact tab
+                
+                **Why TGI on remote instance?**
+                - All model inference runs on the GPU instance (faster)
+                - TGI provides optimized inference with continuous batching
+                - No local model downloads or setup required
+                - Consistent performance across all models
+                """)
+                use_fine_tuned = False
+                use_remote = False
+                client = None
+            else:
+                # Remote server is available - use it for ALL models (base and fine-tuned)
                 try:
                     from utils.fine_tuned_client import FineTunedModelClient
-                    # Get token from session state if available
-                    hf_token = st.session_state.get('hf_token', '')
-                    
-                    # Get base model name from version metadata
-                    version_metadata = model_manager.get_version_metadata(model_name, selected_version)
-                    hf_model_name = None
-                    if version_metadata:
-                        # Axolotl uses "hf_model", old system uses "hf_model_name"
-                        hf_model_name = version_metadata.get("hf_model") or version_metadata.get("hf_model_name")
-                    
-                    # If not in version metadata, try to get from axolotl prep
-                    if not hf_model_name:
-                        from utils.axolotl_prep import AxolotlDataPrep
-                        axolotl_prep = AxolotlDataPrep(model_name)
-                        hf_model_name = axolotl_prep.get_hf_model_name(base_model)
-                    
-                    # FineTunedModelClient expects fine_tune_metadata.json with hf_model_name
-                    # Create compatibility file if it doesn't exist (for Axolotl-trained models)
-                    weights_dir = weights_path.parent if weights_path.name == "adapter" else weights_path
-                    fine_tune_metadata_path = weights_dir / "fine_tune_metadata.json"
-                    if not fine_tune_metadata_path.exists() and hf_model_name:
-                        # Create compatibility metadata file
-                        compatibility_metadata = {
-                            "use_lora": True,
-                            "hf_model_name": hf_model_name,
-                            "base_model": base_model
-                        }
-                        with open(fine_tune_metadata_path, 'w') as f:
-                            json.dump(compatibility_metadata, f, indent=2)
-                    
-                    # FineTunedModelClient expects the weights directory (parent of adapter/)
-                    # If weights_path is the adapter directory, use its parent
-                    model_path_for_client = weights_dir
-                    
-                    client = FineTunedModelClient(str(model_path_for_client), hf_token=hf_token if hf_token else None)
+                    # Use remote client - model selection happens per-request
+                    # Remote server has both base and V1 loaded, so we can use it for any model
+                    model_name_for_remote = "base" if selected_version == "base" else f"v{selected_version}"
+                    print(f"[UI LOG] Connecting to remote inference server: {remote_inference_url}")
+                    print(f"[UI LOG] Requesting model: {model_name_for_remote}")
+                    client = FineTunedModelClient(remote_url=remote_inference_url, remote_model=model_name_for_remote)
                     use_fine_tuned = True
-                    st.success(f"✅ Using weights from {selected_version_label}")
+                    use_remote = True
+                    print(f"[UI LOG] Successfully connected to TGI server: {remote_inference_url}")
+                    st.success(f"✅ Connected to Hugging Face TGI server (model: {model_name_for_remote})")
+                    st.info(f"🌐 **Server URL:** `{remote_inference_url}`")
                 except Exception as e:
-                    st.warning(f"⚠️ Failed to load weights from {selected_version_label}: {str(e)}")
-                    st.info("Falling back to base Ollama model...")
+                    import traceback
+                    print(f"[UI LOG] ERROR: Failed to connect to remote server: {str(e)}")
+                    traceback.print_exc()
+                    st.error(f"❌ **Failed to connect to TGI server**")
+                    st.markdown(f"""
+                **Error:** {str(e)}
+                
+                **Troubleshooting:**
+                1. Check that your Vast.ai instance is still running
+                2. Verify the TGI server is running on the instance
+                3. Check the server URL: `{remote_inference_url}`
+                4. Verify TGI is accessible at `/v1/chat/completions` endpoint
+                5. Check TGI server logs on the instance if needed
+                """)
                     use_fine_tuned = False
-            else:
-                st.warning(f"⚠️ Weights not found for {selected_version_label}")
-                st.info("Falling back to base Ollama model...")
-                use_fine_tuned = False
-        
-        if not use_fine_tuned:
-            client = ollama_client
+                    use_remote = False
+                    client = None
         
         data_manager = TrainingDataManager(model_name)
         
-        # Check all statuses (for validation and inline display)
-        if not use_fine_tuned:
-            ollama_running = False
-            try:
-                import subprocess
-                result = subprocess.run(['ollama', 'list'], capture_output=True, timeout=5)
-                ollama_running = result.returncode == 0
-            except:
-                ollama_running = False
-        
-        available_models = ollama_client.get_available_models()
-        model_exists = ollama_client.model_exists()
-        
-        try:
-            import ollama
-            python_lib_ok = True
-        except ImportError:
-            python_lib_ok = False
-        
-        http_api_ok = False
-        try:
-            import requests
-            response = requests.get("http://localhost:11434/api/tags", timeout=2)
-            http_api_ok = response.status_code == 200
-        except:
-            http_api_ok = False
-        else:
-            # Fine-tuned model - no Ollama needed
-            ollama_running = True
-            model_exists = True
-            python_lib_ok = True
-            http_api_ok = True
-            available_models = []
+        # Status checks - no Ollama needed
+        ollama_running = True  # Not used, but set to avoid errors
+        model_exists = True
+        python_lib_ok = True
+        http_api_ok = True
+        available_models = []
         
         
         # Create status icons HTML
         status_icons_html = []
-        if use_fine_tuned:
-            status_icons_html.append(f'<span title="Fine-Tuned Model: Loaded" style="font-size: 0.7em; cursor: help; margin: 0 1px;">🟢</span>')
+        if use_remote:
+            status_icons_html.append(f'<span title="Remote GPU Server: Active" style="font-size: 0.7em; cursor: help; margin: 0 1px;">🟢</span>')
+        elif use_fine_tuned:
+            status_icons_html.append(f'<span title="Fine-Tuned Model: Loaded Locally" style="font-size: 0.7em; cursor: help; margin: 0 1px;">🟢</span>')
         else:
-            status_icons_html.append(f'<span title="Ollama Server: {"Running" if ollama_running else "Not Running"}" style="font-size: 0.7em; cursor: help; margin: 0 1px;">{"🟢" if ollama_running else "🔴"}</span>')
-        status_icons_html.append(f'<span title="Model {base_model}: {"Available" if model_exists else "Missing"}" style="font-size: 0.7em; cursor: help; margin: 0 1px;">{"🟢" if model_exists else "🔴"}</span>')
+            status_icons_html.append(f'<span title="No Model Available" style="font-size: 0.7em; cursor: help; margin: 0 1px;">🔴</span>')
         status_html = " ".join(status_icons_html)
         
         st.markdown(f'### Interact {status_html}', unsafe_allow_html=True)
+        
+        # Model selector for remote inference (if available)
+        if use_remote and remote_inference_url:
+            st.info(f"🌐 **Remote GPU Server Active** - Fast inference on Vast.ai instance")
+            # Model switcher
+            available_remote_models = ["base"] + [f"v{v}" for v in available_versions]
+            current_remote_model = "base" if selected_version == "base" else f"v{selected_version}"
+            
+            if "remote_model_selector" not in st.session_state:
+                st.session_state["remote_model_selector"] = current_remote_model
+            
+            selected_remote_model = st.selectbox(
+                "Switch Model:",
+                options=available_remote_models,
+                index=available_remote_models.index(st.session_state["remote_model_selector"]) if st.session_state["remote_model_selector"] in available_remote_models else 0,
+                key="remote_model_selector",
+                help="Switch between base and fine-tuned models instantly (both loaded on GPU)"
+            )
+            
+            # Update client with selected model
+            if selected_remote_model != current_remote_model:
+                try:
+                    from utils.fine_tuned_client import FineTunedModelClient
+                    client = FineTunedModelClient(remote_url=remote_inference_url, remote_model=selected_remote_model)
+                    use_fine_tuned = True
+                except:
+                    pass
         
         # Action buttons row
         col1, col2 = st.columns([1, 3])
         with col1:
             if st.button("🗑️ Clear Chat", key="clear_chat_btn", help="Clear chat history and start fresh"):
                 st.session_state.chat_history = []
-                st.success("Chat cleared!")
                 st.rerun()
         
         st.markdown("Chat with your model")
         
-        # Show detailed status if there are issues (only for Ollama)
-        if not use_fine_tuned and (not ollama_running or not model_exists):
+        # Show status if model is not available
+        if not use_fine_tuned and not use_remote:
             st.markdown("---")
-            with st.expander("🔧 Status Details & Fixes", expanded=True):
-                if not ollama_running:
-                    st.error("**Issue:** Ollama server is not running")
-                    st.markdown("""
-                    **To fix:**
-                    1. Make sure Ollama is installed
-                    2. Start Ollama server (usually runs automatically)
-                    3. Check with: `ollama list` in terminal
-                    """)
-                
-                if not model_exists:
-                    st.error(f"**Issue:** Model '{base_model}' is not available")
-                    st.markdown(f"**To fix:**")
-                    st.code(f"ollama pull {base_model}", language="bash")
-                    
-                    if available_models:
-                        st.info(f"**Available models:** {', '.join(available_models)}")
-                        st.markdown(f"**Your profile uses:** `{base_model}`")
-                        st.markdown("**Note:** Model names are case-insensitive. Make sure the base model matches one above.")
-                    else:
-                        st.warning("No models found. Install at least one model first.")
-                
-                st.markdown("---")
-                st.markdown("**Debug Information:**")
-                st.json({
-                    "ollama_running": ollama_running,
-                    "model_exists": model_exists,
-                    "base_model": base_model,
-                    "available_models": available_models,
-                    "python_lib_ok": python_lib_ok,
-                    "http_api_ok": http_api_ok
-                })
+            st.error("❌ **No model available for chat**")
+            st.markdown("""
+            **To use the chat interface, you need:**
             
-            if not ollama_running or not model_exists:
-                st.stop()
+            1. **Remote Inference Server** (Recommended)
+               - Set up in Phase 4 after training completes
+               - Provides fast GPU-accelerated inference
+               - Supports both base and fine-tuned models
+            
+            2. **Local Fine-Tuned Weights**
+               - Select a version (V1, V2, etc.) that has trained weights
+               - Weights will be loaded locally (slower than remote)
+            
+            **Current Status:**
+            - Remote server: {"✅ Available" if remote_inference_url else "❌ Not set up"}
+            - Fine-tuned weights: {"✅ Available" if available_versions else "❌ None trained yet"}
+            """)
+            st.stop()
         
         # Ensure client is initialized
         if client is None:
@@ -8889,9 +9924,99 @@ REMOTE_SCRIPT"""
             if needs_save:
                 save_model_preferences(model_name, preferences)
         
+        # Display chat history
         for i, message in enumerate(st.session_state.chat_history):
             with st.chat_message(message["role"]):
                 st.write(message["content"])
+        
+        # Model selector and Clear chat button (above chat input)
+        if use_remote and remote_inference_url:
+            # Get the selected models for instance
+            instance_model_1 = st.session_state.get(instance_model_1_key, "base")
+            instance_model_2 = st.session_state.get(instance_model_2_key, None)
+            
+            # Build list of available models for switching
+            available_chat_models = [instance_model_1]
+            if instance_model_2:
+                available_chat_models.append(instance_model_2)
+            
+            # Initialize current model selector in session state
+            current_chat_model_key = f"current_chat_model_{model_name}"
+            if current_chat_model_key not in st.session_state:
+                st.session_state[current_chat_model_key] = instance_model_1
+            
+            col_model, col_clear = st.columns([3, 1])
+            with col_model:
+                current_chat_model = st.selectbox(
+                    "Select Model for This Message:",
+                    options=available_chat_models,
+                    index=available_chat_models.index(st.session_state[current_chat_model_key]) if st.session_state[current_chat_model_key] in available_chat_models else 0,
+                    key=f"chat_model_selector_{model_name}",
+                    help=f"Switch between the {len(available_chat_models)} model(s) loaded on your instance"
+                )
+                st.session_state[current_chat_model_key] = current_chat_model
+            
+            with col_clear:
+                if st.button("🗑️ Clear Chat", key="clear_chat_btn", type="secondary", use_container_width=True):
+                    # Clear chat history
+                    st.session_state.chat_history = []
+                    
+                    # If using remote, also clear memory on the instance
+                    if use_remote and ssh_host:
+                        try:
+                            import subprocess
+                            import requests
+                            
+                            # Try to clear TGI server memory by sending a reset request
+                            # TGI doesn't have a built-in clear endpoint, but we can try to reset the conversation
+                            # For now, just clear local history - TGI will handle new conversations
+                            print(f"[UI LOG] Clearing chat history (local only - TGI handles per-request)")
+                            
+                            st.success("✅ Chat cleared! Starting fresh conversation.")
+                            st.rerun()
+                        except Exception as e:
+                            print(f"[UI LOG] Error clearing chat: {str(e)}")
+                            st.session_state.chat_history = []
+                            st.success("✅ Chat cleared locally!")
+                            st.rerun()
+                    else:
+                        st.success("✅ Chat cleared!")
+                        st.rerun()
+        else:
+            # Clear chat button (when not using remote)
+            col_clear, col_spacer = st.columns([1, 4])
+            with col_clear:
+                if st.button("🗑️ Clear Chat", key="clear_chat_btn", type="secondary", use_container_width=True):
+                    st.session_state.chat_history = []
+                    st.success("✅ Chat cleared!")
+                    st.rerun()
+            col_clear, col_spacer = st.columns([1, 4])
+            with col_clear:
+                if st.button("🗑️ Clear Chat", key="clear_chat_btn", type="secondary", use_container_width=True):
+                    # Clear chat history
+                    st.session_state.chat_history = []
+                    
+                    # If using remote, also clear memory on the instance
+                    if use_remote and ssh_host:
+                        try:
+                            import subprocess
+                            import requests
+                            
+                            # Try to clear TGI server memory by sending a reset request
+                            # TGI doesn't have a built-in clear endpoint, but we can try to reset the conversation
+                            # For now, just clear local history - TGI will handle new conversations
+                            print(f"[UI LOG] Clearing chat history (local only - TGI handles per-request)")
+                            
+                            st.success("✅ Chat cleared! Starting fresh conversation.")
+                            st.rerun()
+                        except Exception as e:
+                            print(f"[UI LOG] Error clearing chat: {str(e)}")
+                            st.session_state.chat_history = []
+                            st.success("✅ Chat cleared locally!")
+                            st.rerun()
+                    else:
+                        st.success("✅ Chat cleared!")
+                        st.rerun()
         
         # Chat input
         user_input = st.chat_input("Type your message...", key="learning_session_chat_input")
@@ -8914,7 +10039,7 @@ REMOTE_SCRIPT"""
             # Get the user's last message
             user_input = st.session_state.chat_history[-2]["content"]
             
-            # Prepare messages for Ollama (no rule injection)
+            # Prepare messages for model
             messages = []
             
             # Get prepend text and summary setting
@@ -8972,66 +10097,93 @@ REMOTE_SCRIPT"""
             
             # Get response from model
             try:
-                if use_fine_tuned:
-                    # Fine-tuned models
-                    response = client.chat(messages, max_length=1024, temperature=0.7)
-                    if response and not (isinstance(response, str) and response.startswith("Error:")):
-                        # Strip summary section if present
-                        if "###SUMMARY###" in response:
-                            parts = response.split("###SUMMARY###")
-                            main_response = parts[0].strip()
-                            # Store the summary separately if needed (for future use)
-                            summary = parts[1].strip() if len(parts) > 1 else ""
-                            response = main_response
-                        
-                        st.session_state.chat_history.append({"role": "assistant", "content": response})
-                        data_manager.log_conversation_turn(user_input, response)
-                    else:
-                        st.error(response if response else "Error: Received empty response from model.")
+                import time
+                chat_start = time.time()
+                
+                # Check if client exists and is valid
+                if not use_fine_tuned or client is None:
+                    error_msg = "❌ No model available. Please set up a remote inference server or ensure fine-tuned weights are available."
+                    print(f"[UI LOG] ERROR: {error_msg}")
+                    print(f"[UI LOG] use_fine_tuned={use_fine_tuned}, client={client is not None}, use_remote={use_remote}, selected_version={selected_version}")
+                    st.error(error_msg)
+                    # Remove the user message since we failed
+                    if st.session_state.chat_history and st.session_state.chat_history[-1]["role"] == "user":
+                        st.session_state.chat_history.pop()
                     st.rerun()
+                    return
+                
+                # Fine-tuned models (local or remote)
+                if use_remote:
+                    # Use base model for now (can be extended to support model switching per request)
+                    selected_remote_model = "base" if selected_version == "base" else f"v{selected_version}"
+                    model_name_for_log = f"remote {selected_remote_model}"
                 else:
-                    # Ollama models
-                    try:
-                        response = client.chat(messages, stream=False, timeout=120)
-                        
-                        # Check if response is valid
-                        if response and not (isinstance(response, str) and response.startswith("Error:")):
-                            # Strip summary section if present
-                            if "###SUMMARY###" in response:
-                                parts = response.split("###SUMMARY###")
-                                main_response = parts[0].strip()
-                                # Store the summary separately if needed (for future use)
-                                summary = parts[1].strip() if len(parts) > 1 else ""
-                                response = main_response
-                            
-                            st.session_state.chat_history.append({"role": "assistant", "content": response})
-                            data_manager.log_conversation_turn(user_input, response)
-                        else:
-                            st.error(response if response else "Error: Received empty response from model.")
-                            # Remove the user message since we failed
-                            if st.session_state.chat_history and st.session_state.chat_history[-1]["role"] == "user":
-                                st.session_state.chat_history.pop()
-                        st.rerun()
-                    except Exception as chat_error:
-                        if "timeout" in str(chat_error).lower():
-                            st.error("⏱️ **Request timed out after 120 seconds.**")
-                            st.warning("**Ollama is responding very slowly.** Suggestions:")
-                            st.markdown(f"""
-                            - **Pre-load the model:** Run `ollama run {base_model}` in terminal first
-                            - **Use a smaller/faster model:** Consider using a smaller model
-                            - **Check system resources:** Make sure you have enough RAM/CPU
-                            - **Restart Ollama:** Sometimes restarting helps: `pkill ollama && ollama serve`
-                            """)
-                        else:
-                            st.error(f"Error: {str(chat_error)}")
-                        # Remove the user message since we failed
-                        if st.session_state.chat_history and st.session_state.chat_history[-1]["role"] == "user":
-                            st.session_state.chat_history.pop()
-                        st.rerun()
-                        return
+                    model_name_for_log = f"local V{selected_version}"
+                
+                print(f"[UI LOG] ========================================")
+                print(f"[UI LOG] Starting chat request at {time.strftime('%Y-%m-%d %H:%M:%S')}")
+                print(f"[UI LOG] Model: {model_name_for_log}")
+                print(f"[UI LOG] Mode: {'remote' if use_remote else 'local'}")
+                print(f"[UI LOG] Sending {len(messages)} message(s)")
+                
+                # Log user's prompt
+                user_prompt = user_input[:200] + "..." if len(user_input) > 200 else user_input
+                print(f"[UI LOG] User prompt: {user_prompt}")
+                print(f"[UI LOG] Full message history:")
+                for i, msg in enumerate(messages):
+                    role = msg.get("role", "unknown")
+                    content = str(msg.get("content", ""))[:100]
+                    print(f"[UI LOG]   [{i+1}] {role}: {content}...")
+                
+                # For remote, use the model selected from the dropdown
+                if use_remote:
+                    # Get the currently selected model from the dropdown
+                    current_chat_model = st.session_state.get(current_chat_model_key, instance_model_1)
+                    selected_remote_model = current_chat_model  # Use the model from dropdown
+                    print(f"[UI LOG] Calling remote API: {remote_inference_url}/v1/chat/completions")
+                    print(f"[UI LOG] Using model: {selected_remote_model}")
+                    response = client.chat(messages, max_length=1024, temperature=0.7, model=selected_remote_model)
+                else:
+                    print(f"[UI LOG] Calling local model")
+                    response = client.chat(messages, max_length=1024, temperature=0.7)
+                
+                chat_time = time.time() - chat_start
+                print(f"[UI LOG] Chat completed in {chat_time:.2f}s")
+                
+                if response and not (isinstance(response, str) and response.startswith("Error:")):
+                    # Log response
+                    response_preview = response[:200] + "..." if len(response) > 200 else response
+                    print(f"[UI LOG] Response received ({len(response)} chars): {response_preview}")
+                    
+                    # Strip summary section if present
+                    if "###SUMMARY###" in response:
+                        parts = response.split("###SUMMARY###")
+                        main_response = parts[0].strip()
+                        # Store the summary separately if needed (for future use)
+                        summary = parts[1].strip() if len(parts) > 1 else ""
+                        response = main_response
+                        print(f"[UI LOG] Summary section stripped (summary length: {len(summary)} chars)")
+                    
+                    st.session_state.chat_history.append({"role": "assistant", "content": response})
+                    data_manager.log_conversation_turn(user_input, response)
+                    print(f"[UI LOG] Response added to chat history")
+                    print(f"[UI LOG] ========================================")
+                else:
+                    error_msg = response if response else "Error: Received empty response from model."
+                    print(f"[UI LOG] ERROR: {error_msg}")
+                    st.error(error_msg)
+                st.rerun()
                     
             except Exception as e:
-                st.error(f"Error: {str(e)}")
+                import traceback
+                error_msg = f"Error: {str(e)}"
+                print(f"[UI LOG] ========================================")
+                print(f"[UI LOG] EXCEPTION occurred at {time.strftime('%Y-%m-%d %H:%M:%S')}")
+                print(f"[UI LOG] Error: {error_msg}")
+                print(f"[UI LOG] Traceback:")
+                traceback.print_exc()
+                print(f"[UI LOG] ========================================")
+                st.error(error_msg)
                 # Remove the user message since we failed
                 if st.session_state.chat_history and st.session_state.chat_history[-1]["role"] == "user":
                     st.session_state.chat_history.pop()

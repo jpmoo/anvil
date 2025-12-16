@@ -140,22 +140,112 @@ class VastTrainingManager:
             with open(config_path, 'r') as f:
                 config = yaml.safe_load(f) or {}
             
-            # Ensure adapter: "lora" is set if lora_* parameters exist (required for LoRA mode)
-            # BUT only if there's no existing adapter path (for incremental training)
-            # The path issue is prevented by NOT setting lora_model_dir to output_dir
+            # CRITICAL: Add/ensure all LoRA settings are present for proper LoRA training
+            # This ensures user-provided YAML files work correctly with LoRA
+            config_modified = False
+            
+            # Check if LoRA parameters exist (indicates user wants LoRA training)
             has_lora_params = config.get("lora_r") is not None and config.get("lora_alpha") is not None
+            
+            # Always ensure LoRA settings are complete (this is a LoRA training system)
+            # If user hasn't specified LoRA params, add defaults
+            if not has_lora_params:
+                # User hasn't specified LoRA params - add defaults for LoRA training
+                config["lora_r"] = 8
+                config["lora_alpha"] = 16
+                config_modified = True
+                self.logger.log("INFO", "Added default LoRA parameters (lora_r=8, lora_alpha=16) to YAML config")
+                has_lora_params = True  # Now we have LoRA params
+            
+            # Ensure all LoRA settings are complete
+            if has_lora_params:
+                # Ensure all essential LoRA parameters are set
+                if "lora_r" not in config:
+                    config["lora_r"] = 8
+                    config_modified = True
+                    self.logger.log("INFO", "Added lora_r=8 to YAML config")
+                
+                if "lora_alpha" not in config:
+                    config["lora_alpha"] = 16
+                    config_modified = True
+                    self.logger.log("INFO", "Added lora_alpha=16 to YAML config")
+                
+                if "lora_dropout" not in config:
+                    config["lora_dropout"] = 0.05
+                    config_modified = True
+                    self.logger.log("INFO", "Added lora_dropout=0.05 to YAML config")
+                
+                if "lora_target_modules" not in config:
+                    config["lora_target_modules"] = [
+                        "q_proj", "v_proj", "k_proj", "o_proj",
+                        "gate_proj", "up_proj", "down_proj"
+                    ]
+                    config_modified = True
+                    self.logger.log("INFO", "Added lora_target_modules to YAML config")
+                
+                # Ensure lora_out_dir is set for proper adapter saving
+                if "lora_out_dir" not in config:
+                    config["lora_out_dir"] = f"{output_dir}/adapter"
+                    config_modified = True
+                    self.logger.log("INFO", f"Added lora_out_dir={output_dir}/adapter to YAML config")
+                
+                # CRITICAL: Ensure merge_lora is False to save adapters separately
+                if config.get("merge_lora", True):  # Default to True if not set
+                    config["merge_lora"] = False
+                    config_modified = True
+                    self.logger.log("INFO", "Set merge_lora=False to save adapters separately")
+                
+                # Ensure save_merged_lora is False
+                if config.get("save_merged_lora", True):  # Default to True if not set
+                    config["save_merged_lora"] = False
+                    config_modified = True
+                    self.logger.log("INFO", "Set save_merged_lora=False")
+            
+            # Handle adapter setting - check for previous adapter first (V2+ incremental training)
             current_adapter = config.get("adapter")
-            # Only set adapter: "lora" if:
-            # 1. LoRA params exist
-            # 2. No adapter is set, OR adapter is None/null
-            # 3. Adapter is NOT already set to a path (for incremental training)
-            if has_lora_params and (not current_adapter or current_adapter is None):
-                # Check if adapter might be a path (incremental training) - don't override it
-                if not (isinstance(current_adapter, str) and current_adapter.startswith("/")):
+            
+            # If we have a previous adapter path for incremental training, use it
+            if previous_adapter_path:
+                # For incremental training, set adapter to the previous adapter path
+                # This will be uploaded to /workspace/data/previous_adapter on the instance
+                # The path will be updated during upload to point to the remote location
+                config["adapter"] = "/workspace/data/previous_adapter"
+                config["lora_model_dir"] = "/workspace/data/previous_adapter"
+                config_modified = True
+                self.logger.log("INFO", f"Set adapter path for incremental training: /workspace/data/previous_adapter (from previous version)")
+            elif has_lora_params:
+                # For new LoRA training: Set adapter: "lora" to explicitly enable LoRA mode
+                # Only set if not already set to a path (incremental training)
+                if not current_adapter or current_adapter is None:
                     config["adapter"] = "lora"
+                    config_modified = True
                     self.logger.log("INFO", "Added 'adapter: lora' to YAML config (required for LoRA mode)")
+                elif isinstance(current_adapter, str) and current_adapter.startswith("/"):
+                    # Adapter is already set to a path - keep it (user may have set it manually)
+                    self.logger.log("INFO", f"Keeping existing adapter path: {current_adapter}")
+                elif current_adapter == "lora":
+                    # Already set correctly
+                    pass
                 else:
-                    self.logger.log("INFO", f"Keeping existing adapter path for incremental training: {current_adapter}")
+                    # Unknown adapter value - set to "lora" for LoRA mode
+                    config["adapter"] = "lora"
+                    config_modified = True
+                    self.logger.log("INFO", f"Changed adapter from '{current_adapter}' to 'lora' for LoRA mode")
+            
+            # Ensure lora_model_dir is NOT set to output_dir (causes path loading errors)
+            # Only set lora_model_dir if we have a previous adapter path
+            if "lora_model_dir" in config and config["lora_model_dir"] == output_dir:
+                if not previous_adapter_path:
+                    # Remove it if we don't have a previous adapter
+                    del config["lora_model_dir"]
+                    config_modified = True
+                    self.logger.log("INFO", "Removed lora_model_dir (was pointing to output_dir - causes adapter loading errors)")
+            
+            if config_modified:
+                # Write updated config back to file
+                with open(config_path, 'w') as f:
+                    yaml.dump(config, f, default_flow_style=False, sort_keys=False)
+                self.logger.log("INFO", "Updated YAML config with LoRA settings")
             
             # Auto-adjust config for small datasets to prevent empty batch errors
             total_examples = dataset_stats.get("total_examples", 0)
@@ -1226,6 +1316,7 @@ class VastTrainingManager:
                 if adapter_path.exists():
                     # Upload entire adapter directory
                     remote_adapter_path = "/workspace/data/previous_adapter"
+                    self.logger.log("INFO", f"Uploading previous adapter for incremental training: {adapter_path} -> {remote_adapter_path}")
                     cmd = [
                         "scp", "-r", "-P", str(ssh_port), "-o", "StrictHostKeyChecking=no",
                         str(adapter_path),
@@ -1247,8 +1338,51 @@ class VastTrainingManager:
                     else:
                         self.logger.log("INFO", f"Adapter uploaded and verified at {remote_adapter_path}")
                     
-                    # Update config to point to uploaded adapter
-                    # The config will be updated to use /workspace/data/previous_adapter
+                    # CRITICAL: Update config file on remote instance to point to uploaded adapter
+                    # This ensures user-provided YAML files work with incremental training
+                    self.logger.log("INFO", f"Updating remote config to use previous adapter: {remote_adapter_path}")
+                    update_config_cmd = [
+                        "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
+                        f"root@{ssh_host}",
+                        f"""cd /workspace/data && python3 << 'PYTHON_EOF'
+import yaml
+import sys
+try:
+    with open('axolotl_config.yaml', 'r') as f:
+        config = yaml.safe_load(f) or {{}}
+    
+    # Set adapter path to uploaded previous adapter for incremental training
+    old_adapter = config.get('adapter', 'none')
+    config['adapter'] = '{remote_adapter_path}'
+    config['lora_model_dir'] = '{remote_adapter_path}'
+    
+    # Ensure merge_lora is False to save new adapters separately
+    config['merge_lora'] = False
+    config['save_merged_lora'] = False
+    
+    with open('axolotl_config.yaml', 'w') as f:
+        yaml.dump(config, f, default_flow_style=False, sort_keys=False)
+    
+    print(f'SUCCESS: Updated config with adapter path: {remote_adapter_path}')
+    print(f'Previous adapter setting: {{old_adapter}}')
+except Exception as e:
+    print(f'ERROR: Failed to update config: {{str(e)}}', file=sys.stderr)
+    sys.exit(1)
+PYTHON_EOF"""
+                    ]
+                    update_result = subprocess.run(update_config_cmd, capture_output=True, text=True, timeout=30)
+                    if update_result.returncode == 0:
+                        self.logger.log("SUCCESS", f"Updated remote config to use previous adapter: {remote_adapter_path}")
+                        if update_result.stdout:
+                            for line in update_result.stdout.strip().split('\n'):
+                                if line.strip():
+                                    self.logger.log("INFO", f"Config update: {line}")
+                    else:
+                        error_msg = update_result.stderr or update_result.stdout
+                        self.logger.log("WARNING", f"Could not update remote config with adapter path: {error_msg[:200]}")
+                        # Continue anyway - the config might already be set correctly
+                    
+                    # Store remote adapter path for reference
                     package_info["remote_adapter_path"] = remote_adapter_path
             
             return True
@@ -1417,7 +1551,47 @@ class VastTrainingManager:
             
             # Download ONLY LoRA adapter weights (not full model weights)
             # LoRA adapters are much smaller and are loaded onto the base model locally
-            adapter_path = f"{output_dir}/adapter"
+            # First, find where the adapter actually is (may be in a checkpoint directory)
+            self.logger.log("INFO", "Locating adapter files on remote instance...")
+            find_adapter_cmd = [
+                "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
+                f"root@{ssh_host}",
+                """bash -c '
+                # First, try to find the latest checkpoint directory with adapter
+                latest_checkpoint=$(find /workspace/output/training -type d -name "checkpoint-*" 2>/dev/null | sort -V | tail -1)
+                if [ -n "$latest_checkpoint" ] && [ -f "$latest_checkpoint/adapter/adapter_config.json" ]; then
+                    echo "adapter_path:$latest_checkpoint/adapter"
+                # Check if adapter is directly in output/training/adapter
+                elif [ -f /workspace/output/training/adapter/adapter_config.json ]; then
+                    echo "adapter_path:/workspace/output/training/adapter"
+                # Check other common locations
+                elif [ -f /workspace/output/adapter/adapter_config.json ]; then
+                    echo "adapter_path:/workspace/output/adapter"
+                # Use find to locate adapter_config.json anywhere
+                elif adapter_found=$(find /workspace/output -name "adapter_config.json" -type f 2>/dev/null | head -1); then
+                    adapter_dir=$(dirname "$adapter_found")
+                    echo "adapter_path:$adapter_dir"
+                else
+                    echo "adapter_path:not_found"
+                fi
+                '"""
+            ]
+            find_result = subprocess.run(find_adapter_cmd, capture_output=True, text=True, timeout=30)
+            adapter_path = f"{output_dir}/training/adapter"  # Default fallback
+            
+            if find_result.returncode == 0 and "adapter_path:" in find_result.stdout:
+                for line in find_result.stdout.split('\n'):
+                    if 'adapter_path:' in line:
+                        found_path = line.split('adapter_path:')[1].strip()
+                        if found_path != "not_found":
+                            adapter_path = found_path
+                            self.logger.log("INFO", f"Found adapter at: {adapter_path}")
+                            break
+                        else:
+                            self.logger.log("WARNING", "Adapter not found, will try default locations")
+            else:
+                self.logger.log("WARNING", "Could not locate adapter, will try default locations")
+            
             weights_downloaded = False
             downloaded_files = []
             
@@ -1471,12 +1645,25 @@ class VastTrainingManager:
                 self.logger.log("INFO", "Directory download failed, trying individual adapter files")
                 
                 for file_name in essential_files + optional_files:
-                    # Try adapter subdirectory first, then root output directory
+                    # Try multiple possible locations including checkpoints
                     alt_paths = [
-                        f"{adapter_path}/{file_name}",
-                        f"{output_dir}/adapter/{file_name}",
-                        f"{output_dir}/{file_name}"
+                        f"{adapter_path}/{file_name}",  # Found location
+                        f"{output_dir}/training/adapter/{file_name}",  # Standard location
+                        f"{output_dir}/training/{file_name}",  # Root training dir
                     ]
+                    
+                    # Also try latest checkpoint if we haven't already
+                    if "checkpoint" not in adapter_path:
+                        find_checkpoint_cmd = [
+                            "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
+                            f"root@{ssh_host}",
+                            "find /workspace/output/training -type d -name 'checkpoint-*' 2>/dev/null | sort -V | tail -1"
+                        ]
+                        checkpoint_result = subprocess.run(find_checkpoint_cmd, capture_output=True, text=True, timeout=15)
+                        if checkpoint_result.returncode == 0 and checkpoint_result.stdout.strip():
+                            latest_checkpoint = checkpoint_result.stdout.strip()
+                            alt_paths.insert(1, f"{latest_checkpoint}/adapter/{file_name}")
+                            alt_paths.insert(2, f"{latest_checkpoint}/{file_name}")
                     
                     downloaded_file = False
                     for try_path in alt_paths:
@@ -1491,7 +1678,7 @@ class VastTrainingManager:
                             self.logger.log("SUCCESS", f"Downloaded {file_name}")
                             downloaded_file = True
                             break
-                    
+                
                     if not downloaded_file and file_name in essential_files:
                         self.logger.log("WARNING", f"Failed to download essential file: {file_name}")
                 
@@ -2651,7 +2838,7 @@ class VastTrainingManager:
                 "weight_files_count": len(weight_files),
                 "logs_available": logs is not None and len(logs) > 0,
                 "logs_length": len(logs) if logs else 0
-            })
+                })
             
             return {
                 "status": status,

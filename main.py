@@ -157,39 +157,102 @@ def main():
         with st.expander("Create New Model Profile"):
             new_model_name = st.text_input("Model Name", key="new_model_name")
             
-            # Get installed Ollama models
-            from utils.ollama_client import OllamaClient
-            ollama_client = OllamaClient()
-            installed_models = ollama_client.get_available_models()
+            # Curated list of HuggingFace models good for writing and general prompting
+            # All support LoRA fine-tuning
+            hf_models = [
+                {
+                    "name": "Gemma 3 4B (Recommended)",
+                    "hf_id": "google/gemma-3-4b-it",
+                    "description": "Excellent for writing, general tasks. 4B parameters, fast inference."
+                },
+                {
+                    "name": "Llama 3.1 8B Instruct",
+                    "hf_id": "meta-llama/Llama-3.1-8B-Instruct",
+                    "description": "Strong general-purpose model, great for writing and reasoning."
+                },
+                {
+                    "name": "Llama 3.2 3B Instruct",
+                    "hf_id": "meta-llama/Llama-3.2-3B-Instruct",
+                    "description": "Smaller, faster model. Good balance of quality and speed."
+                },
+                {
+                    "name": "Mistral 7B Instruct",
+                    "hf_id": "mistralai/Mistral-7B-Instruct-v0.2",
+                    "description": "Excellent instruction following, great for structured tasks."
+                },
+                {
+                    "name": "Qwen2.5 7B Instruct",
+                    "hf_id": "Qwen/Qwen2.5-7B-Instruct",
+                    "description": "Strong multilingual support, good for diverse content."
+                },
+                {
+                    "name": "Phi-3 Mini 4K",
+                    "hf_id": "microsoft/Phi-3-mini-4k-instruct",
+                    "description": "Compact model, efficient for smaller tasks."
+                },
+                {
+                    "name": "Gemma 2 9B IT",
+                    "hf_id": "google/gemma-2-9b-it",
+                    "description": "Larger Gemma model, more capable for complex tasks."
+                },
+                {
+                    "name": "Llama 3 8B Instruct",
+                    "hf_id": "meta-llama/Meta-Llama-3-8B-Instruct",
+                    "description": "Solid general-purpose model, well-tested."
+                },
+            ]
             
-            # Filter to get base model names (remove duplicates and tags)
-            base_models = []
-            seen = set()
-            for model in installed_models:
-                base = model.split(':')[0] if ':' in model else model
-                if base.lower() not in seen:
-                    base_models.append(base)
-                    seen.add(base.lower())
+            # Create display options with descriptions
+            model_options = [f"{m['name']} ({m['hf_id']})" for m in hf_models]
             
-            if base_models:
-                base_model = st.selectbox(
-                    "Base Model",
-                    options=sorted(base_models),
-                    key="base_model_selector",
-                    help="Select from your installed Ollama models"
+            # Find default index (Gemma 3 4B)
+            default_index = 0
+            for i, m in enumerate(hf_models):
+                if "gemma-3-4b-it" in m["hf_id"]:
+                    default_index = i
+                    break
+            
+            selected_model_display = st.selectbox(
+                "Base Model (HuggingFace)",
+                options=model_options,
+                index=default_index,
+                key="base_model_selector",
+                help="Select a HuggingFace model. All models support LoRA fine-tuning and work well for writing and general tasks."
+            )
+            
+            # Extract HuggingFace ID from selection
+            selected_index = model_options.index(selected_model_display)
+            selected_model_info = hf_models[selected_index]
+            base_model_hf_id = selected_model_info["hf_id"]
+            
+            # Show model description
+            st.caption(f"💡 {selected_model_info['description']}")
+            
+            # Allow manual override for advanced users
+            with st.expander("🔧 Advanced: Custom HuggingFace Model", expanded=False):
+                custom_hf_model = st.text_input(
+                    "Custom HuggingFace Model ID",
+                    value="",
+                    placeholder="e.g., microsoft/Phi-3-medium-4k-instruct",
+                    key="custom_hf_model",
+                    help="Override with any HuggingFace model ID. Must support LoRA/PEFT."
                 )
-            else:
-                st.warning("No Ollama models found. Please install at least one model first.")
-                base_model = st.text_input("Base Model Name", key="base_model_text", placeholder="e.g., llama2")
+                if custom_hf_model:
+                    base_model_hf_id = custom_hf_model
+                    st.info(f"Using custom model: {base_model_hf_id}")
+            
+            # Store the HuggingFace ID as the base_model (for backward compatibility with existing code)
+            # The system will map this to the actual HF model when needed
+            base_model = base_model_hf_id
             
             if st.button("Create Model Profile", key="create_model_btn"):
                 if new_model_name:
                     if base_model:
                         model_manager.create_model_profile(new_model_name, base_model)
-                        st.success(f"Model profile '{new_model_name}' created!")
+                        st.success(f"Model profile '{new_model_name}' created with base model: {base_model_hf_id}")
                         st.rerun()
                     else:
-                        st.error("Please select or enter a base model")
+                        st.error("Please select a base model")
                 else:
                     st.error("Please enter a model name")
         

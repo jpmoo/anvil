@@ -211,10 +211,10 @@ class AxolotlDataPrep:
     
     def get_hf_model_name(self, ollama_model_name: str) -> Optional[str]:
         """
-        Map Ollama model name to Hugging Face model identifier
+        Map Ollama model name to Hugging Face model identifier, or return HuggingFace ID if already provided
         
         Args:
-            ollama_model_name: Ollama model name (e.g., "llama2", "phi3:mini")
+            ollama_model_name: Ollama model name (e.g., "llama2", "phi3:mini") or HuggingFace ID (e.g., "google/gemma-3-4b-it")
         
         Returns:
             Hugging Face model identifier or None if not found
@@ -222,7 +222,13 @@ class AxolotlDataPrep:
         if not ollama_model_name:
             return None
         
-        # Normalize the input
+        # Check if input is already a HuggingFace model ID (contains "/")
+        # This handles new profiles that use HuggingFace IDs directly
+        if "/" in ollama_model_name:
+            # Already a HuggingFace ID, return as-is
+            return ollama_model_name.strip()
+        
+        # Otherwise, try to map from Ollama name (backward compatibility)
         normalized = ollama_model_name.strip().lower()
         
         # Try exact match first (with or without tag)
