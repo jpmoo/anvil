@@ -111,21 +111,58 @@ class VastTrainingManager:
                 f"2. Or manually specify the Hugging Face model identifier in the code"
             )
         
-        # Check if we have a previous version to merge weights from
-        previous_version_dir = self.model_manager.get_previous_version_dir(self.model_name)
+        # Check if we have any existing versions for incremental training
+        # Use the highest version number if versions exist
+        most_recent_version = self.model_manager.get_most_recent_version(self.model_name)
         previous_adapter_path = None
+        training_mode = "NEW"  # Default to new training
+        version_info = {}
         
-        if previous_version_dir:
-            # Check if previous version has weights
-            previous_weights_dir = previous_version_dir / "weights"
-            if previous_weights_dir.exists():
-                # Look for adapter directory or adapter files
-                adapter_dir = previous_weights_dir / "adapter"
-                if adapter_dir.exists() and any(adapter_dir.iterdir()):
-                    previous_adapter_path = str(adapter_dir)
-                elif any(previous_weights_dir.glob("adapter_model.bin")):
-                    # Adapter files directly in weights dir
-                    previous_adapter_path = str(previous_weights_dir)
+        if most_recent_version is not None:
+            # We have existing versions - this will be incremental training
+            training_mode = "INCREMENTAL"
+            version_info["highest_version"] = most_recent_version
+            self.logger.log("INFO", f"Incremental training detected: Found existing version V{most_recent_version}")
+            
+            # Get the adapter path for the highest version
+            adapter_path = self.model_manager.get_version_weights_path(self.model_name, most_recent_version)
+            
+            if adapter_path and adapter_path.exists():
+                previous_adapter_path = str(adapter_path)
+                version_info["adapter_path"] = str(adapter_path)
+                version_info["weights_found"] = True
+                version_info["weights_attached"] = True
+                self.logger.log("SUCCESS", f"Incremental training: Successfully found and will attach weights from V{most_recent_version}", {
+                    "version": most_recent_version,
+                    "adapter_path": str(adapter_path),
+                    "weights_found": True,
+                    "weights_attached": True
+                })
+            else:
+                # Version exists but no weights found
+                version_info["weights_found"] = False
+                version_info["weights_attached"] = False
+                self.logger.log("WARNING", f"Incremental training: Version V{most_recent_version} exists but no adapter weights found. Falling back to new training.", {
+                    "version": most_recent_version,
+                    "weights_found": False,
+                    "weights_attached": False
+                })
+                # Fall back to new training if weights not found
+                training_mode = "NEW"
+                previous_adapter_path = None
+        else:
+            # No existing versions - this is new training
+            training_mode = "NEW"
+            version_info["highest_version"] = None
+            version_info["weights_found"] = False
+            version_info["weights_attached"] = False
+            self.logger.log("INFO", "New LoRA training: No existing versions found. Starting fresh training from base model.")
+        
+        # Log training mode summary
+        self.logger.log("INFO", f"Training mode: {training_mode}", {
+            "mode": training_mode,
+            "version_info": version_info
+        })
         
         # Handle YAML config
         output_dir = "/workspace/output/training"
@@ -212,7 +249,11 @@ class VastTrainingManager:
                 config["adapter"] = "/workspace/data/previous_adapter"
                 config["lora_model_dir"] = "/workspace/data/previous_adapter"
                 config_modified = True
-                self.logger.log("INFO", f"Set adapter path for incremental training: /workspace/data/previous_adapter (from previous version)")
+                self.logger.log("INFO", f"Incremental training: Configured adapter path for loading previous weights", {
+                    "remote_path": "/workspace/data/previous_adapter",
+                    "local_path": previous_adapter_path,
+                    "version": version_info.get("highest_version")
+                })
             elif has_lora_params:
                 # For new LoRA training: Set adapter: "lora" to explicitly enable LoRA mode
                 # Only set if not already set to a path (incremental training)
@@ -482,7 +523,9 @@ class VastTrainingManager:
             "base_model": base_model,
             "dataset_stats": dataset_stats,
             "config": config,
-            "previous_adapter_path": previous_adapter_path  # Local path to previous adapter
+            "previous_adapter_path": previous_adapter_path,  # Local path to previous adapter
+            "training_mode": training_mode,  # "NEW" or "INCREMENTAL"
+            "version_info": version_info  # Information about version used for incremental training
         }
     
     # Note: create_training_script method removed - we no longer use onstart scripts
@@ -562,7 +605,13 @@ class VastTrainingManager:
         instance_id = existing_instance_id
         # Get instance info to extract offer details
         try:
+            self.logger.log("INFO", f"Getting instance status for {instance_id} (launch_training_job)")
             instance_status = self.vast_client.get_instance_status(instance_id)
+            self.logger.log("INFO", f"Instance status API response received", {
+                "instance_id": instance_id,
+                "response_keys": list(instance_status.keys())[:20],
+                "status": instance_status.get("actual_status") or instance_status.get("status", "unknown")
+            })
             # Extract offer_id from instance if available (for job tracking)
             offer_id = instance_status.get("machine_id") or instance_status.get("offer_id") or "existing"
             # Create a mock selected_offer dict from instance status for job_info
@@ -1309,14 +1358,22 @@ class VastTrainingManager:
                         continue
                     raise Exception("Upload timed out after multiple retries. Instance may not be ready.")
             
-            # Upload previous adapter weights if we have them (for V2+ training)
+            # Upload previous adapter weights if we have them (for V2+ incremental training)
             previous_adapter_path = package_info.get("previous_adapter_path")
+            training_mode = package_info.get("training_mode", "NEW")
+            version_info = package_info.get("version_info", {})
+            
             if previous_adapter_path:
                 adapter_path = Path(previous_adapter_path)
                 if adapter_path.exists():
                     # Upload entire adapter directory
                     remote_adapter_path = "/workspace/data/previous_adapter"
-                    self.logger.log("INFO", f"Uploading previous adapter for incremental training: {adapter_path} -> {remote_adapter_path}")
+                    version_num = version_info.get("highest_version", "unknown")
+                    self.logger.log("INFO", f"Incremental training: Uploading previous adapter weights from V{version_num}", {
+                        "local_path": str(adapter_path),
+                        "remote_path": remote_adapter_path,
+                        "version": version_num
+                    })
                     cmd = [
                         "scp", "-r", "-P", str(ssh_port), "-o", "StrictHostKeyChecking=no",
                         str(adapter_path),
@@ -1324,7 +1381,18 @@ class VastTrainingManager:
                     ]
                     result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
                     if result.returncode != 0:
+                        self.logger.log("ERROR", f"Incremental training: Failed to upload previous adapter weights", {
+                            "error": result.stderr,
+                            "version": version_num,
+                            "local_path": str(adapter_path)
+                        })
                         raise Exception(f"Failed to upload previous adapter: {result.stderr}")
+                    else:
+                        self.logger.log("SUCCESS", f"Incremental training: Successfully uploaded previous adapter weights from V{version_num}", {
+                            "remote_path": remote_adapter_path,
+                            "version": version_num,
+                            "weights_uploaded": True
+                        })
                     
                     # Verify adapter was uploaded correctly
                     verify_cmd = [
@@ -2324,6 +2392,15 @@ PYTHON_EOF"""
             ssh_info = self.get_instance_ssh_info(instance_id)
             ssh_host = ssh_info.get("host")
             ssh_port = ssh_info.get("port", 22)
+            
+            # Check for saved SSH port override from the job
+            jobs = self._load_jobs()
+            job = next((j for j in jobs if j.get("instance_id") == instance_id), None)
+            if job:
+                ssh_port_override = job.get("ssh_port_override")
+                if ssh_port_override:
+                    ssh_port = ssh_port_override
+                    self.logger.log("DEBUG", f"Using SSH port override from job: {ssh_port}")
             
             self.logger.log("DEBUG", f"SSH connection info retrieved", {
                 "ssh_host": ssh_host,

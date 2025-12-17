@@ -1,0 +1,410 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Anvil ChatBot - vLLM Setup</title>
+  <style>
+    * {
+      margin: 0;
+      padding: 0;
+      box-sizing: border-box;
+    }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+      background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+      min-height: 100vh;
+      padding: 20px;
+      color: #333;
+    }
+
+    .container {
+      max-width: 700px;
+      margin: 0 auto;
+      background: white;
+      border-radius: 12px;
+      box-shadow: 0 10px 40px rgba(0, 0, 0, 0.2);
+      padding: 30px;
+    }
+
+    h1 {
+      color: #667eea;
+      margin-bottom: 10px;
+      font-size: 28px;
+    }
+
+    .subtitle {
+      color: #666;
+      margin-bottom: 30px;
+      font-size: 14px;
+    }
+
+    .section {
+      margin-bottom: 30px;
+    }
+
+    .section-title {
+      font-size: 18px;
+      font-weight: 600;
+      margin-bottom: 15px;
+      color: #333;
+      border-bottom: 2px solid #667eea;
+      padding-bottom: 8px;
+    }
+
+    label {
+      display: block;
+      margin-bottom: 8px;
+      font-weight: 500;
+      color: #555;
+    }
+
+    select, input {
+      width: 100%;
+      padding: 12px;
+      border: 2px solid #e0e0e0;
+      border-radius: 6px;
+      font-size: 14px;
+      transition: border-color 0.3s;
+    }
+
+    select:focus, input:focus {
+      outline: none;
+      border-color: #667eea;
+    }
+
+    .form-row {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 15px;
+      margin-bottom: 15px;
+    }
+
+    .versions-list {
+      background: #f5f5f5;
+      border-radius: 6px;
+      padding: 15px;
+      margin-top: 10px;
+    }
+
+    .version-item {
+      padding: 8px;
+      margin: 5px 0;
+      background: white;
+      border-radius: 4px;
+      font-size: 13px;
+    }
+
+    button {
+      background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+      color: white;
+      border: none;
+      padding: 12px 24px;
+      border-radius: 6px;
+      font-size: 16px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: transform 0.2s, box-shadow 0.2s;
+      width: 100%;
+      margin-top: 10px;
+    }
+
+    button:hover {
+      transform: translateY(-2px);
+      box-shadow: 0 5px 15px rgba(102, 126, 234, 0.4);
+    }
+
+    button:active {
+      transform: translateY(0);
+    }
+
+    button:disabled {
+      background: #ccc;
+      cursor: not-allowed;
+      transform: none;
+    }
+
+    .status {
+      margin-top: 15px;
+      padding: 12px;
+      border-radius: 6px;
+      font-size: 14px;
+    }
+
+    .status.success {
+      background: #d4edda;
+      color: #155724;
+      border: 1px solid #c3e6cb;
+    }
+
+    .status.error {
+      background: #f8d7da;
+      color: #721c24;
+      border: 1px solid #f5c6cb;
+    }
+
+    .status.info {
+      background: #d1ecf1;
+      color: #0c5460;
+      border: 1px solid #bee5eb;
+    }
+
+    .steps-list {
+      background: #f8f9fa;
+      border-radius: 6px;
+      padding: 15px;
+      margin-top: 15px;
+      max-height: 300px;
+      overflow-y: auto;
+    }
+
+    .step-item {
+      padding: 8px 0;
+      font-size: 13px;
+      color: #555;
+      border-bottom: 1px solid #e0e0e0;
+    }
+
+    .step-item:last-child {
+      border-bottom: none;
+    }
+
+    .loading {
+      display: inline-block;
+      width: 16px;
+      height: 16px;
+      border: 3px solid #f3f3f3;
+      border-top: 3px solid #667eea;
+      border-radius: 50%;
+      animation: spin 1s linear infinite;
+      margin-right: 8px;
+      vertical-align: middle;
+    }
+
+    @keyframes spin {
+      0% { transform: rotate(0deg); }
+      100% { transform: rotate(360deg); }
+    }
+
+    .error-list {
+      background: #fff3cd;
+      border: 1px solid #ffc107;
+      border-radius: 6px;
+      padding: 15px;
+      margin-top: 15px;
+    }
+
+    .error-item {
+      color: #856404;
+      font-size: 13px;
+      margin: 5px 0;
+    }
+
+    /* Chat Interface Styles */
+    .chat-controls {
+      background: #f8f9fa;
+      border-radius: 6px;
+      padding: 15px;
+      margin-bottom: 15px;
+    }
+
+    .control-group {
+      margin-bottom: 15px;
+    }
+
+    .control-group:last-child {
+      margin-bottom: 0;
+    }
+
+    .control-group label {
+      display: block;
+      margin-bottom: 5px;
+    }
+
+    .control-group textarea {
+      width: 100%;
+      padding: 8px;
+      border: 2px solid #e0e0e0;
+      border-radius: 6px;
+      font-size: 14px;
+      font-family: inherit;
+      resize: vertical;
+    }
+
+    .control-group textarea:focus {
+      outline: none;
+      border-color: #667eea;
+    }
+
+    .control-group input[type="checkbox"] {
+      margin-right: 8px;
+    }
+
+    .chat-messages {
+      background: #f8f9fa;
+      border-radius: 6px;
+      padding: 15px;
+      margin-bottom: 15px;
+      max-height: 400px;
+      overflow-y: auto;
+      min-height: 200px;
+    }
+
+    .message {
+      margin-bottom: 15px;
+      padding: 12px;
+      border-radius: 6px;
+      background: white;
+    }
+
+    .message.user {
+      background: #e3f2fd;
+      border-left: 4px solid #2196f3;
+    }
+
+    .message.assistant {
+      background: #f1f8e9;
+      border-left: 4px solid #8bc34a;
+    }
+
+    .message-header {
+      font-weight: 600;
+      font-size: 12px;
+      color: #666;
+      margin-bottom: 8px;
+      text-transform: uppercase;
+    }
+
+    .message-content {
+      color: #333;
+      white-space: pre-wrap;
+      word-wrap: break-word;
+    }
+
+    .chat-input-container {
+      display: flex;
+      gap: 10px;
+    }
+
+    .chat-input-container textarea {
+      flex: 1;
+      padding: 12px;
+      border: 2px solid #e0e0e0;
+      border-radius: 6px;
+      font-size: 14px;
+      font-family: inherit;
+      resize: vertical;
+    }
+
+    .chat-input-container textarea:focus {
+      outline: none;
+      border-color: #667eea;
+    }
+
+    .chat-input-container button {
+      width: auto;
+      padding: 12px 24px;
+      margin-top: 0;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>🤖 Anvil ChatBot</h1>
+    <p class="subtitle">vLLM Setup and Management</p>
+
+    <!-- Profile Selection -->
+    <div class="section">
+      <div class="section-title">1. Select Profile</div>
+      <label for="profileSelect">Model Profile:</label>
+      <select id="profileSelect">
+        <option value="">Loading profiles...</option>
+      </select>
+      <div id="profileInfo" style="margin-top: 10px; font-size: 13px; color: #666;"></div>
+    </div>
+
+    <!-- SSH Configuration -->
+    <div class="section">
+      <div class="section-title">2. SSH Configuration</div>
+      <div class="form-row">
+        <div>
+          <label for="sshHost">SSH Host/IP:</label>
+          <input type="text" id="sshHost" placeholder="e.g., 123.456.789.0" />
+        </div>
+        <div>
+          <label for="sshPort">SSH Port:</label>
+          <input type="number" id="sshPort" placeholder="22" value="22" />
+        </div>
+      </div>
+      <button id="testSSHBtn">Test SSH Connection</button>
+      <div id="sshStatus"></div>
+    </div>
+
+    <!-- Version Information -->
+    <div class="section" id="versionsSection" style="display: none;">
+      <div class="section-title">3. Available Versions</div>
+      <div id="versionsList" class="versions-list"></div>
+    </div>
+
+    <!-- vLLM Configuration -->
+    <div class="section">
+      <div class="section-title">4. vLLM Configuration</div>
+      <label for="vllmUrl">vLLM HTTP API URL (with port):</label>
+      <input type="text" id="vllmUrl" placeholder="http://your-server-ip:8000" style="width: 100%; padding: 10px; font-size: 14px; box-sizing: border-box;" autocomplete="off" />
+      <small style="display: block; margin-top: 5px; color: #666;">⚠️ Use the external/public IP address of your server (not localhost). This connects directly from your local machine.</small>
+      <div id="vllmUrlStatus" style="margin-top: 8px; font-size: 0.9em;"></div>
+    </div>
+
+    <!-- Prepare vLLM -->
+    <div class="section">
+      <div class="section-title">5. Prepare vLLM</div>
+      <button id="prepareBtn" disabled>Prepare vLLM with Selected Model</button>
+      <div id="prepareStatus"></div>
+      <div id="stepsList" class="steps-list" style="display: none;"></div>
+      <div id="errorsList" class="error-list" style="display: none;"></div>
+    </div>
+
+    <!-- Chat Interface (hidden initially) -->
+    <div id="chatInterface" class="section" style="display: none;">
+      <div class="section-title">💬 Chat Interface</div>
+      
+      <!-- Chat Controls -->
+      <div class="chat-controls">
+        <div class="control-group">
+          <label for="versionSelect">Model Version:</label>
+          <select id="versionSelect">
+            <option value="base">Base Model</option>
+          </select>
+        </div>
+        
+        <div class="control-group">
+          <label for="prependedText">Pre-pended Text (added to every prompt):</label>
+          <textarea id="prependedText" rows="3" placeholder="Enter text that will be prepended to every message..."></textarea>
+        </div>
+        
+        <div class="control-group">
+          <label style="display: flex; align-items: center; gap: 10px;">
+            <input type="checkbox" id="useSummaryCheckbox" />
+            <span>Keep running summary of conversation</span>
+            <button id="clearSummaryBtn" style="margin-left: auto; padding: 4px 12px; font-size: 12px; background: #f44336; color: white; border: none; border-radius: 4px; cursor: pointer;">Clear Summary</button>
+          </label>
+        </div>
+      </div>
+
+      <!-- Chat Messages -->
+      <div id="chatMessages" class="chat-messages"></div>
+
+      <!-- Chat Input -->
+      <div class="chat-input-container">
+        <textarea id="chatInput" rows="3" placeholder="Type your message here..."></textarea>
+        <button id="sendBtn">Send</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="renderer.js"></script>
+</body>
+</html>
+
+

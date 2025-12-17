@@ -92,6 +92,18 @@ class VastAIClient:
                 timeout=30
             )
             
+            # Log API response
+            print(f"[API] search_offers response: status_code={response.status_code}")
+            try:
+                response_json = response.json()
+                print(f"[API] search_offers response body (first 1000 chars): {json.dumps(response_json, indent=2)[:1000]}")
+                if isinstance(response_json, dict):
+                    offers = response_json.get("offers") or response_json.get("results") or response_json.get("data") or []
+                    if isinstance(offers, list):
+                        print(f"[API] search_offers found {len(offers)} offers")
+            except:
+                print(f"[API] search_offers response body (non-JSON): {response.text[:500]}")
+            
             # Check response
             if response.status_code != 200:
                 # Try to get error details
@@ -190,6 +202,14 @@ class VastAIClient:
                 timeout=60
             )
             
+            # Log API response
+            print(f"[API] create_instance response: status_code={response.status_code}")
+            try:
+                response_json = response.json()
+                print(f"[API] create_instance response body: {json.dumps(response_json, indent=2)[:1000]}")  # Limit to 1000 chars
+            except:
+                print(f"[API] create_instance response body (non-JSON): {response.text[:500]}")
+            
             # Get detailed error information
             if not response.ok:
                 error_detail = ""
@@ -242,6 +262,14 @@ class VastAIClient:
                 headers=headers_with_auth,
                 timeout=30
             )
+            
+            # Log API response
+            print(f"[API] get_instance_status response: status_code={response.status_code}, instance_id={instance_id}")
+            try:
+                response_json = response.json()
+                print(f"[API] get_instance_status response body: {json.dumps(response_json, indent=2)[:1000]}")  # Limit to 1000 chars
+            except:
+                print(f"[API] get_instance_status response body (non-JSON): {response.text[:500]}")
             
             # Check for 404 explicitly - this means instance doesn't exist
             if response.status_code == 404:
@@ -402,6 +430,15 @@ class VastAIClient:
                 headers=headers_with_auth,
                 timeout=30
             )
+            
+            # Log API response
+            print(f"[API] start_instance response: status_code={response.status_code}, instance_id={instance_id}")
+            try:
+                response_json = response.json()
+                print(f"[API] start_instance response body: {json.dumps(response_json, indent=2)[:1000]}")  # Limit to 1000 chars
+            except:
+                print(f"[API] start_instance response body (non-JSON): {response.text[:500]}")
+            
             response.raise_for_status()
             
             # Check response
