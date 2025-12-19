@@ -7,15 +7,33 @@ let conversationHistory = [];
 let conversationSummary = '';
 let configLoaded = false; // Track if config has been loaded to prevent overwriting user input
 
+// Fix 3: Normalize conversation history before sending to enforce strict role alternation
+function normalizeConversation(messages) {
+  const cleaned = [];
+  for (const msg of messages) {
+    if (cleaned.length === 0) {
+      // First message must be user or system
+      if (msg.role === "user" || msg.role === "system") {
+        cleaned.push(msg);
+      }
+      continue;
+    }
+    const last = cleaned[cleaned.length - 1];
+    // Only add if role alternates (no duplicate consecutive roles)
+    if (msg.role !== last.role) {
+      cleaned.push(msg);
+    }
+  }
+  return cleaned;
+}
+
 // Save configuration to file
 async function saveConfig() {
   try {
     // Read directly from input fields to ensure we save current values, not stale sshConfig
     const sshHostInput = document.getElementById('sshHost');
     const sshPortInput = document.getElementById('sshPort');
-    const vllmUrlInput = document.getElementById('vllmUrl');
     const prependedTextInput = document.getElementById('prependedText');
-    const useSummaryCheckbox = document.getElementById('useSummaryCheckbox');
     
     // Get SSH values from input fields
     let sshHost = sshHostInput ? sshHostInput.value.trim() : '';
@@ -57,13 +75,18 @@ async function saveConfig() {
     const profileSelect = document.getElementById('profileSelect');
     const versionSelect = document.getElementById('versionSelect');
     
+    // Get internal port (for FastAPI server inside container)
+    const internalPortInput = document.getElementById('internalPort');
+    let internalPort = internalPortInput ? parseInt(internalPortInput.value.trim()) : 8888;
+    
+    if (isNaN(internalPort)) internalPort = 8888;
+    
     const config = {
       sshHost: sshHost,
       sshPort: sshPort,
-      vllmUrl: vllmUrlInput ? vllmUrlInput.value.trim() : '',
+      internalPort: internalPort,
       prependedText: prependedTextInput ? prependedTextInput.value.trim() : '',
-      useSummary: useSummaryCheckbox ? useSummaryCheckbox.checked : false,
-      conversationSummary: conversationSummary || '', // Save the conversation summary
+      conversationHistory: conversationHistory || [], // Save the conversation history
       selectedProfile: profileSelect ? profileSelect.value : '', // Save selected profile
       selectedVersion: versionSelect ? versionSelect.value : 'base' // Save selected version (default to 'base')
       // Token is not saved - it's retrieved automatically during setup
@@ -132,21 +155,19 @@ async function loadConfig() {
       // Mark config as loaded
       configLoaded = true;
       
-      // Load vLLM URL (only if field is empty, to avoid overwriting user input)
-      // Reset vLLM URL test flags since we're loading from saved config
+      // Load Inference Server URL (only if field is empty, to avoid overwriting user input)
+      // Reset Inference Server URL test flags since we're loading from saved config
       // Don't test the URL automatically on startup - user should test when ready
-      vllmUrlTested = false;
-      vllmUrlValid = false;
       
-      if (config.vllmUrl) {
-        const vllmUrlInput = document.getElementById('vllmUrl');
-        if (vllmUrlInput && !vllmUrlInput.value.trim()) {
-          vllmUrlInput.value = config.vllmUrl;
-          // Don't test automatically - user will test when they're ready
+      // Load port forwarding values
+      const internalPortInput = document.getElementById('internalPort');
+      if (internalPortInput && config.internalPort !== undefined && config.internalPort !== null) {
+        if (!internalPortInput.value.trim() || internalPortInput.value === '8888') {
+          internalPortInput.value = config.internalPort.toString();
         }
       }
       
-      // Load prepended text
+      // Load system message
       if (config.prependedText !== undefined) {
         const prependedTextInput = document.getElementById('prependedText');
         if (prependedTextInput) {
@@ -154,18 +175,19 @@ async function loadConfig() {
         }
       }
       
-      // Load use summary option
-      if (config.useSummary !== undefined) {
-        const useSummaryCheckbox = document.getElementById('useSummaryCheckbox');
-        if (useSummaryCheckbox) {
-          useSummaryCheckbox.checked = config.useSummary;
+      // Load conversation history
+      if (config.conversationHistory !== undefined && Array.isArray(config.conversationHistory)) {
+        conversationHistory = config.conversationHistory;
+        console.log('[CONFIG] Loaded conversation history:', conversationHistory.length, 'messages');
+        
+        // Restore chat messages from history
+        const chatMessages = document.getElementById('chatMessages');
+        if (chatMessages && conversationHistory.length > 0) {
+          chatMessages.innerHTML = ''; // Clear existing messages
+          conversationHistory.forEach(msg => {
+            addMessage(msg.role, msg.content, false); // Add to UI but don't add to history again
+          });
         }
-      }
-      
-      // Load conversation summary
-      if (config.conversationSummary !== undefined && config.conversationSummary) {
-        conversationSummary = config.conversationSummary;
-        console.log('[CONFIG] Loaded conversation summary (length:', conversationSummary.length, 'chars)');
       }
       
       // Load selected profile (will be restored after profiles are loaded)
@@ -196,12 +218,19 @@ window.addEventListener('DOMContentLoaded', async () => {
   // Load saved configuration first
   await loadConfig();
   
+  // Set up event listeners BEFORE loading profiles (so profile restoration works)
+  const profileSelect = document.getElementById('profileSelect');
+  if (profileSelect) {
+    profileSelect.addEventListener('change', handleProfileChange);
+    console.log('[INIT] Profile select event listener set up');
+  }
+  
+  // Initialize button states (all disabled until profile is selected)
+  updateButtonStates();
+  
   await loadProfiles();
   await checkVastApiKey();
   await checkSSHKey();
-  
-  // Set up event listeners
-  document.getElementById('profileSelect').addEventListener('change', handleProfileChange);
   
   const sshHostInput = document.getElementById('sshHost');
   const sshPortInput = document.getElementById('sshPort');
@@ -226,17 +255,21 @@ window.addEventListener('DOMContentLoaded', async () => {
     console.error('[INIT] sshPort input not found!');
   }
   
-  document.getElementById('testSSHBtn').addEventListener('click', testSSHConnection);
-  document.getElementById('prepareBtn').addEventListener('click', prepareVLLM);
+  document.getElementById('testSSHBtn').addEventListener('click', initializeInferenceEnvironment);
   
-  // Set up vLLM URL listeners after functions are defined (see end of file)
+  // Set up internal port listener
+  const internalPortInput = document.getElementById('internalPort');
+  if (internalPortInput) {
+    internalPortInput.addEventListener('input', saveConfig);
+  }
+  
+  // Set up Inference Server URL listeners after functions are defined (see end of file)
   setTimeout(setupVLLMUrlListeners, 0);
   document.getElementById('sendBtn').addEventListener('click', sendMessage);
   
-  // Set up listeners for prepended text and summary checkbox
+  // Set up listeners for system message
   const prependedTextInput = document.getElementById('prependedText');
-  const useSummaryCheckbox = document.getElementById('useSummaryCheckbox');
-  const clearSummaryBtn = document.getElementById('clearSummaryBtn');
+  const clearChatBtn = document.getElementById('clearChatBtn');
   
   // Set up listener for version selection
   const versionSelect = document.getElementById('versionSelect');
@@ -252,28 +285,23 @@ window.addEventListener('DOMContentLoaded', async () => {
       saveConfig();
     });
   }
-  if (useSummaryCheckbox) {
-    useSummaryCheckbox.addEventListener('change', () => {
-      saveConfig();
-    });
-  }
-  if (clearSummaryBtn) {
-    clearSummaryBtn.addEventListener('click', () => {
-      conversationSummary = '';
+  
+  if (clearChatBtn) {
+    clearChatBtn.addEventListener('click', () => {
       conversationHistory = [];
       const chatMessages = document.getElementById('chatMessages');
       if (chatMessages) {
         chatMessages.innerHTML = '';
       }
-      console.log('[CHAT] Summary and conversation history cleared');
+      console.log('[CHAT] Conversation history cleared');
       
-      // Save config to persist the cleared summary
+      // Save config to persist the cleared history
       saveConfig();
       // Optionally add a message indicating the conversation was reset
       if (chatMessages) {
         const resetMsg = document.createElement('div');
-        resetMsg.className = 'message assistant-message';
-        resetMsg.textContent = 'Conversation summary and history cleared. Starting fresh conversation.';
+        resetMsg.className = 'message assistant';
+        resetMsg.textContent = 'Conversation history cleared. Starting fresh conversation.';
         chatMessages.appendChild(resetMsg);
       }
     });
@@ -284,6 +312,12 @@ window.addEventListener('DOMContentLoaded', async () => {
       sendMessage();
     }
   });
+  
+  // Final button state update after all initialization
+  setTimeout(() => {
+    console.log('[INIT] Final button state update after initialization');
+    updateButtonStates();
+  }, 500);
 });
 
 async function loadProfiles() {
@@ -408,6 +442,8 @@ async function checkSSHKey() {
 async function handleProfileChange(event) {
   const profileName = event.target.value;
   
+  console.log('[PROFILE] Profile selection changed:', profileName);
+  
   // Save config when profile changes
   if (profileName) {
     saveConfig();
@@ -418,7 +454,7 @@ async function handleProfileChange(event) {
     profileVersions = [];
     document.getElementById('profileInfo').textContent = '';
     document.getElementById('versionsSection').style.display = 'none';
-    updatePrepareButton();
+    updateButtonStates();
     return;
   }
   
@@ -432,15 +468,24 @@ async function handleProfileChange(event) {
       baseModel: baseModel
     };
     
+    console.log('[PROFILE] Selected profile:', selectedProfile);
     document.getElementById('profileInfo').textContent = `Base Model: ${baseModel}`;
     
     // Load versions
+    console.log('[PROFILE] Loading versions for profile:', profileName);
     profileVersions = await window.electronAPI.getProfileVersions(profileName);
+    console.log('[PROFILE] Loaded versions:', profileVersions);
+    console.log('[PROFILE] Version count:', profileVersions.length);
+    
     displayVersions();
-    updatePrepareButton();
+    updateButtonStates();
   } catch (error) {
-    console.error('Error loading profile versions:', error);
+    console.error('[PROFILE] Error loading profile versions:', error);
     showStatus('profileInfo', `Error loading versions: ${error.message}`, 'error');
+    // Reset versions on error
+    profileVersions = [];
+    displayVersions();
+    updateButtonStates();
   }
 }
 
@@ -448,9 +493,12 @@ function displayVersions() {
   const versionsList = document.getElementById('versionsList');
   const versionsSection = document.getElementById('versionsSection');
   
+  console.log('[VERSIONS] Displaying versions, count:', profileVersions.length);
+  
   if (profileVersions.length === 0) {
     versionsList.innerHTML = '<div class="version-item">No versions found for this profile</div>';
     versionsSection.style.display = 'block';
+    console.log('[VERSIONS] No versions found - Prepare button will be disabled');
     return;
   }
   
@@ -459,7 +507,12 @@ function displayVersions() {
   ).join('');
   
   versionsSection.style.display = 'block';
+  console.log('[VERSIONS] Displayed', profileVersions.length, 'version(s)');
 }
+
+// Update Inference Server URL from external port and SSH host
+// updateInferenceUrlFromPorts() removed - no longer needed with SSH tunnel approach
+// All inference requests now go through SSH tunnel to localhost:<forwarded_port>
 
 function handleSSHConfigChange(skipSave = false) {
   console.log('[SSH] handleSSHConfigChange called, skipSave:', skipSave);
@@ -498,7 +551,7 @@ function handleSSHConfigChange(skipSave = false) {
   sshConfig.port = parseInt(sshPortInput ? sshPortInput.value : '22') || 22;
   console.log('[SSH] Updated sshConfig:', { host: sshConfig.host, port: sshConfig.port });
   sshTested = false;
-  updatePrepareButton();
+  updateButtonStates();
   
   // Save config when it changes (unless we're loading from saved config)
   if (!skipSave) {
@@ -515,15 +568,31 @@ function handleSSHConfigChange(skipSave = false) {
   }
 }
 
-async function testSSHConnection() {
+async function initializeInferenceEnvironment() {
   const btn = document.getElementById('testSSHBtn');
   const statusDiv = document.getElementById('sshStatus');
   const sshHostInput = document.getElementById('sshHost');
   const sshPortInput = document.getElementById('sshPort');
+  const vllmUrlInput = document.getElementById('vllmUrl');
   
   // Read directly from input fields to ensure we use current values, not stale sshConfig
   let hostValue = sshHostInput ? sshHostInput.value.trim() : '';
-  let portValue = parseInt(sshPortInput ? sshPortInput.value : '22') || 22;
+  let portValue = 22; // Default
+  
+  // Get port from input field, respecting saved config
+  if (sshPortInput && sshPortInput.value.trim()) {
+    const parsedPort = parseInt(sshPortInput.value.trim());
+    if (!isNaN(parsedPort) && parsedPort > 0) {
+      portValue = parsedPort;
+      console.log(`[INIT] Using SSH port from input: ${portValue}`);
+    }
+  } else {
+    // If input is empty, try to use saved config or sshConfig
+    if (sshConfig.port && sshConfig.port > 0) {
+      portValue = sshConfig.port;
+      console.log(`[INIT] Using SSH port from sshConfig: ${portValue}`);
+    }
+  }
   
   // Process host value (strip port if present)
   if (hostValue.includes(':')) {
@@ -531,11 +600,14 @@ async function testSSHConnection() {
     hostValue = parts[0].trim();
     if (parts.length > 1 && parts[1].trim()) {
       const extractedPort = parseInt(parts[1].trim());
-      if (!isNaN(extractedPort)) {
+      if (!isNaN(extractedPort) && extractedPort > 0) {
         portValue = extractedPort;
+        console.log(`[INIT] Using SSH port extracted from host: ${portValue}`);
       }
     }
   }
+  
+  console.log(`[INIT] Final SSH port value: ${portValue}`);
   
   if (!hostValue) {
     showStatus('sshStatus', 'Please enter SSH host/IP', 'error');
@@ -547,30 +619,116 @@ async function testSSHConnection() {
   sshConfig.port = portValue;
   
   btn.disabled = true;
-  btn.innerHTML = '<span class="loading"></span> Testing...';
+  btn.innerHTML = '<span class="loading"></span> Initializing...';
   statusDiv.innerHTML = '';
   
+  // Get profile info if available
+  let profileName = null;
+  let baseModel = null;
+  let versions = [];
+  
+  if (selectedProfile) {
+    profileName = selectedProfile.name;
+    baseModel = selectedProfile.baseModel;
+    versions = profileVersions || [];
+  }
+  
+  // Get internal port (for FastAPI server inside container)
+  const internalPortInput = document.getElementById('internalPort');
+  let internalPort = internalPortInput ? parseInt(internalPortInput.value.trim()) : 8888;
+  
+  if (isNaN(internalPort)) internalPort = 8888;
+  
   try {
-    const result = await window.electronAPI.testSSH({
+    const result = await window.electronAPI.initializeInferenceEnvironment({
       host: hostValue,
       port: portValue,
-      username: 'root'
+      username: 'root',
+      profileName: profileName,
+      baseModel: baseModel,
+      versions: versions,
+      inferenceUrl: undefined, // No longer needed - using SSH tunnel
+      vllmUrl: undefined, // No longer needed - using SSH tunnel
+      externalPort: null, // No longer needed - using SSH tunnel
+      internalPort: internalPort
     });
     
+    // Display steps and errors
+    if (result.steps && result.steps.length > 0) {
+      let statusHTML = '<div class="steps-container">';
+      result.steps.forEach(step => {
+        statusHTML += `<div class="step">${step}</div>`;
+      });
+      statusHTML += '</div>';
+      statusDiv.innerHTML = statusHTML;
+    }
+    
+    if (result.errors && result.errors.length > 0) {
+      let errorHTML = '<div class="errors-container" style="margin-top: 10px; color: #ff4444;">';
+      result.errors.forEach(error => {
+        errorHTML += `<div class="error">✗ ${error}</div>`;
+      });
+      errorHTML += '</div>';
+      statusDiv.innerHTML += errorHTML;
+    }
+    
     if (result.success) {
-      showStatus('sshStatus', '✓ ' + result.message, 'success');
+      showStatus('sshStatus', '✓ Initialization complete!', 'success');
       sshTested = true;
+      // Ensure sshConfig is set after successful initialization
+      sshConfig.host = hostValue;
+      sshConfig.port = portValue;
+      
+      // Update inference URL if provided
+      if (result.inferenceUrl) {
+        if (vllmUrlInput) {
+          vllmUrlInput.value = result.inferenceUrl;
+        }
+        vllmUrl = result.inferenceUrl;
+        vllmUrlTested = true;
+        vllmUrlValid = true;
+      }
+      
+      console.log('[INIT] Initialization successful, config updated:', sshConfig);
+      console.log('[INIT] Health check passed:', result.healthCheckPassed);
+      
+      // Automatically launch the chat interface if initialization succeeded
+      // Even if health check didn't pass, the server might still be starting
+      if (result.success) {
+        console.log('[INIT] Initialization successful - automatically launching chat interface...');
+        // Small delay to ensure UI is updated
+        setTimeout(async () => {
+          try {
+            await showChatInterface();
+            console.log('[INIT] ✓ Chat interface launched automatically');
+          } catch (error) {
+            console.error('[INIT] Error launching chat interface:', error);
+            console.error('[INIT] Error details:', error);
+            // Show error in UI
+            showStatus('sshStatus', 'Chat interface error: ' + error.message, 'error');
+          }
+        }, 500);
+      }
     } else {
-      showStatus('sshStatus', '✗ ' + result.message, 'error');
+      // Show error message - errors are already displayed above if any
+      let errorMessage = '✗ Initialization failed';
+      if (result.errors && result.errors.length > 0) {
+        // Errors are already shown above, just add a note to check terminal
+        errorMessage += ' - Check terminal for details';
+      } else {
+        // No specific errors returned, definitely check terminal
+        errorMessage += ' - Check terminal for details';
+      }
+      showStatus('sshStatus', errorMessage, 'error');
       sshTested = false;
     }
   } catch (error) {
     showStatus('sshStatus', '✗ Error: ' + error.message, 'error');
     sshTested = false;
   } finally {
-    btn.disabled = false;
-    btn.textContent = 'Test SSH Connection';
-    updatePrepareButton();
+    btn.disabled = !selectedProfile; // Re-enable only if profile is selected
+    btn.textContent = 'Initialize Inference Environment';
+    updateButtonStates();
   }
 }
 
@@ -591,7 +749,7 @@ function debounce(func, wait) {
 // Create debounced test function
 let debouncedTestVLLMUrl = null;
 
-// Test vLLM URL connectivity
+// Test Inference Server URL connectivity
 let vllmUrlTested = false;
 let vllmUrlValid = false;
 
@@ -604,10 +762,10 @@ async function testVLLMUrl() {
   const vllmUrl = vllmUrlInput ? vllmUrlInput.value.trim() : '';
   
   if (!vllmUrl) {
-    statusDiv.innerHTML = '<span style="color: #999;">Enter a vLLM URL to test</span>';
+    statusDiv.innerHTML = '<span style="color: #999;">Enter an Inference Server URL to test</span>';
     vllmUrlTested = false;
     vllmUrlValid = false;
-    updatePrepareButton();
+    updateButtonStates();
     return;
   }
   
@@ -640,30 +798,51 @@ async function testVLLMUrl() {
     });
     
     if (result.success) {
-      statusDiv.innerHTML = `<span style="color: #4caf50;">✓ ${result.message}</span>`;
-      if (result.models && result.models.length > 0) {
-        statusDiv.innerHTML += `<br><small style="color: #666;">Available models: ${result.models.join(', ')}</small>`;
+      // Check if it's a "starting up" status (502/503) - show as warning but still valid
+      if (result.isStarting && (result.statusCode === 502 || result.statusCode === 503)) {
+        statusDiv.innerHTML = `<span style="color: #ff9800;">⚠ ${result.message}</span>`;
+        if (result.details) {
+          statusDiv.innerHTML += `<br><small style="color: #666;">${result.details}</small>`;
+        }
+        // Show supervisor status if available
+        if (result.supervisorStatus) {
+          const statusColor = result.supervisorStatus.includes('STOPPED') ? '#f44336' : 
+                             result.supervisorStatus.includes('RUNNING') ? '#4caf50' : '#666';
+          statusDiv.innerHTML += `<br><small style="color: ${statusColor}; font-weight: bold;">Supervisor: ${result.supervisorStatus}</small>`;
+        }
+        vllmUrlTested = true;
+        vllmUrlValid = true; // Still valid - credentials work, service just starting
+      } else {
+        statusDiv.innerHTML = `<span style="color: #4caf50;">✓ ${result.message}</span>`;
+        if (result.models && result.models.length > 0) {
+          statusDiv.innerHTML += `<br><small style="color: #666;">Available models: ${result.models.join(', ')}</small>`;
+        }
+        vllmUrlTested = true;
+        vllmUrlValid = true;
       }
-      vllmUrlTested = true;
-      vllmUrlValid = true;
     } else {
       statusDiv.innerHTML = `<span style="color: #f44336;">✗ ${result.message}</span>`;
       if (result.details) {
         statusDiv.innerHTML += `<br><small style="color: #666;">${result.details}</small>`;
       }
       vllmUrlTested = true;
-      vllmUrlValid = false;
+      // Check if it's a "starting up" status even in error case
+      if (result.statusCode && [502, 503].includes(result.statusCode) && result.isStarting) {
+        vllmUrlValid = true; // Credentials work, service just starting
+      } else {
+        vllmUrlValid = false;
+      }
     }
   } catch (error) {
     statusDiv.innerHTML = `<span style="color: #f44336;">✗ Error: ${error.message}</span>`;
     vllmUrlTested = true;
     vllmUrlValid = false;
   } finally {
-    updatePrepareButton();
+    updateButtonStates();
   }
 }
 
-// Set up vLLM URL event listeners (called after functions are defined)
+// Set up Inference Server URL event listeners (called after functions are defined)
 function setupVLLMUrlListeners() {
   const vllmUrlInput = document.getElementById('vllmUrl');
   
@@ -700,14 +879,13 @@ async function prepareVLLM() {
   
   try {
     // Read directly from input fields to ensure we use current values
-    const vllmUrlInput = document.getElementById('vllmUrl');
     const sshHostInput = document.getElementById('sshHost');
     const sshPortInput = document.getElementById('sshPort');
     
     const vllmUrl = vllmUrlInput ? vllmUrlInput.value.trim() : '';
     
     if (!vllmUrl) {
-      showStatus('prepareStatus', '✗ Please enter vLLM HTTP API URL', 'error');
+      showStatus('prepareStatus', '✗ Please enter Inference Server HTTP API URL', 'error');
       return;
     }
     
@@ -767,8 +945,8 @@ async function prepareVLLM() {
   } catch (error) {
     showStatus('prepareStatus', '✗ Error: ' + error.message, 'error');
   } finally {
-    btn.disabled = false;
-    btn.textContent = 'Prepare vLLM with Selected Model';
+    updateButtonStates(); // This will set the correct disabled state
+    btn.textContent = 'Prepare Inference Server with Selected Model';
   }
 }
 
@@ -778,29 +956,38 @@ async function updateIncrementalSummary(newUserMessage, newAssistantResponse, cu
     console.log('\n[SUMMARY] ========================================');
     console.log('[SUMMARY] Updating conversation summary incrementally...');
     
-    // Build the summary update prompt
+    // Build the summary update prompt in a clear, structured way
     let summaryPrompt = '';
-    if (currentSummary && currentSummary.trim()) {
-      summaryPrompt = `Given the previous conversation summary:\n\n${currentSummary}\n\n`;
-    } else {
-      summaryPrompt = 'Starting a new conversation summary.\n\n';
-    }
-    
-    summaryPrompt += `And this new exchange:\n\nUser: ${newUserMessage}\n\nAssistant: ${newAssistantResponse}\n\n`;
-    summaryPrompt += `Please provide an updated summary that incorporates this new information`;
     
     if (currentSummary && currentSummary.trim()) {
-      summaryPrompt += ` while preserving important context from the previous summary`;
+      summaryPrompt = `Previous conversation summary:\n\n${currentSummary}\n\n`;
     }
     
-    summaryPrompt += `. Keep it concise (2-3 sentences). Focus on the main topics, decisions, and key information discussed.`;
+    // Get profile name for summary prompt
+    const profileName = (modelInfo && modelInfo.profileName) 
+      ? modelInfo.profileName 
+      : (selectedProfile && selectedProfile.name) 
+        ? selectedProfile.name 
+        : 'Assistant';
+    summaryPrompt += `New exchange:\n\nUser: ${newUserMessage}\n\n${profileName}: ${newAssistantResponse}\n\n`;
+    summaryPrompt += `Please provide an updated summary that:\n`;
+    summaryPrompt += `- Incorporates the new exchange above\n`;
+    
+    if (currentSummary && currentSummary.trim()) {
+      summaryPrompt += `- Preserves important context from the previous summary\n`;
+    }
+    
+    summaryPrompt += `- Is concise (2-3 sentences)\n`;
+    summaryPrompt += `- Focuses on main topics, decisions, and key information\n\n`;
+    summaryPrompt += `Updated summary:`;
     
     console.log('[SUMMARY] Summary update prompt:');
     console.log('----------------------------------------');
     console.log(summaryPrompt);
     console.log('----------------------------------------');
     
-    // Send summary generation request to vLLM
+    // Send summary generation request to inference server
+    // The sendChatMessage function will format it properly with system/user messages
     const summaryResult = await window.electronAPI.sendChatMessage({
       message: summaryPrompt,
       version: 'base', // Use base model for summary generation
@@ -824,9 +1011,14 @@ async function updateIncrementalSummary(newUserMessage, newAssistantResponse, cu
       console.error('[SUMMARY] Failed to generate summary:', summaryResult.error);
       // Fallback: create a simple summary from recent messages
       const recentMessages = conversationHistory.slice(-4); // Last 4 messages (2 exchanges)
+      const profileName = (modelInfo && modelInfo.profileName) 
+        ? modelInfo.profileName 
+        : (selectedProfile && selectedProfile.name) 
+          ? selectedProfile.name 
+          : 'Assistant';
       conversationSummary = recentMessages
         .map(m => {
-          const roleLabel = m.role === 'user' ? 'User' : 'Assistant';
+          const roleLabel = m.role === 'user' ? 'User' : profileName;
           const content = m.content.length > 150 ? m.content.substring(0, 150) + '...' : m.content;
           return `${roleLabel}: ${content}`;
         })
@@ -838,15 +1030,20 @@ async function updateIncrementalSummary(newUserMessage, newAssistantResponse, cu
     }
   } catch (error) {
     console.error('[SUMMARY] Error updating summary:', error);
-    // Fallback: create a simple summary from recent messages
-    const recentMessages = conversationHistory.slice(-4);
-    conversationSummary = recentMessages
-      .map(m => {
-        const roleLabel = m.role === 'user' ? 'User' : 'Assistant';
-        const content = m.content.length > 150 ? m.content.substring(0, 150) + '...' : m.content;
-        return `${roleLabel}: ${content}`;
-      })
-      .join('\n\n');
+      // Fallback: create a simple summary from recent messages
+      const recentMessages = conversationHistory.slice(-4);
+      const profileName = (modelInfo && modelInfo.profileName) 
+        ? modelInfo.profileName 
+        : (selectedProfile && selectedProfile.name) 
+          ? selectedProfile.name 
+          : 'Assistant';
+      conversationSummary = recentMessages
+        .map(m => {
+          const roleLabel = m.role === 'user' ? 'User' : profileName;
+          const content = m.content.length > 150 ? m.content.substring(0, 150) + '...' : m.content;
+          return `${roleLabel}: ${content}`;
+        })
+        .join('\n\n');
     
     // Save config to persist the error fallback summary
     saveConfig();
@@ -855,12 +1052,16 @@ async function updateIncrementalSummary(newUserMessage, newAssistantResponse, cu
 
 async function showChatInterface() {
   try {
+    console.log('[CHAT] Attempting to show chat interface...');
     // Get model info
     modelInfo = await window.electronAPI.getModelInfo();
+    console.log('[CHAT] Model info received:', modelInfo ? 'present' : 'null');
     if (!modelInfo) {
-      console.error('No model info available');
+      console.error('[CHAT] No model info available - cannot show chat interface');
+      showStatus('sshStatus', 'Error: Model info not available. Please check terminal logs.', 'error');
       return;
     }
+    console.log('[CHAT] Model info:', JSON.stringify(modelInfo, null, 2));
 
     // Populate version selector
     const versionSelect = document.getElementById('versionSelect');
@@ -909,7 +1110,19 @@ function addMessage(role, content, addToHistory = true) {
   
   const header = document.createElement('div');
   header.className = 'message-header';
-  header.textContent = role === 'user' ? 'You' : 'Assistant';
+  
+  // Use profile name for assistant messages, fallback to "Assistant" if no profile
+  if (role === 'user') {
+    header.textContent = 'You';
+  } else {
+    // Try to get profile name from modelInfo first, then selectedProfile
+    const profileName = (modelInfo && modelInfo.profileName) 
+      ? modelInfo.profileName 
+      : (selectedProfile && selectedProfile.name) 
+        ? selectedProfile.name 
+        : 'Assistant';
+    header.textContent = profileName;
+  }
   
   const contentDiv = document.createElement('div');
   contentDiv.className = 'message-content';
@@ -933,6 +1146,7 @@ function addMessage(role, content, addToHistory = true) {
 
 async function sendMessage() {
   const input = document.getElementById('chatInput');
+  // Get the user's actual typed message - this is what will be sent as the user message
   const message = input.value.trim();
   
   if (!message) {
@@ -940,14 +1154,21 @@ async function sendMessage() {
   }
 
   if (!modelInfo) {
-    alert('Model not prepared. Please prepare vLLM first.');
+    alert('Model not prepared. Please prepare the inference server first.');
     return;
   }
 
   const sendBtn = document.getElementById('sendBtn');
   const versionSelect = document.getElementById('versionSelect');
-  const prependedText = document.getElementById('prependedText').value.trim();
-  const useSummary = document.getElementById('useSummaryCheckbox').checked;
+  const systemMessage = document.getElementById('prependedText').value.trim();
+
+  // Log what we're sending to verify it's correct
+  console.log('[SEND] User message (exactly as typed):', message);
+  console.log('[SEND] Message length:', message.length);
+  console.log('[SEND] System message length:', systemMessage.length);
+  if (systemMessage.length > 1000) {
+    console.warn('[SEND] WARNING: System message is very long (' + systemMessage.length + ' chars). Make sure this is intentional.');
+  }
 
   // Disable input while sending
   input.disabled = true;
@@ -957,60 +1178,68 @@ async function sendMessage() {
   // Add user message to chat (display only, not in history yet)
   addMessage('user', message, false);
   
-  // Clear input
+  // Clear input immediately after capturing the message
   input.value = '';
 
   try {
+    // Fix 3: Normalize conversation history before sending to enforce strict role alternation
+    const normalizedHistory = normalizeConversation(conversationHistory);
+    
+    // Send ONLY the user's typed message - system message and summary are handled separately as system messages
+    // Conversation history is always sent (always enabled)
     const result = await window.electronAPI.sendChatMessage({
-      message: message,
+      message: message, // This is the user's actual typed message, nothing else
       version: versionSelect.value,
-      prependedText: prependedText,
-      useSummary: useSummary,
-      conversationSummary: conversationSummary,
-      conversationHistory: conversationHistory // Send full history
+      prependedText: systemMessage, // System message from user input
+      useSummary: false, // Always false - history is always enabled, no summary feature
+      conversationSummary: '', // Not used - history is always enabled
+      conversationHistory: normalizedHistory // Always send conversation history
     });
 
     if (result.success) {
-      // Add user message to history (matching what backend sent: structured format)
-      // The backend structures it as CONTEXT/SUMMARY/PROMPT, so we'll match that format
-      let userMessageContent = '';
-      const sections = [];
+      // Note: System messages are added per-request, not stored in history
+      // Only user and assistant messages are stored in conversation history
       
-      if (prependedText && prependedText.trim()) {
-        sections.push(`### CONTEXT ###\n\nSome context for you to know:\n${prependedText}`);
-      }
-      
-      if (useSummary && conversationSummary && conversationSummary.trim()) {
-        sections.push(`### SUMMARY ###\n\nWe've been talking about:\n${conversationSummary}`);
-      }
-      
-      sections.push(`### PROMPT ###\n\n${message}`);
-      userMessageContent = sections.join('\n\n');
-      
+      // Add user message to history (clean, without system message formatting)
       conversationHistory.push({
         role: 'user',
-        content: userMessageContent
+        content: message.trim()
       });
       
-      // Add assistant response
-      addMessage('assistant', result.response);
+      // Save config to persist conversation history
+      saveConfig();
       
-      // Add assistant response to history
-      conversationHistory.push({
-        role: 'assistant',
-        content: result.response
-      });
-      
-      // Update conversation summary if enabled (using LLM-based incremental approach)
-      if (useSummary) {
-        await updateIncrementalSummary(message, result.response, conversationSummary);
+      // Fix 1: Only append assistant messages with real content (non-empty)
+      const assistantText = result.response?.trim() ?? "";
+      if (assistantText.length > 0) {
+        // Add assistant response to UI
+        addMessage('assistant', assistantText);
+        
+        // Add assistant response to history (only if non-empty)
+        conversationHistory.push({
+          role: 'assistant',
+          content: assistantText
+        });
+        
+        // Save config to persist conversation history
+        saveConfig();
+      } else {
+        // Empty response - show in UI but don't add to history
+        addMessage('assistant', '(Empty response)');
+        console.warn('[CHAT] Received empty assistant response - not adding to history');
       }
     } else {
-      addMessage('assistant', 'Error: ' + (result.error || 'Unknown error'));
+      // Fix 2: Never append assistant messages on error - errors are out-of-band events
+      const errorMsg = result.error || 'Unknown error';
+      console.error('[CHAT] Chat error:', errorMsg);
+      addMessage('assistant', 'Error: ' + errorMsg);
+      // Do NOT mutate conversation history here - errors are not part of the conversation
     }
   } catch (error) {
-    console.error('Error sending message:', error);
+    // Fix 2: Never append assistant messages on error - errors are out-of-band events
+    console.error('[CHAT] Error sending message:', error);
     addMessage('assistant', 'Error: ' + error.message);
+    // Do NOT mutate conversation history here - errors are not part of the conversation
   } finally {
     input.disabled = false;
     sendBtn.disabled = false;
@@ -1019,31 +1248,34 @@ async function sendMessage() {
   }
 }
 
-function updatePrepareButton() {
-  const btn = document.getElementById('prepareBtn');
-  const canPrepare = selectedProfile && 
-                     sshConfig.host && 
-                     sshTested && 
-                     vllmUrlTested && 
-                     vllmUrlValid &&
-                     profileVersions.length > 0;
+// Update all button states based on profile selection
+function updateButtonStates() {
+  const hasProfile = !!selectedProfile;
   
-  btn.disabled = !canPrepare;
-  
-  if (!selectedProfile) {
-    btn.title = 'Please select a profile first';
-  } else if (!sshConfig.host || !sshTested) {
-    btn.title = 'Please test SSH connection first';
-  } else if (!vllmUrlTested || !vllmUrlValid) {
-    btn.title = 'Please test vLLM URL first';
-  } else if (profileVersions.length === 0) {
-    btn.title = 'No versions available for this profile';
-  } else {
-    btn.title = '';
+  // Update Initialize Inference Environment button
+  const testSSHBtn = document.getElementById('testSSHBtn');
+  if (testSSHBtn) {
+    testSSHBtn.disabled = !hasProfile;
+    if (!hasProfile) {
+      testSSHBtn.title = 'Please select a model profile first';
+    } else {
+      testSSHBtn.title = '';
+    }
   }
   
-  btn.disabled = !canPrepare;
+  // Update Send button
+  const sendBtn = document.getElementById('sendBtn');
+  if (sendBtn) {
+    sendBtn.disabled = !hasProfile;
+    if (!hasProfile) {
+      sendBtn.title = 'Please select a model profile first';
+    } else {
+      sendBtn.title = '';
+    }
+  }
+  
 }
+
 
 function showStatus(elementId, message, type) {
   const element = document.getElementById(elementId);

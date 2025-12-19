@@ -1,20 +1,20 @@
-# Anvil ChatBot - vLLM Setup Companion App
+# Anvil ChatBot - Inference Server Setup Companion App
 
-This Electron app is a companion to the main Anvil application. It helps you set up and manage vLLM on remote Vast.ai instances with your trained models.
+This Electron app is a companion to the main Anvil application. It helps you set up and manage a FastAPI inference server on remote Vast.ai instances with your trained models.
 
 ## Features
 
 - **Profile Selection**: Select a model profile from the parent Anvil app
-- **SSH Configuration**: Configure and test SSH connection to your Vast.ai instance
+- **Inference Environment Initialization**: Comprehensive setup that tests SSH, installs dependencies, downloads models, uploads adapters, and configures the inference server
 - **Version Management**: View all available model versions for the selected profile
-- **vLLM Preparation**: Upload model adapters and prepare vLLM configuration
+- **Inference Server Preparation**: Upload model adapters and prepare FastAPI inference server configuration
 
 ## Prerequisites
 
 1. **Node.js and npm** installed on your system
 2. **SSH keys** configured for connecting to Vast.ai instances (typically in `~/.ssh/id_rsa`)
 3. **Parent Anvil app** with at least one model profile created
-4. **vLLM** already running on the target Vast.ai instance
+4. **FastAPI Inference Server** will be started automatically on the target Vast.ai instance
 
 ## Installation
 
@@ -60,15 +60,21 @@ This Electron app is a companion to the main Anvil application. It helps you set
 3. **Configure SSH**:
    - Enter the SSH host/IP address of your Vast.ai instance
    - Enter the SSH port (default: 22)
-   - Click "Test SSH Connection" to verify connectivity
+   - Click "Initialize Inference Environment" to set up SSH, install dependencies, download models, upload adapters, and start the inference server
 
-4. **Prepare vLLM**:
-   - Once SSH is tested successfully, click "Prepare vLLM with Selected Model"
+4. **Configure Inference Server URL**:
+   - Enter the HTTP API URL for your inference server (e.g., `http://your-server-ip:8000`)
+   - Click the test button to verify connectivity
+   - The app will automatically retrieve authentication tokens if needed
+
+5. **Prepare Inference Server**:
+   - Once SSH and URL are tested successfully, click "Prepare Inference Server with Selected Model"
    - The app will:
-     - Check if vLLM is running
+     - Upload the inference server script to the remote instance
      - Create remote model directories
      - Upload all version adapters
-     - Create preparation scripts and model info files
+     - Configure and start the FastAPI inference server via supervisor
+     - Monitor server startup and model loading
 
 ## How It Works
 
@@ -76,7 +82,8 @@ This Electron app is a companion to the main Anvil application. It helps you set
 2. **Version Detection**: Scans for version directories (V1, V2, etc.) and their adapter weights
 3. **SSH Connection**: Uses NodeSSH library to connect via SSH (requires SSH keys)
 4. **File Upload**: Transfers adapter directories to the remote instance
-5. **vLLM Setup**: Creates scripts and configuration files for vLLM usage
+5. **Inference Server Setup**: Uploads FastAPI server script and configures supervisor to run it
+6. **Server Management**: Uses supervisor to manage the inference server process
 
 ## Remote Directory Structure
 
@@ -92,27 +99,30 @@ After preparation, the remote instance will have:
 ├── V2/
 │   └── adapter/
 │       └── ...
-├── prepare_vllm.sh
 └── model_info.json
 ```
 
-## vLLM Integration
+## Inference Server Integration
 
-The app creates a `prepare_vllm.sh` script with example commands for using the models with vLLM. You can use the adapters with vLLM's LoRA support:
+The app uploads a FastAPI inference server (`utils/inference_server.py`) that automatically loads:
+- The base model (specified in the profile)
+- All available adapter versions (V1, V2, etc.) from `/workspace/models/{profileName}/V*/adapter`
 
-```bash
-vllm serve {baseModel} \
-  --enable-lora \
-  --lora-modules adapter1=/workspace/models/{profileName}/V1/adapter \
-                 adapter2=/workspace/models/{profileName}/V2/adapter
-```
+The server exposes REST API endpoints:
+- `GET /health` - Health check endpoint
+- `GET /models` - List available models
+- `POST /chat` - Chat completion endpoint
+
+The server is managed by supervisor and automatically loads models on startup.
 
 ## Troubleshooting
 
 - **SSH Connection Fails**: Ensure SSH keys are configured in Vast.ai account settings
-- **vLLM Not Running**: Start vLLM on the instance before running preparation
+- **Inference Server Not Starting**: Check supervisor logs with `supervisorctl tail -200 inference`
 - **No Profiles Found**: Make sure the parent Anvil app has created at least one model profile
 - **Upload Fails**: Check disk space on the remote instance and network connectivity
+- **Model Loading Fails**: Verify the base model name is correct and accessible from HuggingFace
+- **Authentication Errors**: The app automatically retrieves `OPEN_BUTTON_TOKEN` for Basic Auth
 
 ## SSH Key Configuration
 
@@ -141,5 +151,7 @@ The app will display which SSH key is being used in the SSH Configuration sectio
 
 - The app uses the Vast.ai API key from the parent app's `app_config.json` (for future features)
 - SSH authentication uses the SSH key from parent app config or default locations
-- The app assumes vLLM is already running - it only prepares the model files, not the vLLM service itself
+- The app automatically starts and manages the FastAPI inference server via supervisor
+- The inference server uses PEFT (Parameter-Efficient Fine-Tuning) to load adapters on top of the base model
+- Models are loaded on server startup - first startup may take several minutes for large models
 

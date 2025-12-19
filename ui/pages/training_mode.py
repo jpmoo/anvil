@@ -29,6 +29,69 @@ def filter_malloc_warnings(text):
     return '\n'.join(filtered_lines)
 
 
+def get_ssh_base_options(ssh_port: int) -> list:
+    """
+    Get base SSH command options that prevent interactive prompts.
+    This handles firewall prompts and host key verification automatically.
+    
+    Args:
+        ssh_port: SSH port number
+        
+    Returns:
+        List of SSH command arguments (port and options)
+    """
+    return [
+        "-p", str(ssh_port),
+        "-o", "StrictHostKeyChecking=no",
+        "-o", "UserKnownHostsFile=/dev/null",
+        "-o", "BatchMode=yes",
+        "-o", "ConnectTimeout=10"
+    ]
+
+
+def run_ssh_command(ssh_host: str, ssh_port: int, command: str, timeout: int = 30, 
+                    terminal_output: list = None, input_text: str = None) -> subprocess.CompletedProcess:
+    """
+    Run an SSH command with automatic prompt handling.
+    Automatically answers "yes" to any prompts from firewalls or host verification.
+    
+    Args:
+        ssh_host: SSH hostname
+        ssh_port: SSH port
+        command: Command to execute on remote host
+        timeout: Command timeout in seconds
+        terminal_output: Optional list to append output messages to
+        input_text: Optional input to pipe to stdin (defaults to "yes\n" for prompts)
+        
+    Returns:
+        CompletedProcess result from subprocess.run
+    """
+    ssh_cmd = [
+        "ssh"
+    ] + get_ssh_base_options(ssh_port) + [
+        f"root@{ssh_host}",
+        command
+    ]
+    
+    # Default input to "yes\n" to handle any prompts
+    if input_text is None:
+        input_text = "yes\n"
+    
+    try:
+        result = subprocess.run(
+            ssh_cmd,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            input=input_text
+        )
+        return result
+    except subprocess.TimeoutExpired:
+        if terminal_output:
+            terminal_output.append(f"[SSH] Command timed out after {timeout}s")
+        raise
+
+
 def kill_all_training_processes(ssh_host: str, ssh_port: int, terminal_output: list, max_retries: int = 5) -> bool:
     """
     Kill all training-related processes on the remote instance.
@@ -87,13 +150,14 @@ def kill_all_training_processes(ssh_host: str, ssh_port: int, terminal_output: l
         )
         
         kill_cmd = [
-            "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
+            "ssh"
+        ] + get_ssh_base_options(ssh_port) + [
             f"root@{ssh_host}",
             kill_command
         ]
         
         try:
-            kill_result = subprocess.run(kill_cmd, capture_output=True, text=True, timeout=30)
+            kill_result = subprocess.run(kill_cmd, capture_output=True, text=True, timeout=30, input="yes\n")
             stdout_filtered = filter_malloc_warnings(kill_result.stdout)
             stderr_filtered = filter_malloc_warnings(kill_result.stderr)
             
@@ -116,11 +180,12 @@ def kill_all_training_processes(ssh_host: str, ssh_port: int, terminal_output: l
                     terminal_output.append(f"[SSH] ✓ Kill command completed")
                     # Verify by checking processes again
                     verify_cmd = [
-                        "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
+                        "ssh"
+                    ] + get_ssh_base_options(ssh_port) + [
                         f"root@{ssh_host}",
                         "ps aux | grep -E 'accelerate|axolotl|axolotl.cli.train' | grep -v grep | wc -l"
                     ]
-                    verify_result = subprocess.run(verify_cmd, capture_output=True, text=True, timeout=15)
+                    verify_result = subprocess.run(verify_cmd, capture_output=True, text=True, timeout=15, input="yes\n")
                     if verify_result.returncode == 0:
                         remaining = int(verify_result.stdout.strip())
                         if remaining == 0:
@@ -144,12 +209,13 @@ def kill_all_training_processes(ssh_host: str, ssh_port: int, terminal_output: l
     all_clear = False
     for verify_attempt in range(3):
         verify_cmd = [
-            "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
+            "ssh"
+        ] + get_ssh_base_options(ssh_port) + [
             f"root@{ssh_host}",
             "ps aux | grep -E 'accelerate|axolotl|axolotl.cli.train' | grep -v grep"
         ]
         try:
-            verify_result = subprocess.run(verify_cmd, capture_output=True, text=True, timeout=15)
+            verify_result = subprocess.run(verify_cmd, capture_output=True, text=True, timeout=15, input="yes\n")
             if verify_result.returncode == 0 and verify_result.stdout.strip():
                 # There are still processes
                 process_lines = verify_result.stdout.strip().split('\n')
@@ -158,7 +224,8 @@ def kill_all_training_processes(ssh_host: str, ssh_port: int, terminal_output: l
                     time.sleep(3)
                     # Try one more aggressive kill
                     final_kill_cmd = [
-                        "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
+                        "ssh"
+        ] + get_ssh_base_options(ssh_port) + [
                         f"root@{ssh_host}",
                         "pkill -9 -f 'accelerate' 2>/dev/null || true; "
                         "pkill -9 -f 'axolotl' 2>/dev/null || true; "
@@ -166,7 +233,7 @@ def kill_all_training_processes(ssh_host: str, ssh_port: int, terminal_output: l
                         "  (xargs -r kill -9 2>/dev/null || xargs kill -9 2>/dev/null || true); "
                         "sleep 2"
                     ]
-                    subprocess.run(final_kill_cmd, capture_output=True, text=True, timeout=20)
+                    subprocess.run(final_kill_cmd, capture_output=True, text=True, timeout=20, input="yes\n")
                 else:
                     # Last attempt - show details
                     terminal_output.append(f"[SSH] ⚠️ WARNING: {len(process_lines)} training process(es) still running after all kill attempts:")
@@ -1318,7 +1385,8 @@ def render():
                                 if ssh_host:
                                     terminal_output.append(f"[SSH] Cleaning up old training files on instance...")
                                     cleanup_cmd = [
-                                        "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
+                                        "ssh"
+        ] + get_ssh_base_options(ssh_port) + [
                                         f"root@{ssh_host}",
                                         "cd /workspace/data && "
                                         "echo 'Cleaning up all old training files...' && "
@@ -1332,7 +1400,7 @@ def render():
                                         "echo 'Cleanup complete' && "
                                         "ls -la /workspace/data/ 2>/dev/null | grep -E '(training_data|axolotl_config)' || echo 'No training files found (clean)'"
                                     ]
-                                    cleanup_result = subprocess.run(cleanup_cmd, capture_output=True, text=True, timeout=30)
+                                    cleanup_result = subprocess.run(cleanup_cmd, capture_output=True, text=True, timeout=30, input="yes\n")
                                     if cleanup_result.returncode == 0:
                                         terminal_output.append(f"[SUCCESS] Old files cleaned up on instance")
                                         if cleanup_result.stdout:
@@ -1749,7 +1817,8 @@ def render():
                                     # Clean up old files before starting Phase 2
                                     terminal_output.append(f"[SSH] Phase 2: Cleaning up old training files...")
                                     cleanup_cmd = [
-                                        "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
+                                        "ssh"
+        ] + get_ssh_base_options(ssh_port) + [
                                         f"root@{ssh_host}",
                                         "cd /workspace/data && "
                                         "echo 'Cleaning up old training files...' && "
@@ -1760,7 +1829,7 @@ def render():
                                         "echo 'Old files cleaned up' && "
                                         "ls -la /workspace/data/ 2>/dev/null | grep -E '(training_data|axolotl_config)' || echo 'No training files found (clean)'"
                                     ]
-                                    cleanup_result = subprocess.run(cleanup_cmd, capture_output=True, text=True, timeout=30)
+                                    cleanup_result = subprocess.run(cleanup_cmd, capture_output=True, text=True, timeout=30, input="yes\n")
                                     if cleanup_result.returncode == 0:
                                         terminal_output.append(f"[SSH] Old files cleaned up successfully")
                                         if cleanup_result.stdout:
@@ -1804,7 +1873,8 @@ def render():
                                     # Clean up old files before starting Phase 2
                                     terminal_output.append(f"[SSH] Cleaning up old training files...")
                                     cleanup_cmd = [
-                                        "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
+                                        "ssh"
+        ] + get_ssh_base_options(ssh_port) + [
                                         f"root@{ssh_host}",
                                         "cd /workspace/data && "
                                         "echo 'Cleaning up old training files...' && "
@@ -1815,7 +1885,7 @@ def render():
                                         "echo 'Old files cleaned up' && "
                                         "ls -la /workspace/data/ 2>/dev/null | grep -E '(training_data|axolotl_config)' || echo 'No training files found (clean)'"
                                     ]
-                                    cleanup_result = subprocess.run(cleanup_cmd, capture_output=True, text=True, timeout=30)
+                                    cleanup_result = subprocess.run(cleanup_cmd, capture_output=True, text=True, timeout=30, input="yes\n")
                                     if cleanup_result.returncode == 0:
                                         terminal_output.append(f"[SSH] Old files cleaned up successfully")
                                         if cleanup_result.stdout:
@@ -1828,11 +1898,12 @@ def render():
                                     # Test SSH connection
                                     import subprocess
                                     test_cmd = [
-                                        "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
+                                        "ssh"
+        ] + get_ssh_base_options(ssh_port) + [
                                         f"root@{ssh_host}",
                                         "echo 'SSH connection test'"
                                     ]
-                                    test_result = subprocess.run(test_cmd, capture_output=True, text=True, timeout=15)
+                                    test_result = subprocess.run(test_cmd, capture_output=True, text=True, timeout=15, input="yes\n")
                                     if test_result.returncode == 0:
                                         terminal_output.append(f"[SSH] Connection test successful")
                                     else:
@@ -1850,14 +1921,12 @@ def render():
                                             time.sleep(wait_time)
                                         
                                         mkdir_cmd = [
-                                            "ssh", "-p", str(ssh_port), 
-                                            "-o", "StrictHostKeyChecking=no", 
-                                            "-o", "ConnectTimeout=30",
-                                            "-o", "UserKnownHostsFile=/dev/null",
+                                            "ssh"
+                                        ] + get_ssh_base_options(ssh_port) + [
                                             f"root@{ssh_host}",
                                             "echo 'Deleting output directory...' && rm -rf /workspace/output 2>&1 && echo 'Output directory deleted' && mkdir -p /workspace/data && mkdir -p /workspace/output/training && echo 'Directories recreated' && ls -la /workspace/output/ 2>&1 && echo 'Output directories forcefully deleted and recreated'"
                                         ]
-                                        mkdir_result = subprocess.run(mkdir_cmd, capture_output=True, text=True, timeout=30)
+                                        mkdir_result = subprocess.run(mkdir_cmd, capture_output=True, text=True, timeout=30, input="yes\n")
                                         if mkdir_result.returncode == 0:
                                             terminal_output.append(f"[SSH] ✓ Output directories forcefully deleted and recreated")
                                             stdout_filtered = filter_malloc_warnings(mkdir_result.stdout)
@@ -1869,11 +1938,12 @@ def render():
                                             # Check for onstart errors in Phase 2
                                             try:
                                                 check_onstart_cmd = [
-                                                    "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
+                                                    "ssh"
+        ] + get_ssh_base_options(ssh_port) + [
                                                     f"root@{ssh_host}",
                                                     "tail -30 /var/log/onstart.log 2>/dev/null || tail -30 /tmp/onstart.log 2>/dev/null || echo 'no_onstart_log'"
                                                 ]
-                                                onstart_check = subprocess.run(check_onstart_cmd, capture_output=True, text=True, timeout=15)
+                                                onstart_check = subprocess.run(check_onstart_cmd, capture_output=True, text=True, timeout=15, input="yes\n")
                                                 if "no_onstart_log" not in onstart_check.stdout and onstart_check.stdout.strip():
                                                     onstart_content = onstart_check.stdout.lower()
                                                     # Check for critical errors
@@ -2082,12 +2152,13 @@ def render():
                                             # Check if directories already exist (from auto-init)
                                             # If not, create them
                                             check_dirs_cmd = [
-                                                "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
+                                                "ssh"
+        ] + get_ssh_base_options(ssh_port) + [
                                                 f"root@{ssh_host}",
                                                 "test -d /workspace/data && test -d /workspace/output/training && echo 'exists' || echo 'missing'"
                                             ]
                                             import subprocess
-                                            check_result = subprocess.run(check_dirs_cmd, capture_output=True, text=True, timeout=15)
+                                            check_result = subprocess.run(check_dirs_cmd, capture_output=True, text=True, timeout=15, input="yes\n")
                                             
                                             if "exists" not in check_result.stdout:
                                                 # Directories don't exist, create them with retry logic
@@ -2109,7 +2180,7 @@ def render():
                                                         f"root@{ssh_host}",
                                                         "echo 'Deleting output directory...' && rm -rf /workspace/output 2>&1 && echo 'Output directory deleted' && mkdir -p /workspace/data && mkdir -p /workspace/output/training && echo 'Directories recreated' && ls -la /workspace/output/ 2>&1 && echo 'Output directories forcefully deleted and recreated'"
                                                     ]
-                                                    mkdir_result = subprocess.run(mkdir_cmd, capture_output=True, text=True, timeout=30)
+                                                    mkdir_result = subprocess.run(mkdir_cmd, capture_output=True, text=True, timeout=30, input="yes\n")
                                                     if mkdir_result.returncode == 0:
                                                         terminal_output.append(f"[SSH] ✓ Output directories forcefully deleted and recreated")
                                                         stdout_filtered = filter_malloc_warnings(mkdir_result.stdout)
@@ -2241,7 +2312,7 @@ def render():
                                                                 terminal_output.append(f"[SCP] Retry {retry}/3 after {wait_time}s wait...")
                                                                 time.sleep(wait_time)
                                                             
-                                                            scp_config_result = subprocess.run(scp_config_cmd, capture_output=True, text=True, timeout=300)
+                                                            scp_config_result = subprocess.run(scp_config_cmd, capture_output=True, text=True, timeout=300, input="yes\n")
                                                             if scp_config_result.returncode == 0:
                                                                 job_config_uploaded = True
                                                                 config_upload_success = True
@@ -2297,7 +2368,7 @@ def render():
                                                                 terminal_output.append(f"[SCP] Retry {retry}/3 after {wait_time}s wait...")
                                                                 time.sleep(wait_time)
                                                             
-                                                            scp_result = subprocess.run(scp_cmd, capture_output=True, text=True, timeout=300)
+                                                            scp_result = subprocess.run(scp_cmd, capture_output=True, text=True, timeout=300, input="yes\n")
                                                             if scp_result.returncode == 0:
                                                                 job_dataset_uploaded = True
                                                                 dataset_upload_success = True
@@ -2447,7 +2518,7 @@ def render():
                                                     f"root@{ssh_host}",
                                                     "rm -rf /workspace/data/* /workspace/output/training/* && echo 'Cleanup complete'"
                                                 ]
-                                                cleanup_result = subprocess.run(cleanup_cmd, capture_output=True, text=True, timeout=30)
+                                                cleanup_result = subprocess.run(cleanup_cmd, capture_output=True, text=True, timeout=30, input="yes\n")
                                                 if cleanup_result.returncode == 0:
                                                     terminal_output.append(f"[SSH] Files and directories deleted successfully")
                                                     cleanup_success = True
@@ -2475,7 +2546,7 @@ def render():
                                                     f"root@{ssh_host}",
                                                     "mkdir -p /workspace/data && mkdir -p /workspace/output/training && echo 'Directories recreated'"
                                                 ]
-                                                mkdir_result = subprocess.run(mkdir_cmd, capture_output=True, text=True, timeout=30)
+                                                mkdir_result = subprocess.run(mkdir_cmd, capture_output=True, text=True, timeout=30, input="yes\n")
                                                 if mkdir_result.returncode == 0:
                                                     terminal_output.append(f"[SSH] Directories recreated successfully")
                                                     mkdir_success = True
@@ -2594,7 +2665,8 @@ def render():
                                 # Clean up old numbered files (single job uses active files, no numbered files needed)
                                 terminal_output.append(f"[SSH] Cleaning up old numbered training files (keeping active files)...")
                                 cleanup_cmd = [
-                                    "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
+                                    "ssh"
+        ] + get_ssh_base_options(ssh_port) + [
                                     f"root@{ssh_host}",
                                     f"cd /workspace/data && "
                                     f"echo 'Cleaning up old numbered training files...' && "
@@ -2614,7 +2686,7 @@ def render():
                                     f"echo 'Cleanup complete' && "
                                     f"ls -la /workspace/data/ 2>/dev/null | grep -E '(training_data|axolotl_config)' || echo 'No training files found'"
                                 ]
-                                cleanup_result = subprocess.run(cleanup_cmd, capture_output=True, text=True, timeout=30)
+                                cleanup_result = subprocess.run(cleanup_cmd, capture_output=True, text=True, timeout=30, input="yes\n")
                                 if cleanup_result.returncode == 0:
                                     terminal_output.append(f"[SSH] Old files cleaned up successfully")
                                     if cleanup_result.stdout:
@@ -2631,7 +2703,8 @@ def render():
                                 expected_data_name = "training_data.jsonl"
                                 
                                 check_files_cmd = [
-                                    "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
+                                    "ssh"
+        ] + get_ssh_base_options(ssh_port) + [
                                     f"root@{ssh_host}",
                                     f"cd /workspace/data && "
                                     f"if [ -f {expected_config_name} ] && [ -f {expected_data_name} ]; then "
@@ -2647,7 +2720,7 @@ def render():
                                     f"  echo 'FILES_MISSING'; "
                                     f"fi"
                                 ]
-                                check_result = subprocess.run(check_files_cmd, capture_output=True, text=True, timeout=15)
+                                check_result = subprocess.run(check_files_cmd, capture_output=True, text=True, timeout=15, input="yes\n")
                                 if "FILES_MISSING" in check_result.stdout:
                                     terminal_output.append(f"[ERROR] Training files ({expected_config_name}, {expected_data_name}) are missing!")
                                     st.error("❌ Training files are missing. Please re-upload files in Phase 2.")
@@ -2861,11 +2934,12 @@ def render():
                                         f"PYTHON_EOF"
                                     )
                                     fix_config_cmd = [
-                                        "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
+                                        "ssh"
+        ] + get_ssh_base_options(ssh_port) + [
                                         f"root@{ssh_host}",
                                         fix_config_remote_cmd
                                     ]
-                                    fix_config_result = subprocess.run(fix_config_cmd, capture_output=True, text=True, timeout=30)
+                                    fix_config_result = subprocess.run(fix_config_cmd, capture_output=True, text=True, timeout=30, input="yes\n")
                                     
                                     if fix_config_result.returncode == 0:
                                         stdout_filtered = filter_malloc_warnings(fix_config_result.stdout)
@@ -2979,11 +3053,12 @@ def render():
                                 if yaml_to_check:
                                     terminal_output.append(f"[YAML DEBUG] Checking for YAML file on remote: {yaml_to_check}")
                                     check_yaml_cmd = [
-                                        "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
+                                        "ssh"
+        ] + get_ssh_base_options(ssh_port) + [
                                         f"root@{ssh_host}",
                                         f"test -f /workspace/data/{yaml_to_check} && echo 'found' || echo 'not_found'"
                                     ]
-                                    yaml_check_result = subprocess.run(check_yaml_cmd, capture_output=True, text=True, timeout=15)
+                                    yaml_check_result = subprocess.run(check_yaml_cmd, capture_output=True, text=True, timeout=15, input="yes\n")
                                     if "found" in yaml_check_result.stdout:
                                         yaml_found_on_remote = True
                                         yaml_file_path = f"/workspace/data/{yaml_to_check}"
@@ -2998,7 +3073,8 @@ def render():
                                 
                                 # Also check config file to see if it references YAML settings
                                 check_config_cmd = [
-                                    "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
+                                    "ssh"
+        ] + get_ssh_base_options(ssh_port) + [
                                     f"root@{ssh_host}",
                                     "test -f /workspace/data/axolotl_config.yaml && cat /workspace/data/axolotl_config.yaml | head -50 || echo 'config_not_found'"
                                 ]
@@ -3055,7 +3131,8 @@ def render():
                             
                             if ssh_host:
                                 lora_verify_cmd = [
-                                    "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
+                                    "ssh"
+        ] + get_ssh_base_options(ssh_port) + [
                                     f"root@{ssh_host}",
                                     "cd /workspace/data && python3 << 'PYTHON_EOF'\n"
                                     "import yaml\n"
@@ -3129,7 +3206,7 @@ def render():
                                     "    print(f'ERROR: {str(e)}')\n"
                                     "PYTHON_EOF"
                                 ]
-                                lora_verify_result = subprocess.run(lora_verify_cmd, capture_output=True, text=True, timeout=20)
+                                lora_verify_result = subprocess.run(lora_verify_cmd, capture_output=True, text=True, timeout=20, input="yes\n")
                                 if lora_verify_result.returncode == 0:
                                     verify_output = lora_verify_result.stdout.strip()
                                     if "LORA_VERIFICATION:" in verify_output:
@@ -3203,11 +3280,12 @@ def render():
                         if ssh_host:
                             try:
                                 check_process_cmd = [
-                                    "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
+                                    "ssh"
+        ] + get_ssh_base_options(ssh_port) + [
                                     f"root@{ssh_host}",
                                     "ps aux | grep -E '(accelerate|axolotl.cli.train)' | grep -v grep | wc -l"
                                 ]
-                                process_check_result = subprocess.run(check_process_cmd, capture_output=True, text=True, timeout=10)
+                                process_check_result = subprocess.run(check_process_cmd, capture_output=True, text=True, timeout=10, input="yes\n")
                                 if process_check_result.returncode == 0:
                                     process_count = int(process_check_result.stdout.strip())
                                     processes_actually_running = process_count > 0
@@ -3284,7 +3362,7 @@ def render():
                                                     str(weights_path),
                                                     f"root@{ssh_host}:/workspace/previous_adapter"
                                                 ]
-                                                upload_result = subprocess.run(upload_weights_cmd, capture_output=True, text=True, timeout=300)
+                                                upload_result = subprocess.run(upload_weights_cmd, capture_output=True, text=True, timeout=300, input="yes\n")
                                                 if upload_result.returncode == 0:
                                                     terminal_output.append(f"[PRIOR WEIGHTS] ✓ Uploaded previous version weights to /workspace/previous_adapter")
                                                     if upload_result.stdout:
@@ -3292,7 +3370,8 @@ def render():
                                                     
                                                     # Update config file to use the adapter
                                                     update_config_cmd = [
-                                                        "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
+                                                        "ssh"
+        ] + get_ssh_base_options(ssh_port) + [
                                                         f"root@{ssh_host}",
                                                         f"cd /workspace/data && "
                                                         f"python3 << 'PYTHON_EOF'\n"
@@ -3338,7 +3417,8 @@ def render():
                                         
                                         # Check for active files (single job, no suffix)
                                         check_active_cmd = [
-                                            "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
+                                            "ssh"
+        ] + get_ssh_base_options(ssh_port) + [
                                             f"root@{ssh_host}",
                                             f"cd /workspace/data && "
                                             f"if [ -f axolotl_config.yaml ] && [ -f training_data.jsonl ]; then "
@@ -3357,7 +3437,7 @@ def render():
                                             f"  ls -la axolotl_config.yaml training_data.jsonl 2>&1 || echo 'Files not found'; "
                                             f"fi"
                                         ]
-                                        check_result = subprocess.run(check_active_cmd, capture_output=True, text=True, timeout=15)
+                                        check_result = subprocess.run(check_active_cmd, capture_output=True, text=True, timeout=15, input="yes\n")
                                         if "ACTIVE_MISSING" in check_result.stdout:
                                             terminal_output.append(f"[ERROR] Training files (axolotl_config.yaml, training_data.jsonl) are missing!")
                                             if check_result.stdout:
@@ -3389,11 +3469,12 @@ def render():
                                         # Check if files exist
                                         import subprocess
                                         check_files_cmd = [
-                                            "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
+                                            "ssh"
+        ] + get_ssh_base_options(ssh_port) + [
                                             f"root@{ssh_host}",
                                             "test -f /workspace/data/axolotl_config.yaml && test -f /workspace/data/training_data.jsonl && echo 'files_exist' || echo 'files_missing'"
                                         ]
-                                        files_check = subprocess.run(check_files_cmd, capture_output=True, text=True, timeout=15)
+                                        files_check = subprocess.run(check_files_cmd, capture_output=True, text=True, timeout=15, input="yes\n")
                                         
                                         if "files_exist" in files_check.stdout:
                                             terminal_output.append(f"[SSH] Training files found - setting up environment...")
@@ -3401,11 +3482,12 @@ def render():
                                             # Check if there's already a training process running
                                             # Check for existing processes
                                             check_processes_cmd = [
-                                                "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
+                                                "ssh"
+        ] + get_ssh_base_options(ssh_port) + [
                                                 f"root@{ssh_host}",
                                                 "ps aux | grep -E '(accelerate|axolotl|train)' | grep -v grep | head -5 || echo 'no_processes'"
                                             ]
-                                            check_processes_result = subprocess.run(check_processes_cmd, capture_output=True, text=True, timeout=15)
+                                            check_processes_result = subprocess.run(check_processes_cmd, capture_output=True, text=True, timeout=15, input="yes\n")
                                             
                                             has_existing_process = "no_processes" not in check_processes_result.stdout and check_processes_result.stdout.strip()
                                             
@@ -3422,18 +3504,20 @@ def render():
                                             # Clean output directory
                                             terminal_output.append(f"[SSH] Cleaning output directory...")
                                             cleanup_cmd = [
-                                                "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
+                                                "ssh"
+        ] + get_ssh_base_options(ssh_port) + [
                                                 f"root@{ssh_host}",
                                                 "rm -rf /workspace/output/training/* && echo 'Output directory cleaned'"
                                             ]
-                                            cleanup_result = subprocess.run(cleanup_cmd, capture_output=True, text=True, timeout=30)
+                                            cleanup_result = subprocess.run(cleanup_cmd, capture_output=True, text=True, timeout=30, input="yes\n")
                                             if cleanup_result.returncode == 0:
                                                 terminal_output.append(f"[SSH] Output directory cleaned")
                                             
                                             # FINAL VERIFICATION: Check files exist and are valid right before starting training
                                             terminal_output.append(f"[SSH] Final verification: Checking files exist and are valid before starting training...")
                                             final_verify_cmd = [
-                                                "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
+                                                "ssh"
+        ] + get_ssh_base_options(ssh_port) + [
                                                 f"root@{ssh_host}",
                                                 f"cd /workspace/data && "
                                                 f"echo '=== FINAL FILE VERIFICATION ===' && "
@@ -3456,7 +3540,7 @@ def render():
                                                 f"echo 'File sizes: config=$config_size bytes, data=$data_size bytes' && "
                                                 f"echo '=== VERIFICATION PASSED ==='"
                                             ]
-                                            final_verify_result = subprocess.run(final_verify_cmd, capture_output=True, text=True, timeout=15)
+                                            final_verify_result = subprocess.run(final_verify_cmd, capture_output=True, text=True, timeout=15, input="yes\n")
                                             if final_verify_result.returncode != 0:
                                                 terminal_output.append(f"[ERROR] Final verification FAILED!")
                                                 if final_verify_result.stdout:
@@ -3482,7 +3566,8 @@ def render():
                                             # Verify config file points to correct dataset path
                                             terminal_output.append(f"[SSH] Verifying config file points to correct dataset path...")
                                             verify_config_cmd = [
-                                                "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
+                                                "ssh"
+        ] + get_ssh_base_options(ssh_port) + [
                                                 f"root@{ssh_host}",
                                                 f"cd /workspace/data && "
                                                 f"python3 << 'PYTHON_EOF'\n"
@@ -3532,7 +3617,7 @@ def render():
                                                 f"    sys.exit(1)\n"
                                                 f"PYTHON_EOF"
                                             ]
-                                            verify_config_result = subprocess.run(verify_config_cmd, capture_output=True, text=True, timeout=15)
+                                            verify_config_result = subprocess.run(verify_config_cmd, capture_output=True, text=True, timeout=15, input="yes\n")
                                             if verify_config_result.returncode != 0:
                                                 terminal_output.append(f"[ERROR] Config verification FAILED!")
                                                 if verify_config_result.stdout:
@@ -3559,7 +3644,8 @@ def render():
                                             # This prevents multipack sampler IndexError issues
                                             terminal_output.append(f"[SSH] Ensuring sample_packing is disabled...")
                                             fix_sample_packing_cmd = [
-                                                "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
+                                                "ssh"
+        ] + get_ssh_base_options(ssh_port) + [
                                                 f"root@{ssh_host}",
                                                 f"cd /workspace/data && "
                                                 f"python3 << 'PYTHON_EOF'\n"
@@ -3650,7 +3736,8 @@ REMOTE_SCRIPT"""
                                             terminal_output.append(f"[DEBUG]   accelerate launch -m axolotl.cli.train /workspace/data/axolotl_config.yaml")
                                             
                                             training_cmd = [
-                                                "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
+                                                "ssh"
+        ] + get_ssh_base_options(ssh_port) + [
                                                 "-o", "ServerAliveInterval=5", "-o", "ServerAliveCountMax=2",
                                                 f"root@{ssh_host}",
                                                 ssh_command
@@ -3696,7 +3783,8 @@ REMOTE_SCRIPT"""
                                             # Quick check to see if log file is being created
                                             try:
                                                 quick_log_check_cmd = [
-                                                    "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
+                                                    "ssh"
+        ] + get_ssh_base_options(ssh_port) + [
                                                     f"root@{ssh_host}",
                                                     "test -f /workspace/output/training/training.log && (wc -l /workspace/output/training/training.log && tail -20 /workspace/output/training/training.log) || echo 'log_not_created'"
                                                 ]
@@ -3727,7 +3815,8 @@ REMOTE_SCRIPT"""
                                             # Wait a moment and verify training process is running
                                             try:
                                                 verify_cmd = [
-                                                    "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
+                                                    "ssh"
+        ] + get_ssh_base_options(ssh_port) + [
                                                     f"root@{ssh_host}",
                                                     "sleep 3 && ps aux | grep -E '(accelerate|axolotl)' | grep -v grep | head -2 || echo 'no_process'"
                                                 ]
@@ -3749,7 +3838,8 @@ REMOTE_SCRIPT"""
                                                         
                                                         # Check training log for errors
                                                         check_log_cmd = [
-                                                            "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
+                                                            "ssh"
+        ] + get_ssh_base_options(ssh_port) + [
                                                             f"root@{ssh_host}",
                                                             "tail -50 /workspace/output/training/training.log 2>/dev/null || echo 'no_log'"
                                                         ]
@@ -3902,7 +3992,8 @@ REMOTE_SCRIPT"""
                                     # First test SSH connection with a simple command
                                     terminal_output.append(f"[SSH] Testing SSH connection...")
                                     test_connection_cmd = [
-                                        "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
+                                        "ssh"
+        ] + get_ssh_base_options(ssh_port) + [
                                         "-o", "ServerAliveInterval=5", "-o", "ServerAliveCountMax=2",
                                         f"root@{ssh_host}",
                                         "echo 'SSH connection successful'"
@@ -3931,7 +4022,8 @@ REMOTE_SCRIPT"""
                                     terminal_output.append(f"[SSH] Checking output directory...")
                                     terminal_output.append(f"[DEBUG] SSH command: ssh -p {ssh_port} root@{ssh_host} 'ls -la /workspace/output/training'")
                                     check_output_cmd = [
-                                        "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
+                                        "ssh"
+        ] + get_ssh_base_options(ssh_port) + [
                                         "-o", "ServerAliveInterval=5", "-o", "ServerAliveCountMax=2",
                                         f"root@{ssh_host}",
                                         """bash -c '
@@ -3995,7 +4087,8 @@ REMOTE_SCRIPT"""
                                     terminal_output.append(f"[SSH] Checking if training files are present...")
                                     terminal_output.append(f"[DEBUG] SSH command: ssh -p {ssh_port} root@{ssh_host} 'ls -la /workspace/data/'")
                                     check_files_cmd = [
-                                        "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
+                                        "ssh"
+        ] + get_ssh_base_options(ssh_port) + [
                                         f"root@{ssh_host}",
                                         "ls -la /workspace/data/ 2>/dev/null | grep -E '(training_data|axolotl_config)' || echo 'files_missing'"
                                     ]
@@ -4058,7 +4151,8 @@ REMOTE_SCRIPT"""
                                         # Automatically remove _0 files (old naming scheme)
                                         terminal_output.append(f"[SSH] Removing old _0 files...")
                                         remove_old_files_cmd = [
-                                            "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
+                                            "ssh"
+        ] + get_ssh_base_options(ssh_port) + [
                                             f"root@{ssh_host}",
                                             "cd /workspace/data && rm -f axolotl_config_0.yaml training_data_0.jsonl && echo 'Removed _0 files' || echo 'No _0 files to remove'"
                                         ]
@@ -4072,7 +4166,8 @@ REMOTE_SCRIPT"""
                                     terminal_output.append(f"[SSH] Checking for training processes...")
                                     terminal_output.append(f"[DEBUG] SSH command: ssh -p {ssh_port} root@{ssh_host} 'ps aux | grep -E ...'")
                                     check_training_cmd = [
-                                        "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
+                                        "ssh"
+        ] + get_ssh_base_options(ssh_port) + [
                                         f"root@{ssh_host}",
                                         "ps aux | grep -E '(accelerate|axolotl|train)' | grep -v grep | head -5 || echo 'no_training'"
                                     ]
@@ -4133,7 +4228,8 @@ REMOTE_SCRIPT"""
                                                 parent_pids = {}
                                                 for pid in pids:
                                                     get_parent_cmd = [
-                                                        "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
+                                                        "ssh"
+        ] + get_ssh_base_options(ssh_port) + [
                                                         f"root@{ssh_host}",
                                                         f"ps -o ppid= -p {pid} 2>/dev/null | tr -d ' '"
                                                     ]
@@ -4189,7 +4285,8 @@ REMOTE_SCRIPT"""
                                         st.session_state[terminal_output_key] = terminal_output
                                         
                                         check_process_cmd_full = [
-                                            "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
+                                            "ssh"
+        ] + get_ssh_base_options(ssh_port) + [
                                             "-o", "ServerAliveInterval=5", "-o", "ServerAliveCountMax=2",
                                             f"root@{ssh_host}",
                                             "ps aux | grep -E '(accelerate|axolotl|train)' | grep -v grep | head -1"
@@ -4262,7 +4359,8 @@ REMOTE_SCRIPT"""
                                     
                                     # First check if log file exists and its size
                                     check_log_exists_cmd = [
-                                        "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
+                                        "ssh"
+        ] + get_ssh_base_options(ssh_port) + [
                                         "-o", "ServerAliveInterval=5", "-o", "ServerAliveCountMax=2",
                                         f"root@{ssh_host}",
                                         "ls -lh /workspace/output/training/training.log 2>/dev/null | awk '{print $5, $9}' || echo 'log_not_found'"
@@ -4281,7 +4379,8 @@ REMOTE_SCRIPT"""
                                     terminal_output.append(f"[SSH] Checking training logs...")
                                     terminal_output.append(f"[DEBUG] SSH command: ssh -p {ssh_port} root@{ssh_host} 'tail -100 /workspace/output/training/training.log'")
                                     check_training_log_cmd = [
-                                        "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
+                                        "ssh"
+        ] + get_ssh_base_options(ssh_port) + [
                                         "-o", "ServerAliveInterval=5", "-o", "ServerAliveCountMax=2",
                                         f"root@{ssh_host}",
                                         "tail -100 /workspace/output/training/training.log 2>/dev/null || echo 'no_training_log'"
@@ -4311,7 +4410,8 @@ REMOTE_SCRIPT"""
                                         
                                         # Also try to get the full log to extract stats more accurately
                                         full_log_cmd = [
-                                            "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
+                                            "ssh"
+        ] + get_ssh_base_options(ssh_port) + [
                                             "-o", "ServerAliveInterval=5", "-o", "ServerAliveCountMax=2",
                                             f"root@{ssh_host}",
                                             "cat /workspace/output/training/training.log 2>/dev/null | head -500 || echo 'no_full_log'"
@@ -4337,7 +4437,8 @@ REMOTE_SCRIPT"""
                                             
                                             # Try multiple methods to count the prepared dataset
                                             check_dataset_cmd = [
-                                                "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
+                                                "ssh"
+        ] + get_ssh_base_options(ssh_port) + [
                                                 "-o", "ServerAliveInterval=5", "-o", "ServerAliveCountMax=2",
                                                 f"root@{ssh_host}",
                                                 "find /workspace/axolotl/prepared_data -name 'train.jsonl' -type f 2>/dev/null | head -1 | xargs -I {} sh -c 'if [ -f \"{}\" ]; then wc -l \"{}\" | awk \"{print \\$1}\"; else echo \"0\"; fi' || echo 'cannot_count'"
@@ -4399,7 +4500,8 @@ REMOTE_SCRIPT"""
                                             
                                             # Check if there's any history of training commands or if the log directory was ever written to
                                             check_training_history_cmd = [
-                                                "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
+                                                "ssh"
+        ] + get_ssh_base_options(ssh_port) + [
                                                 f"root@{ssh_host}",
                                                 "ls -la /workspace/output/training/ 2>/dev/null | head -10 || echo 'no_output_dir'"
                                             ]
@@ -4414,7 +4516,8 @@ REMOTE_SCRIPT"""
                                             
                                             # Check if axolotl is properly installed and accessible
                                             check_axolotl_cmd = [
-                                                "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
+                                                "ssh"
+        ] + get_ssh_base_options(ssh_port) + [
                                                 f"root@{ssh_host}",
                                                 "cd /workspace/axolotl && (/opt/conda/bin/python -c 'import axolotl; import accelerate' 2>&1 || python3 -c 'import axolotl; import accelerate' 2>&1 || python -c 'import axolotl; import accelerate' 2>&1) || echo 'axolotl_not_available'"
                                             ]
@@ -4431,7 +4534,8 @@ REMOTE_SCRIPT"""
                                             
                                             # Check if config file is valid
                                             check_config_cmd = [
-                                                "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
+                                                "ssh"
+        ] + get_ssh_base_options(ssh_port) + [
                                                 f"root@{ssh_host}",
                                                 "test -f /workspace/data/axolotl_config.yaml && (head -5 /workspace/data/axolotl_config.yaml || echo 'config_read_error') || echo 'config_not_found'"
                                             ]
@@ -4455,7 +4559,8 @@ REMOTE_SCRIPT"""
                                             
                                             # Check if the log file is being created but is empty (process might be starting)
                                             check_log_size_cmd = [
-                                                "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
+                                                "ssh"
+        ] + get_ssh_base_options(ssh_port) + [
                                                 f"root@{ssh_host}",
                                                 "test -f /workspace/output/training/training.log && wc -l /workspace/output/training/training.log || echo 'log_not_exists'"
                                             ]
@@ -4472,7 +4577,8 @@ REMOTE_SCRIPT"""
                                             # This is a non-critical diagnostic check, so handle timeouts gracefully
                                             try:
                                                 check_tmp_output_cmd = [
-                                                    "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
+                                                    "ssh"
+        ] + get_ssh_base_options(ssh_port) + [
                                                     f"root@{ssh_host}",
                                                     "ls -lht /tmp/*.log /tmp/*.out /tmp/*.err 2>/dev/null | head -3 || echo 'no_tmp_output'"
                                                 ]
@@ -4489,7 +4595,8 @@ REMOTE_SCRIPT"""
                                             
                                             # Check if we can see the process's file descriptors to see if it's writing
                                             check_process_fds_cmd = [
-                                                "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
+                                                "ssh"
+        ] + get_ssh_base_options(ssh_port) + [
                                                 f"root@{ssh_host}",
                                                 "ps aux | grep -E '(accelerate|axolotl|train)' | grep -v grep | awk '{print $2}' | head -1 | xargs -I {} sh -c 'if [ -n \"{}\" ]; then ls -l /proc/{}/fd/ 2>/dev/null | grep -E \"(training.log|stdout|stderr)\" || echo \"no_fds\"; else echo \"no_pid\"; fi'"
                                             ]
@@ -4508,7 +4615,8 @@ REMOTE_SCRIPT"""
                                                     
                                                     # Get the main training process PID (the one with accelerate launch)
                                                     get_main_pid_cmd = [
-                                                        "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
+                                                        "ssh"
+        ] + get_ssh_base_options(ssh_port) + [
                                                         f"root@{ssh_host}",
                                                         "ps aux | grep -E 'accelerate.*launch.*axolotl' | grep -v grep | awk '{print $2}' | head -1"
                                                     ]
@@ -4521,7 +4629,8 @@ REMOTE_SCRIPT"""
                                                             
                                                             # Try to read from stdout (fd 1) and stderr (fd 2)
                                                             read_fd_cmd = [
-                                                                "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
+                                                                "ssh"
+        ] + get_ssh_base_options(ssh_port) + [
                                                                 f"root@{ssh_host}",
                                                                 f"if [ -r /proc/{main_pid}/fd/1 ]; then tail -100 /proc/{main_pid}/fd/1 2>/dev/null || echo 'cannot_read_fd1'; else echo 'fd1_not_readable'; fi"
                                                             ]
@@ -4543,7 +4652,8 @@ REMOTE_SCRIPT"""
                                             
                                             # Also check Axolotl's default output locations
                                             check_axolotl_output_cmd = [
-                                                "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
+                                                "ssh"
+        ] + get_ssh_base_options(ssh_port) + [
                                                 f"root@{ssh_host}",
                                                 "find /workspace -name '*.log' -type f -path '*/axolotl/*' -o -path '*/output/*' 2>/dev/null | head -5 | xargs -I {} sh -c 'if [ -f \"{}\" ]; then echo \"{}: $(tail -20 \"{}\" | wc -l) lines\"; fi' || echo 'no_axolotl_logs'"
                                             ]
@@ -4558,7 +4668,8 @@ REMOTE_SCRIPT"""
                                     terminal_output.append(f"[SSH] Checking debug.log for errors...")
                                     terminal_output.append(f"[DEBUG] SSH command: ssh -p {ssh_port} root@{ssh_host} 'if [ -f /workspace/output/training/debug.log ]; then tail -30 /workspace/output/training/debug.log; else echo no_debug_log; fi'")
                                     debug_log_cmd = [
-                                        "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
+                                        "ssh"
+        ] + get_ssh_base_options(ssh_port) + [
                                         f"root@{ssh_host}",
                                         "if [ -f /workspace/output/training/debug.log ]; then tail -30 /workspace/output/training/debug.log; else echo 'no_debug_log'; fi"
                                     ]
@@ -4595,7 +4706,8 @@ REMOTE_SCRIPT"""
                                     )
                                     terminal_output.append(f"[DEBUG] SSH command: ssh -p {ssh_port} root@{ssh_host} 'checking multiple log locations...'")
                                     log_cmd = [
-                                        "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
+                                        "ssh"
+        ] + get_ssh_base_options(ssh_port) + [
                                         "-o", "ServerAliveInterval=5", "-o", "ServerAliveCountMax=2",
                                         f"root@{ssh_host}",
                                         log_command
@@ -4639,7 +4751,8 @@ REMOTE_SCRIPT"""
                                         try:
                                             # Get the main training process PID
                                             get_pid_cmd = [
-                                                "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
+                                                "ssh"
+        ] + get_ssh_base_options(ssh_port) + [
                                                 f"root@{ssh_host}",
                                                 "ps aux | grep -E 'accelerate.*launch.*axolotl' | grep -v grep | awk '{print $2}' | head -1"
                                             ]
@@ -4648,7 +4761,8 @@ REMOTE_SCRIPT"""
                                                 main_pid = pid_result.stdout.strip()
                                                 # Try to read from stdout (fd 1)
                                                 read_fd_cmd = [
-                                                    "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
+                                                    "ssh"
+        ] + get_ssh_base_options(ssh_port) + [
                                                     f"root@{ssh_host}",
                                                     f"if [ -r /proc/{main_pid}/fd/1 ]; then tail -100 /proc/{main_pid}/fd/1 2>/dev/null || echo 'cannot_read'; else echo 'not_readable'; fi"
                                                 ]
@@ -4721,7 +4835,8 @@ REMOTE_SCRIPT"""
                                             if ssh_host:
                                                 try:
                                                     check_config_cmd = [
-                                                        "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
+                                                        "ssh"
+        ] + get_ssh_base_options(ssh_port) + [
                                                         f"root@{ssh_host}",
                                                         "cd /workspace/data && python3 << 'PYTHON_EOF'\n"
                                                         "import yaml\n"
@@ -5465,7 +5580,8 @@ REMOTE_SCRIPT"""
                                         
                                         if ssh_host:
                                             check_adapter_files_cmd = [
-                                                "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
+                                                "ssh"
+        ] + get_ssh_base_options(ssh_port) + [
                                                 f"root@{ssh_host}",
                                                 """bash -c '
                                                     adapter_found=false
@@ -5558,7 +5674,8 @@ REMOTE_SCRIPT"""
                                                     terminal_output.append(f"[QUEUE] ========================================")
                                                     terminal_output.append(f"[QUEUE] Verifying job {current_job_index + 1} has completed...")
                                                     verify_complete_cmd = [
-                                                        "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
+                                                        "ssh"
+        ] + get_ssh_base_options(ssh_port) + [
                                                         f"root@{ssh_host}",
                                                         "ps aux | grep -E '(accelerate|axolotl|train)' | grep -v grep | wc -l"
                                                     ]
@@ -5583,7 +5700,8 @@ REMOTE_SCRIPT"""
                                                     terminal_output.append(f"[CLEANUP] ========================================")
                                                     terminal_output.append(f"[CLEANUP] Step 1: Saving results from job {current_job_index + 1}...")
                                                     save_results_cmd = [
-                                                        "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
+                                                        "ssh"
+        ] + get_ssh_base_options(ssh_port) + [
                                                         f"root@{ssh_host}",
                                                         f"mkdir -p /workspace/data/job_{current_job_index}_results && "
                                                         f"cp -r /workspace/output/training/* /workspace/data/job_{current_job_index}_results/ 2>/dev/null && "
@@ -5607,7 +5725,8 @@ REMOTE_SCRIPT"""
                                                     terminal_output.append(f"[MERGE] Step 2: Extracting adapter from job {current_job_index + 1} for merging into job {next_job_index + 1}...")
                                                     # Check multiple possible adapter locations
                                                     copy_adapter_cmd = [
-                                                        "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
+                                                        "ssh"
+        ] + get_ssh_base_options(ssh_port) + [
                                                         f"root@{ssh_host}",
                                                         f"mkdir -p /workspace/data/previous_adapter_{current_job_index} && "
                                                         f"(test -d /workspace/data/job_{current_job_index}_results/adapter && cp -r /workspace/data/job_{current_job_index}_results/adapter/* /workspace/data/previous_adapter_{current_job_index}/ 2>/dev/null && echo 'adapter_from_subdir' || "
@@ -5640,7 +5759,8 @@ REMOTE_SCRIPT"""
                                                     terminal_output.append(f"[CLEANUP] Step 3: Cleaning output directory to prevent conflicts...")
                                                     terminal_output.append(f"[CLEANUP]   Removing old checkpoints and files from /workspace/output/training/...")
                                                     cleanup_cmd = [
-                                                        "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
+                                                        "ssh"
+        ] + get_ssh_base_options(ssh_port) + [
                                                         f"root@{ssh_host}",
                                                         f"ls -la /workspace/output/training/ 2>/dev/null | head -5 && "
                                                         f"rm -rf /workspace/output/training/* && "
@@ -5648,7 +5768,7 @@ REMOTE_SCRIPT"""
                                                         f"ls -la /workspace/output/training/ && "
                                                         f"echo 'Output directory cleaned'"
                                                     ]
-                                                    cleanup_result = subprocess.run(cleanup_cmd, capture_output=True, text=True, timeout=30)
+                                                    cleanup_result = subprocess.run(cleanup_cmd, capture_output=True, text=True, timeout=30, input="yes\n")
                                                     
                                                     if cleanup_result.returncode == 0 and "Output directory cleaned" in cleanup_result.stdout:
                                                         terminal_output.append(f"[CLEANUP] ✓ Output directory cleaned successfully")
@@ -5690,7 +5810,8 @@ REMOTE_SCRIPT"""
                                                             f"PYTHON_EOF"
                                                         )
                                                         update_config_cmd = [
-                                                            "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
+                                                            "ssh"
+        ] + get_ssh_base_options(ssh_port) + [
                                                             f"root@{ssh_host}",
                                                             update_config_remote_cmd
                                                         ]
@@ -5725,7 +5846,8 @@ REMOTE_SCRIPT"""
                                                         terminal_output.append(f"[SSH]   Job 1: Files should already be active (no suffix needed)")
                                                         terminal_output.append(f"[SSH]   Just removing previous job files and verifying job 1 files exist...")
                                                         rename_cmd = [
-                                                            "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
+                                                            "ssh"
+        ] + get_ssh_base_options(ssh_port) + [
                                                             f"root@{ssh_host}",
                                                             f"cd /workspace/data && "
                                                             f"echo 'Step 1: Removing previous job active files...' && "
@@ -5744,7 +5866,8 @@ REMOTE_SCRIPT"""
                                                         terminal_output.append(f"[SSH]   Files to activate (job {next_job_index + 1}): axolotl_config_{next_job_index}.yaml → axolotl_config.yaml")
                                                         terminal_output.append(f"[SSH]   Files to activate (job {next_job_index + 1}): training_data_{next_job_index}.jsonl → training_data.jsonl")
                                                         rename_cmd = [
-                                                            "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
+                                                            "ssh"
+        ] + get_ssh_base_options(ssh_port) + [
                                                             f"root@{ssh_host}",
                                                             f"cd /workspace/data && "
                                                             f"echo '=== File Rename Operation ===' && "
@@ -5810,7 +5933,8 @@ REMOTE_SCRIPT"""
                                                         # Step 6: Verify no processes are running (should already be stopped, but double-check)
                                                         terminal_output.append(f"[SSH] Verifying no training processes are running before starting job {next_job_index + 1}...")
                                                         verify_no_processes_cmd = [
-                                                            "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
+                                                            "ssh"
+        ] + get_ssh_base_options(ssh_port) + [
                                                             f"root@{ssh_host}",
                                                             "ps aux | grep -E '(accelerate|axolotl|train)' | grep -v grep | wc -l"
                                                         ]
@@ -5873,7 +5997,8 @@ REMOTE_SCRIPT"""
                                                             "fi"
                                                         )
                                                         restart_training_cmd = [
-                                                            "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
+                                                            "ssh"
+        ] + get_ssh_base_options(ssh_port) + [
                                                             "-o", "ServerAliveInterval=5", "-o", "ServerAliveCountMax=2",
                                                             f"root@{ssh_host}",
                                                             restart_training_remote_cmd
@@ -5891,7 +6016,8 @@ REMOTE_SCRIPT"""
                                                         # Verify training process started
                                                         terminal_output.append(f"[SSH] Verifying training process started...")
                                                         verify_cmd = [
-                                                            "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
+                                                            "ssh"
+        ] + get_ssh_base_options(ssh_port) + [
                                                             f"root@{ssh_host}",
                                                             "sleep 3 && ps aux | grep -E '(accelerate|axolotl)' | grep -v grep | head -2 || echo 'no_process'"
                                                         ]
@@ -6003,7 +6129,8 @@ REMOTE_SCRIPT"""
                                                             f"PYTHON_EOF"
                                                         )
                                                         fix_multipack_cmd = [
-                                                            "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
+                                                            "ssh"
+        ] + get_ssh_base_options(ssh_port) + [
                                                             f"root@{ssh_host}",
                                                             fix_multipack_remote_cmd
                                                         ]
@@ -6105,7 +6232,8 @@ REMOTE_SCRIPT"""
                                                     f"PYTHON_EOF"
                                                 )
                                                     fix_adapter_cmd = [
-                                                        "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
+                                                        "ssh"
+        ] + get_ssh_base_options(ssh_port) + [
                                                         f"root@{ssh_host}",
                                                         fix_adapter_remote_cmd
                                                     ]
@@ -6189,7 +6317,8 @@ REMOTE_SCRIPT"""
                                                     f"PYTHON_EOF"
                                                 )
                                                 fix_tokenizer_cmd = [
-                                                    "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
+                                                    "ssh"
+        ] + get_ssh_base_options(ssh_port) + [
                                                     f"root@{ssh_host}",
                                                     fix_tokenizer_remote_cmd
                                                 ]
@@ -6239,7 +6368,8 @@ REMOTE_SCRIPT"""
                                                     f"PYTHON_EOF"
                                                 )
                                                 fix_dataset_path_cmd = [
-                                                    "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
+                                                    "ssh"
+        ] + get_ssh_base_options(ssh_port) + [
                                                     f"root@{ssh_host}",
                                                     fix_dataset_path_remote_cmd
                                                 ]
@@ -6306,7 +6436,8 @@ REMOTE_SCRIPT"""
                                                     f"PYTHON_EOF"
                                                 )
                                                 fix_oom_cmd = [
-                                                    "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
+                                                    "ssh"
+        ] + get_ssh_base_options(ssh_port) + [
                                                     f"root@{ssh_host}",
                                                     fix_oom_remote_cmd
                                                 ]
@@ -6353,7 +6484,8 @@ REMOTE_SCRIPT"""
                                             
                                             # First, check if train_on_inputs is set correctly (this is critical for sample retention)
                                             check_train_on_inputs_cmd = [
-                                                "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
+                                                "ssh"
+        ] + get_ssh_base_options(ssh_port) + [
                                                 f"root@{ssh_host}",
                                                 "cd /workspace/data && python3 << 'PYTHON_EOF'\n"
                                                 "import yaml\n"
@@ -6393,7 +6525,8 @@ REMOTE_SCRIPT"""
                                             
                                             # First, check if data actually survived filtering
                                             check_survived_cmd = [
-                                                "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
+                                                "ssh"
+        ] + get_ssh_base_options(ssh_port) + [
                                                 f"root@{ssh_host}",
                                                 "python3 << 'PYTHON_EOF'\n"
                                                 "import os\n"
@@ -6560,7 +6693,8 @@ REMOTE_SCRIPT"""
                                                     f"PYTHON_EOF"
                                                 )
                                                 fix_multipack_cmd = [
-                                                    "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
+                                                    "ssh"
+        ] + get_ssh_base_options(ssh_port) + [
                                                     f"root@{ssh_host}",
                                                     fix_multipack_remote_cmd
                                                 ]
@@ -6802,11 +6936,12 @@ REMOTE_SCRIPT"""
                                     # Step 2: Forcefully delete output directories and recreate them
                                     terminal_output.append(f"[SSH] Forcefully deleting output directories...")
                                     cleanup_cmd = [
-                                        "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
+                                        "ssh"
+        ] + get_ssh_base_options(ssh_port) + [
                                         f"root@{ssh_host}",
                                         "echo 'Deleting output directory...' && rm -rf /workspace/output 2>&1 && echo 'Output directory deleted' && mkdir -p /workspace/output/training && echo 'Directories recreated' && ls -la /workspace/output/ 2>&1 && echo 'Output directories forcefully deleted and recreated'"
                                     ]
-                                    cleanup_result = subprocess.run(cleanup_cmd, capture_output=True, text=True, timeout=30)
+                                    cleanup_result = subprocess.run(cleanup_cmd, capture_output=True, text=True, timeout=30, input="yes\n")
                                     if cleanup_result.returncode == 0:
                                         terminal_output.append(f"[SSH] ✓ Output directories forcefully deleted and recreated")
                                         stdout_filtered = filter_malloc_warnings(cleanup_result.stdout)
@@ -6824,7 +6959,8 @@ REMOTE_SCRIPT"""
                                             terminal_output.append(f"[ERROR] stdout: {stdout_filtered[:300]}")
                                         # Try to verify if deletion actually happened despite error
                                         verify_cmd = [
-                                            "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
+                                            "ssh"
+        ] + get_ssh_base_options(ssh_port) + [
                                             f"root@{ssh_host}",
                                             "if [ -d /workspace/output ]; then echo 'DIRECTORY_EXISTS' && ls -la /workspace/output/; else echo 'DIRECTORY_DELETED'; fi"
                                         ]
@@ -6842,7 +6978,8 @@ REMOTE_SCRIPT"""
                                     try:
                                         # Read current config
                                         read_config_cmd = [
-                                            "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
+                                            "ssh"
+        ] + get_ssh_base_options(ssh_port) + [
                                             f"root@{ssh_host}",
                                             "cd /workspace/data && python3 << 'PYTHON_EOF'\n"
                                             "import yaml\n"
@@ -6891,7 +7028,8 @@ REMOTE_SCRIPT"""
                                             
                                             # Check GPU memory to suggest optimal batch size
                                             check_memory_cmd = [
-                                                "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
+                                                "ssh"
+        ] + get_ssh_base_options(ssh_port) + [
                                                 f"root@{ssh_host}",
                                                 "nvidia-smi --query-gpu=memory.total,memory.used,memory.free --format=csv,noheader,nounits 2>/dev/null | head -1"
                                             ]
@@ -7115,7 +7253,8 @@ REMOTE_SCRIPT"""
                                         f"PYTHON_EOF"
                                     )
                                     fix_tokenizer_cmd = [
-                                        "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
+                                        "ssh"
+        ] + get_ssh_base_options(ssh_port) + [
                                         f"root@{ssh_host}",
                                         fix_tokenizer_remote_cmd_redo
                                     ]
@@ -7273,7 +7412,8 @@ REMOTE_SCRIPT"""
                                                         # Verify the uploaded file on remote
                                                         terminal_output.append(f"[SSH] Verifying uploaded config file...")
                                                         verify_cmd = [
-                                                            "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
+                                                            "ssh"
+        ] + get_ssh_base_options(ssh_port) + [
                                                             f"root@{ssh_host}",
                                                             "grep -E 'base_model|base_model_config' /workspace/data/axolotl_config.yaml | head -2"
                                                         ]
@@ -7369,7 +7509,8 @@ REMOTE_SCRIPT"""
                                                                 f"PYTHON_EOF"
                                                             )
                                                             fix_config_cmd_redo = [
-                                                                "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
+                                                                "ssh"
+        ] + get_ssh_base_options(ssh_port) + [
                                                                 f"root@{ssh_host}",
                                                                 fix_config_remote_cmd_redo
                                                             ]
@@ -7386,7 +7527,8 @@ REMOTE_SCRIPT"""
                                                                 
                                                                 # Verify the actual config value
                                                                 verify_path_cmd = [
-                                                                    "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
+                                                                    "ssh"
+        ] + get_ssh_base_options(ssh_port) + [
                                                                     f"root@{ssh_host}",
                                                                     "grep 'dataset_preparation_path' /workspace/data/axolotl_config.yaml"
                                                                 ]
@@ -7581,7 +7723,8 @@ fi
 REMOTE_SCRIPT"""
                                     
                                     restart_cmd = [
-                                        "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
+                                        "ssh"
+        ] + get_ssh_base_options(ssh_port) + [
                                         "-o", "ServerAliveInterval=5", "-o", "ServerAliveCountMax=2",
                                         f"root@{ssh_host}",
                                         ssh_command
@@ -7629,7 +7772,8 @@ REMOTE_SCRIPT"""
                                     # Quick check to see if log file is being created
                                     try:
                                         quick_log_check_cmd = [
-                                            "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
+                                            "ssh"
+        ] + get_ssh_base_options(ssh_port) + [
                                             f"root@{ssh_host}",
                                             "test -f /workspace/output/training/training.log && (wc -l /workspace/output/training/training.log && tail -20 /workspace/output/training/training.log) || echo 'log_not_created'"
                                         ]
@@ -7653,7 +7797,8 @@ REMOTE_SCRIPT"""
                                             
                                             # Check if there are any Python processes that might have failed
                                             check_python_errors_cmd = [
-                                                "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
+                                                "ssh"
+        ] + get_ssh_base_options(ssh_port) + [
                                                 f"root@{ssh_host}",
                                                 "ps aux | grep python | grep -E '(axolotl|accelerate|train)' | grep -v grep | head -5 || echo 'no_python_process'"
                                             ]
@@ -7676,7 +7821,8 @@ REMOTE_SCRIPT"""
                                     # Wait a moment and verify training process is running
                                     try:
                                         verify_cmd = [
-                                            "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
+                                            "ssh"
+        ] + get_ssh_base_options(ssh_port) + [
                                             f"root@{ssh_host}",
                                             "sleep 3 && ps aux | grep -E '(accelerate|axolotl)' | grep -v grep | head -2 || echo 'no_process'"
                                         ]
@@ -7699,7 +7845,8 @@ REMOTE_SCRIPT"""
                                             
                                             # Check training log for errors
                                             check_log_cmd = [
-                                                "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
+                                                "ssh"
+        ] + get_ssh_base_options(ssh_port) + [
                                                 f"root@{ssh_host}",
                                                 "tail -50 /workspace/output/training/training.log 2>/dev/null || echo 'no_log'"
                                             ]
@@ -7867,7 +8014,8 @@ REMOTE_SCRIPT"""
                                     "else echo 'no_logs'; fi"
                                 )
                                 log_cmd = [
-                                    "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
+                                    "ssh"
+        ] + get_ssh_base_options(ssh_port) + [
                                     f"root@{ssh_host}",
                                     log_command
                                 ]
@@ -8186,7 +8334,8 @@ REMOTE_SCRIPT"""
                                             # If adapter_dir_remote doesn't contain "checkpoint", also try latest checkpoint
                                             if "checkpoint" not in adapter_dir_remote:
                                                 find_checkpoint_cmd = [
-                                                    "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
+                                                    "ssh"
+        ] + get_ssh_base_options(ssh_port) + [
                                                     f"root@{ssh_host}",
                                                     "find /workspace/output/training -type d -name 'checkpoint-*' 2>/dev/null | sort -V | tail -1"
                                                 ]
