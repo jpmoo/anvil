@@ -7,6 +7,258 @@ let conversationHistory = [];
 let conversationSummary = '';
 let configLoaded = false; // Track if config has been loaded to prevent overwriting user input
 
+let behaviorPacks = null; // Loaded behavior packs configuration
+
+// Helper to normalize new behavior pack schema into expected fields
+function normalizeBehaviorPack(pack) {
+  if (!pack) return pack;
+
+  // Map generation defaults
+  pack.generation_settings = {
+    temperature: pack.generation_defaults?.verbosity === 'high' ? 0.7 : 0.5,
+    max_tokens: pack.generation_defaults?.soft_max_tokens || 800,
+    min_length_chars: pack.generation_defaults?.min_paragraphs
+      ? pack.generation_defaults.min_paragraphs * 200
+      : undefined
+  };
+
+  // Map opening / style rules
+  pack.style_rules = {
+    forbidden_opening_patterns: pack.opening_rules?.disallowed_openings || [],
+    preferred_openings: pack.opening_rules?.preferred_openings || [],
+    forbidden_terms: pack.profile_intent?.avoid || []
+  };
+
+  // Flatten triggers → exemplars
+  pack.exemplars = {};
+  if (pack.triggers) {
+    Object.entries(pack.triggers).forEach(([key, trigger]) => {
+      if (trigger.exemplars) {
+        pack.exemplars[key] = {
+          when: trigger.when ? Object.keys(trigger.when) : [],
+          text: trigger.exemplars
+        };
+      }
+    });
+  }
+
+  return pack;
+}
+
+// === Behavior-pack–driven style helpers ===
+
+// Build a system message from the loaded behavior pack, if present
+function buildSystemFromBehaviorPack() {
+  if (!behaviorPacks) return '';
+  const parts = [];
+  if (behaviorPacks.profile_intent?.identity) parts.push(behaviorPacks.profile_intent.identity);
+  if (behaviorPacks.profile_intent?.stance) parts.push(behaviorPacks.profile_intent.stance);
+  if (Array.isArray(behaviorPacks.profile_intent?.avoid) && behaviorPacks.profile_intent.avoid.length) {
+    parts.push(`Avoid: ${behaviorPacks.profile_intent.avoid.join(', ')}`);
+  }
+  if (behaviorPacks.tone_guidance?.voice) parts.push(`Voice: ${behaviorPacks.tone_guidance.voice}`);
+  if (behaviorPacks.tone_guidance?.opening_style) parts.push(`Opening style: ${behaviorPacks.tone_guidance.opening_style}`);
+  if (Array.isArray(behaviorPacks.tone_guidance?.preferred_openings) && behaviorPacks.tone_guidance.preferred_openings.length) {
+    parts.push(`Preferred openings: ${behaviorPacks.tone_guidance.preferred_openings.join(' | ')}`);
+  }
+  return parts.join('\n');
+}
+function getStyleRules() {
+  return behaviorPacks?.style_rules || {};
+}
+
+function violatesOpeningRules(text) {
+  if (!text) return false;
+  const rules = getStyleRules();
+  const patterns = rules.forbidden_opening_patterns || [];
+  const opening = text.trim().slice(0, 200).toLowerCase();
+  return patterns.some(p => {
+    try {
+      return new RegExp(p, 'i').test(opening);
+    } catch {
+      return false;
+    }
+  });
+}
+
+function containsForbiddenTerms(text) {
+  if (!text) return false;
+  const rules = getStyleRules();
+  const terms = rules.forbidden_terms || [];
+  return terms.some(term =>
+    new RegExp(`\\b${term}\\b`, 'i').test(text)
+  );
+}
+let pendingExemplarSystemText = null; // One-shot exemplar appended to the next request as system text
+let exemplarRotationIndex = {}; // Track rotation index for each trigger
+let usedTriggers = new Set();
+let isSending = false; // Prevent accidental double-send / concurrent sendMessage calls
+
+// Load behavior packs configuration for a specific profile
+async function loadBehaviorPacks(profileName) {
+  try {
+    const result = await window.electronAPI.loadBehaviorPacks(profileName);
+    if (result && result.success && result.data) {
+      behaviorPacks = normalizeBehaviorPack(result.data);
+      const exemplarCount = Object.keys(behaviorPacks.exemplars || {}).length;
+      console.log('[BEHAVIOR] Behavior packs loaded:', exemplarCount, 'exemplar(s)');
+
+      // Check if pack is empty and show warning
+      if (result.isEmpty) {
+        console.warn('[BEHAVIOR] Behavior pack is empty (no exemplars with content)');
+        showBehaviorPackWarning();
+      } else {
+        hideBehaviorPackWarning();
+      }
+
+      return behaviorPacks;
+    } else {
+      console.warn('[BEHAVIOR] Failed to load behavior packs:', result?.error || 'Unknown error');
+      showBehaviorPackWarning();
+      return null;
+    }
+  } catch (error) {
+    console.error('[BEHAVIOR] Error loading behavior packs:', error);
+    showBehaviorPackWarning();
+    return null;
+  }
+}
+
+// Show warning if behavior pack is empty
+function showBehaviorPackWarning() {
+  // Check if warning element already exists
+  let warningDiv = document.getElementById('behaviorPackWarning');
+  if (!warningDiv) {
+    // Create warning element
+    warningDiv = document.createElement('div');
+    warningDiv.id = 'behaviorPackWarning';
+    warningDiv.style.cssText = 'background: #fff3cd; border: 1px solid #ffc107; border-radius: 6px; padding: 12px; margin: 15px 0; color: #856404;';
+    warningDiv.innerHTML = '<strong>⚠ Warning:</strong> Behavior pack is empty. No exemplars are configured for this profile. Edit <code>behavior_packs.json</code> in the profile folder to add exemplars.';
+    
+    // Insert at the top of chat interface, after the section title
+    const chatInterface = document.getElementById('chatInterface');
+    if (chatInterface) {
+      // Find the section-title element and insert after it
+      const sectionTitle = chatInterface.querySelector('.section-title');
+      if (sectionTitle && sectionTitle.nextSibling) {
+        chatInterface.insertBefore(warningDiv, sectionTitle.nextSibling);
+      } else if (sectionTitle) {
+        sectionTitle.parentNode.insertBefore(warningDiv, sectionTitle.nextSibling);
+      } else {
+        // Fallback: insert at the beginning
+        chatInterface.insertBefore(warningDiv, chatInterface.firstChild);
+      }
+    }
+  }
+  warningDiv.style.display = 'block';
+}
+
+// Hide warning if behavior pack has content
+function hideBehaviorPackWarning() {
+  const warningDiv = document.getElementById('behaviorPackWarning');
+  if (warningDiv) {
+    warningDiv.style.display = 'none';
+  }
+}
+
+// Get exemplar text for a given trigger condition
+// Supports two formats:
+//  1) explicit mapping: exemplars[trigger] = { text: ... }
+//  2) when-based matching: exemplars[key] = { when: [..triggers..], text: ... }
+// Rotates across all matching exemplar texts per trigger.
+function getExemplarForTrigger(trigger) {
+  if (!behaviorPacks || !behaviorPacks.exemplars) return null;
+
+  const exemplarsObj = behaviorPacks.exemplars;
+  const matches = [];
+
+  for (const [key, entry] of Object.entries(exemplarsObj)) {
+    if (!entry) continue;
+
+    // Match rule A: explicit key equals trigger
+    const keyMatch = key === trigger;
+
+    // Match rule B: `when` includes trigger
+    const whenList = Array.isArray(entry.when) ? entry.when : (typeof entry.when === 'string' ? [entry.when] : []);
+    const whenMatch = whenList.includes(trigger);
+
+    if (!keyMatch && !whenMatch) continue;
+
+    if (!entry.text) continue;
+    const texts = Array.isArray(entry.text) ? entry.text : [entry.text];
+    for (const t of texts) {
+      if (typeof t === 'string' && t.trim()) matches.push(t.trim());
+    }
+  }
+
+  if (matches.length === 0) return null;
+
+  const index = exemplarRotationIndex[trigger] ?? 0;
+  const selected = matches[index % matches.length];
+  exemplarRotationIndex[trigger] = index + 1;
+  return selected;
+}
+
+// Inject exemplar as one-shot system text (not shown in UI, not saved to history)
+// Allows per-turn triggers to fire repeatedly; one-shots only once per session.
+function injectExemplar(trigger) {
+  const exemplarText = getExemplarForTrigger(trigger);
+  if (!exemplarText) return false;
+
+  if (containsForbiddenTerms(exemplarText)) {
+    console.warn('[BEHAVIOR] Exemplar blocked due to forbidden terms (behavior pack rules)');
+    return false;
+  }
+
+  console.log(`[BEHAVIOR] Queuing exemplar for trigger: ${trigger}`);
+  pendingExemplarSystemText = exemplarText;
+  console.log('[BEHAVIOR] Applied exemplar:', trigger);
+  return true;
+}
+
+// (Behavior-pack–driven forbidden checks and opening rules now used. See helpers above.)
+
+// Detect lack of concrete, practical practice in assistant responses
+function lacksConcretePractice(text) {
+  if (!text) return true;
+  return !/(student work|common assessment|lesson plan|exit ticket|protocol|agenda|artifact|look at|bring|examine|decide|try next|instructional move|next meeting)/i.test(text);
+}
+
+// Detect if a response is too brief to be useful (behavior-pack–driven)
+function isTooBrief(text) {
+  if (!text) return true;
+  const minChars = behaviorPacks?.generation_settings?.min_length_chars;
+  if (!minChars) return false;
+  return text.trim().length < minChars;
+}
+
+// Build a rewrite instruction that forces plain-language, example-driven coaching
+function buildRewriteInstruction(userMessage, badAssistantText) {
+  return (
+    `Rewrite your last response so it follows the system instructions.\n\n` +
+    `Hard rules:\n` +
+    `- Do NOT use labels or headings like "Current step", "Diagnosis", "Next step", "Reflection gap", "framework", "stage", or "diagram".\n` +
+    `- Speak as a thoughtful human colleague. Use concrete, practical examples (routines, artifacts, questions teams examine, decisions teams make).\n` +
+    `- Ground it in the leader's situation and explain your reasoning plainly.\n` +
+    `- Do NOT end with questions unless they truly help decide the next move.\n\n` +
+    `User message:\n${userMessage}\n\n` +
+    `Your previous (non-compliant) draft:\n${badAssistantText}\n\n` +
+    `Return ONLY the revised answer.`
+  );
+}
+
+// Wrap system content to reduce the model mistaking it for user content
+function wrapSystemBlocks(userSystem, exemplar) {
+  const blocks = [];
+  if (exemplar && exemplar.trim()) {
+    blocks.push(`<SYSTEM_EXEMPLAR>\n${exemplar.trim()}\n</SYSTEM_EXEMPLAR>`);
+  }
+  if (userSystem && userSystem.trim()) {
+    blocks.push(`<SYSTEM_PREPEND>\n${userSystem.trim()}\n</SYSTEM_PREPEND>`);
+  }
+  return blocks.join('\n\n');
+}
+
 // Fix 3: Normalize conversation history before sending to enforce strict role alternation
 function normalizeConversation(messages) {
   const cleaned = [];
@@ -215,6 +467,7 @@ async function loadConfig() {
 
 // Load profiles on startup
 window.addEventListener('DOMContentLoaded', async () => {
+  // Behavior packs will be loaded when profile is selected
   // Load saved configuration first
   await loadConfig();
   
@@ -287,22 +540,29 @@ window.addEventListener('DOMContentLoaded', async () => {
   }
   
   if (clearChatBtn) {
-    clearChatBtn.addEventListener('click', () => {
+    clearChatBtn.addEventListener('click', async () => {
       conversationHistory = [];
       const chatMessages = document.getElementById('chatMessages');
       if (chatMessages) {
         chatMessages.innerHTML = '';
       }
       console.log('[CHAT] Conversation history cleared');
-      
+
       // Save config to persist the cleared history
       saveConfig();
-      // Optionally add a message indicating the conversation was reset
+      
+      // Clear one-shot exemplar before voice_reset injection (one-shot semantics)
+      pendingExemplarSystemText = null;
+      usedTriggers.clear();
+      
+      // Load behavior packs for the current profile and inject exemplar for voice_reset if available
+      const profileName = modelInfo?.profileName || null;
+      await loadBehaviorPacks(profileName);
       if (chatMessages) {
-        const resetMsg = document.createElement('div');
-        resetMsg.className = 'message assistant';
-        resetMsg.textContent = 'Conversation history cleared. Starting fresh conversation.';
-        chatMessages.appendChild(resetMsg);
+        // Try to inject exemplar for voice_reset, fallback to default message
+        if (!injectExemplar('voice_reset')) {
+          addMessage('assistant', 'Hello! I\'m glad to be talking with you today!');
+        }
       }
     });
   }
@@ -994,7 +1254,9 @@ async function updateIncrementalSummary(newUserMessage, newAssistantResponse, cu
       prependedText: '', // No prepended text for summary
       useSummary: false, // Don't include summary in summary generation
       conversationSummary: '', // No summary context for summary generation
-      conversationHistory: [] // Empty history for summary generation
+      conversationHistory: [], // Empty history for summary generation
+      temperature: behaviorPacks?.generation_settings?.temperature,
+      max_tokens: behaviorPacks?.generation_settings?.max_tokens
     });
     
     if (summaryResult.success && summaryResult.response) {
@@ -1095,8 +1357,17 @@ async function showChatInterface() {
     // Scroll to chat interface
     document.getElementById('chatInterface').scrollIntoView({ behavior: 'smooth' });
     
-    // Add welcome message
-    addMessage('assistant', 'vLLM is ready! You can now start chatting. Select a model version and type your message.');
+    // Load behavior packs for the current profile and inject exemplar if available
+    const profileName = modelInfo?.profileName || null;
+    await loadBehaviorPacks(profileName);
+    
+    // Clear one-shot exemplar before conversation_start injection (one-shot semantics)
+    pendingExemplarSystemText = null;
+    
+    // Try to inject exemplar for conversation_start, fallback to default message
+    if (!injectExemplar('conversation_start')) {
+      addMessage('assistant', 'Hello! I\'m glad to be talking with you today!');
+    }
   } catch (error) {
     console.error('Error showing chat interface:', error);
     showStatus('prepareStatus', 'Error loading chat interface: ' + error.message, 'error');
@@ -1147,9 +1418,13 @@ function addMessage(role, content, addToHistory = true) {
 async function sendMessage() {
   const input = document.getElementById('chatInput');
   // Get the user's actual typed message - this is what will be sent as the user message
-  const message = input.value.trim();
-  
-  if (!message) {
+  const userText = input.value.trim();
+  if (isSending) {
+    console.warn('[SEND] sendMessage() called while a send is already in progress. Ignoring duplicate call.');
+    return;
+  }
+
+  if (!userText) {
     return;
   }
 
@@ -1158,89 +1433,296 @@ async function sendMessage() {
     return;
   }
 
+  // --- Behavior trigger detection: asked_for_next_steps ---
+  function detectAskedForNextSteps(text) {
+    const patterns = [
+      /what should i do/i,
+      /what would you suggest/i,
+      /next step/i,
+      /how do i move/i,
+      /how do we move/i,
+      /what comes next/i,
+      /what can i try/i
+    ];
+    return patterns.some(p => p.test(text));
+  }
+
+  if (behaviorPacks?.triggers?.asked_for_next_steps) {
+    if (detectAskedForNextSteps(userText)) {
+      queueTrigger("asked_for_next_steps");
+      console.warn("[BEHAVIOR] Triggered asked_for_next_steps from user intent");
+    }
+  }
+
   const sendBtn = document.getElementById('sendBtn');
   const versionSelect = document.getElementById('versionSelect');
-  const systemMessage = document.getElementById('prependedText').value.trim();
+
+  // Behavior-pack system intent takes precedence. User prepend text is legacy fallback only.
+  const userProvidedSystem = document.getElementById('prependedText').value.trim();
+  const behaviorSystem = buildSystemFromBehaviorPack();
+  const systemToUse = behaviorSystem || userProvidedSystem;
+
+  const effectiveSystemMessage = wrapSystemBlocks(systemToUse, pendingExemplarSystemText);
 
   // Log what we're sending to verify it's correct
-  console.log('[SEND] User message (exactly as typed):', message);
-  console.log('[SEND] Message length:', message.length);
-  console.log('[SEND] System message length:', systemMessage.length);
-  if (systemMessage.length > 1000) {
-    console.warn('[SEND] WARNING: System message is very long (' + systemMessage.length + ' chars). Make sure this is intentional.');
+  console.log('[SEND] User message (exactly as typed):', userText);
+  console.log('[SEND] Message length:', userText.length);
+  console.log('[SEND] System message length:', effectiveSystemMessage.length);
+  console.log('[SEND] One-shot exemplar appended?', !!(pendingExemplarSystemText && pendingExemplarSystemText.trim()));
+  if (effectiveSystemMessage.length > 1000) {
+    console.warn('[SEND] WARNING: System message is very long (' + effectiveSystemMessage.length + ' chars). Make sure this is intentional.');
   }
 
   // Disable input while sending
   input.disabled = true;
   sendBtn.disabled = true;
   sendBtn.textContent = 'Sending...';
+  isSending = true;
 
-  // Add user message to chat (display only, not in history yet)
-  addMessage('user', message, false);
-  
+  // Fix possible duplicate user-message rendering
+  if (conversationHistory.length > 0) {
+    const last = conversationHistory[conversationHistory.length - 1];
+    if (last.role === 'user' && last.content === userText) {
+      console.warn('[SEND] Duplicate user message detected; skipping UI append.');
+    } else {
+      addMessage('user', userText, false);
+    }
+  } else {
+    addMessage('user', userText, false);
+  }
+
   // Clear input immediately after capturing the message
   input.value = '';
 
+  // --- Behavior-driven generation settings ---
+  const gen = behaviorPacks?.generation_defaults || {};
+  let requestedMaxTokens = 512; // safe fallback
+  if (gen.soft_max_tokens) {
+    requestedMaxTokens = gen.soft_max_tokens;
+  }
+  let verbosityMultiplier = 1;
+  if (gen.verbosity === "high") verbosityMultiplier = 1.5;
+  if (gen.verbosity === "low") verbosityMultiplier = 0.7;
+  requestedMaxTokens = Math.floor(requestedMaxTokens * verbosityMultiplier);
+
   try {
-    // Fix 3: Normalize conversation history before sending to enforce strict role alternation
-    const normalizedHistory = normalizeConversation(conversationHistory);
-    
     // Send ONLY the user's typed message - system message and summary are handled separately as system messages
     // Conversation history is always sent (always enabled)
-    const result = await window.electronAPI.sendChatMessage({
-      message: message, // This is the user's actual typed message, nothing else
+    const requestBody = {
+      message: userText,
       version: versionSelect.value,
-      prependedText: systemMessage, // System message from user input
-      useSummary: false, // Always false - history is always enabled, no summary feature
-      conversationSummary: '', // Not used - history is always enabled
-      conversationHistory: normalizedHistory // Always send conversation history
-    });
+      prependedText: effectiveSystemMessage,
+      useSummary: false,
+      conversationSummary: '',
+      conversationHistory: conversationHistory,
+      temperature: behaviorPacks?.generation_settings?.temperature,
+      max_tokens: requestedMaxTokens
+    };
+    const result = await window.electronAPI.sendChatMessage(requestBody);
 
     if (result.success) {
       // Note: System messages are added per-request, not stored in history
       // Only user and assistant messages are stored in conversation history
-      
+
+      // Save config to persist conversation history
       // Add user message to history (clean, without system message formatting)
       conversationHistory.push({
         role: 'user',
-        content: message.trim()
+        content: userText
       });
-      
-      // Save config to persist conversation history
       saveConfig();
-      
-      // Fix 1: Only append assistant messages with real content (non-empty)
-      const assistantText = result.response?.trim() ?? "";
-      if (assistantText.length > 0) {
-        // Add assistant response to UI
-        addMessage('assistant', assistantText);
-        
-        // Add assistant response to history (only if non-empty)
-        conversationHistory.push({
-          role: 'assistant',
-          content: assistantText
-        });
-        
-        // Save config to persist conversation history
-        saveConfig();
-      } else {
+
+      // Only append assistant messages with real content (non-empty)
+      let assistantText = result.response?.trim() ?? "";
+
+      // --- Behavior enforcement: examples & reasoning ---
+      function lacksConcreteExamples(text) {
+        return !/(student work|exit ticket|lesson|team meeting|artifact|assessment|instructional|classroom)/i.test(text);
+      }
+      function lacksReasoning(text) {
+        return !/(because|so that|this helps|which allows|as a result)/i.test(text);
+      }
+      const genDefaults = behaviorPacks?.generation_defaults || {};
+      if (genDefaults.require_examples && lacksConcreteExamples(assistantText)) {
+        queueTrigger("expand_into_practice");
+        console.warn("[BEHAVIOR] Response lacked concrete examples; queuing expand_into_practice");
+      }
+      if (genDefaults.explain_reasoning && lacksReasoning(assistantText)) {
+        queueTrigger("expand_into_practice");
+        console.warn("[BEHAVIOR] Response lacked reasoning; queuing expand_into_practice");
+      }
+      // --- Behavior enforcement: min_paragraphs ---
+      if (genDefaults.min_paragraphs) {
+        const paragraphCount = assistantText.split(/\n\s*\n/).length;
+        if (paragraphCount < genDefaults.min_paragraphs) {
+          queueTrigger("expand_into_practice");
+          console.warn("[BEHAVIOR] Response below min_paragraphs; queuing expand_into_practice");
+        }
+      }
+
+      // 3) Prevent any diagnostic response from reaching UI/history:
+      // Only call addMessage('assistant', ...) after all rewrites and checks.
+      let handled = false;
+
+      if (assistantText.length === 0) {
         // Empty response - show in UI but don't add to history
-        addMessage('assistant', '(Empty response)');
+        addMessage('assistant', '(Empty response)', false);
         console.warn('[CHAT] Received empty assistant response - not adding to history');
+        handled = true;
+      }
+
+      // 2) Change diagnostic-opening handling to force a FULL rewrite (not just opening rewrite)
+      if (!handled && violatesOpeningRules(assistantText)) {
+        injectExemplar('diagnostic_opening');
+        const diagnosticSystem = wrapSystemBlocks(systemToUse, pendingExemplarSystemText);
+        const fullRewritePrompt =
+`Rewrite the response below as a thoughtful coaching reply.
+- Do NOT diagnose, label, or classify the leader or their situation.
+- Open by reflecting what the leader is noticing or experiencing.
+- Use concrete examples of teacher team practice (routines, artifacts, questions, decisions).
+- Explain why those moves would help practice change.
+- Avoid headings, stages, or shorthand.
+
+Original response:
+${assistantText}
+
+Return ONLY the revised response.
+`;
+        try {
+          const reframed = await window.electronAPI.sendChatMessage({
+            message: fullRewritePrompt,
+            version: versionSelect.value,
+            prependedText: diagnosticSystem,
+            useSummary: false,
+            conversationSummary: '',
+            conversationHistory: conversationHistory,
+            temperature: behaviorPacks?.generation_settings?.temperature,
+            max_tokens: requestedMaxTokens
+          });
+          if (reframed.success && reframed.response?.trim()) {
+            assistantText = reframed.response.trim();
+            // Only accept if it does NOT contain forbidden terms
+            if (!containsForbiddenTerms(assistantText)) {
+              handled = false; // allow next checks (for expansion etc.)
+            } else {
+              // Still contains forbidden terms; do NOT show in UI/history
+              handled = true;
+            }
+          } else {
+            // Rewrite failed, do not show in UI/history
+            handled = true;
+          }
+        } catch (e) {
+          console.error('[BEHAVIOR] Full rewrite for diagnostic opening failed:', e);
+          handled = true;
+        }
+      }
+
+      // 2b/3) Post-generation enforcement: if the model falls back to forbidden terms, do a single rewrite retry
+      if (!handled && containsForbiddenTerms(assistantText)) {
+        console.warn('[BEHAVIOR] Assistant output contained forbidden terms. Attempting one rewrite retry.');
+        injectExemplar('response_violation');
+        const correctiveSystem = wrapSystemBlocks(systemToUse, pendingExemplarSystemText);
+        const rewritePrompt = buildRewriteInstruction(userText, assistantText);
+        try {
+          const retry = await window.electronAPI.sendChatMessage({
+            message: rewritePrompt,
+            version: versionSelect.value,
+            prependedText: correctiveSystem,
+            useSummary: false,
+            conversationSummary: '',
+            conversationHistory: conversationHistory,
+            temperature: behaviorPacks?.generation_settings?.temperature,
+            max_tokens: requestedMaxTokens
+          });
+          if (retry.success && (retry.response?.trim() ?? '').length > 0) {
+            const rewritten = retry.response.trim();
+            if (!containsForbiddenTerms(rewritten)) {
+              assistantText = rewritten;
+              handled = false; // allow next checks (for expansion etc.)
+            } else {
+              // Still contains forbidden terms; do NOT show in UI/history
+              handled = true;
+            }
+          } else {
+            // Rewrite failed, do not show in UI/history
+            handled = true;
+          }
+        } catch (e) {
+          console.error('[BEHAVIOR] Error during rewrite retry:', e);
+          handled = true;
+        }
+      }
+
+      // 2c) Escalate rewrite if response is syntactically compliant but lacks concrete practice or is too brief
+      if (!handled && !containsForbiddenTerms(assistantText) && (lacksConcretePractice(assistantText) || isTooBrief(assistantText))) {
+        console.warn('[BEHAVIOR] Assistant output lacked concrete practice or was too brief. Attempting expansion rewrite.');
+        injectExemplar('expand_into_practice');
+        const expansionSystem = wrapSystemBlocks(systemToUse, pendingExemplarSystemText);
+        const expansionPrompt =
+          `Rewrite the response below as a helpful coaching answer (not a label/diagnosis). ` +
+          `Include: (1) a brief reflection of what the leader is noticing, (2) 2–4 actionable next steps, and (3) at least one concrete example (routine/protocol/artifact/question set) a team could use next meeting. ` +
+          `Explain why those moves would change practice.\n\n` +
+          `Original response:\n${assistantText}\n\n` +
+          `Return ONLY the expanded response.`;
+        try {
+          const expanded = await window.electronAPI.sendChatMessage({
+            message: expansionPrompt,
+            version: versionSelect.value,
+            prependedText: expansionSystem,
+            useSummary: false,
+            conversationSummary: '',
+            conversationHistory: conversationHistory,
+            temperature: behaviorPacks?.generation_settings?.temperature,
+            max_tokens: requestedMaxTokens
+          });
+          if (expanded.success && (expanded.response?.trim() ?? '').length > 0) {
+            const expandedText = expanded.response.trim();
+            if (!containsForbiddenTerms(expandedText)) {
+              assistantText = expandedText;
+              handled = false;
+            } else {
+              handled = true;
+            }
+          } else {
+            handled = true;
+          }
+        } catch (e) {
+          console.error('[BEHAVIOR] Error during expansion rewrite:', e);
+          handled = true;
+        }
+      }
+
+      // 3) Prevent any diagnostic response from reaching UI/history:
+      // Only append assistant messages if not handled (i.e., assistantText is compliant and all rewrites succeeded)
+      if (!handled && assistantText && assistantText.trim().length > 0 && !containsForbiddenTerms(assistantText)) {
+        addMessage('assistant', assistantText.trim());
+        saveConfig();
+      } else if (!handled) {
+        // If ALL rewrites fail, display a single fallback assistant message and DO NOT save it to history.
+        addMessage('assistant', "Let’s slow this down and look closely at what you’re noticing in practice.", false);
+        // Do not call saveConfig here
       }
     } else {
-      // Fix 2: Never append assistant messages on error - errors are out-of-band events
+      // Never append assistant messages on error - errors are out-of-band events
       const errorMsg = result.error || 'Unknown error';
       console.error('[CHAT] Chat error:', errorMsg);
-      addMessage('assistant', 'Error: ' + errorMsg);
+      addMessage('assistant', 'Error: ' + errorMsg, false);
       // Do NOT mutate conversation history here - errors are not part of the conversation
     }
+    
+    // Clear one-shot exemplar after request attempt (one-shot semantics)
+    pendingExemplarSystemText = null;
   } catch (error) {
-    // Fix 2: Never append assistant messages on error - errors are out-of-band events
+    // Never append assistant messages on error - errors are out-of-band events
     console.error('[CHAT] Error sending message:', error);
-    addMessage('assistant', 'Error: ' + error.message);
+    addMessage('assistant', 'Error: ' + error.message, false);
     // Do NOT mutate conversation history here - errors are not part of the conversation
+    
+    // Clear one-shot exemplar on error (one-shot semantics)
+    pendingExemplarSystemText = null;
   } finally {
+    isSending = false;
     input.disabled = false;
     sendBtn.disabled = false;
     sendBtn.textContent = 'Send';
@@ -1276,11 +1758,9 @@ function updateButtonStates() {
   
 }
 
-
 function showStatus(elementId, message, type) {
   const element = document.getElementById(elementId);
   if (!element) return;
-  
   element.className = `status ${type}`;
   element.textContent = message;
 }

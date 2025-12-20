@@ -13,10 +13,23 @@ from transformers.generation.logits_process import LogitsProcessorList, InfNanRe
 from peft import PeftModel
 import os
 import time
+# === Diagnostic shorthand post-filter helper ===
+#
+# Tunables (override via environment)
+# MAX_NEW_TOKENS_CAP: hard upper bound on generation length
+# MAX_GENERATION_SECONDS: wall-clock budget per request
 import json
 from pathlib import Path
 
+# === Diagnostic shorthand post-filter helper ===
+import re
+
+
 app = FastAPI(title="Anvil Inference Server")
+
+# Readiness state
+MODEL_READY = False
+MODEL_ERROR = None
 
 # Global models and tokenizers
 models = {}  # {"base": model, "v1": model, etc.}
@@ -37,16 +50,24 @@ if device == "cuda":
 class ChatRequest(BaseModel):
     messages: List[Dict[str, str]]
     model: str = "base"  # "base" or "v1", "v2", etc.
-    max_length: int = 1024
-    temperature: float = 0.7
+    max_length: int = 512  # Deprecated, use max_new_tokens if provided
+    max_new_tokens: Optional[int] = None
+    temperature: Optional[float] = None
+    top_p: Optional[float] = None
+    top_k: Optional[int] = None
+    do_sample: Optional[bool] = None
     summary: Optional[str] = None
     update_summary: bool = False
+    # Behavior-pack fields (pass-through for client controls; not enforced server-side)
+    verbosity: Optional[str] = None
+    min_paragraphs: Optional[int] = None
 
 class ChatResponse(BaseModel):
     response: str
     model_used: str
     tokens_generated: int
     inference_time: float
+    finish_reason: str
     summary: Optional[str] = None
 
 class ModelInfo(BaseModel):
@@ -58,6 +79,9 @@ class ModelInfo(BaseModel):
 async def load_models():
     """Load all available models on server startup"""
     global models, tokenizers
+    global MODEL_READY, MODEL_ERROR
+    MODEL_READY = False
+    MODEL_ERROR = None
     
     print(f"[SERVER] Starting inference server on {device}...")
     print(f"[SERVER] Using dtype: {model_dtype}")
@@ -100,6 +124,7 @@ async def load_models():
         tokenizers["base"] = base_tokenizer
         print(f"[SERVER] ✓ Base model loaded")
     except Exception as e:
+        MODEL_ERROR = str(e)
         print(f"[SERVER] ✗ Failed to load base model: {e}")
         raise
     
@@ -139,44 +164,116 @@ async def load_models():
                     except Exception as e:
                         print(f"[SERVER] ✗ Failed to load {version_name} adapter: {e}")
     
+    MODEL_READY = True
     print(f"[SERVER] Server ready! Loaded models: {list(models.keys())}")
+
+@app.get("/ready")
+async def ready():
+    if MODEL_READY:
+        return {
+            "status": "ready",
+            "models_loaded": list(models.keys()),
+            "device": device
+        }
+
+    if MODEL_ERROR:
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "status": "error",
+                "message": MODEL_ERROR
+            }
+        )
+
+    raise HTTPException(
+        status_code=503,
+        detail={"status": "loading"}
+    )
 
 @app.post("/chat", response_model=ChatResponse)
 async def chat(request: ChatRequest):
     """Handle chat requests with model selection"""
-    def build_instruction(messages: List[Dict[str, str]]) -> str:
+    if not MODEL_READY:
+        raise HTTPException(
+            status_code=503,
+            detail="Model not ready yet"
+        )
+    # NOTE: This server is intentionally behavior-agnostic.
+    # Tone, verbosity, coaching style, and corrective behavior
+    # are controlled entirely by the client (renderer + behavior packs).
+    # The server intentionally does NOT persist or append conversation history.
+    # The client is responsible for storing and sending the full message history with each request.
+    def sanitize_messages(messages: List[Dict[str, str]]) -> List[Dict[str, str]]:
         """
-        Build a single Gemma-compatible instruction string.
-        System messages are treated as authoritative background context
-        and are never interleaved with user turns.
+        Clean conversation history to remove empty messages
+        and de-duplicate consecutive assistant messages.
         """
-        system_blocks = []
-        user_blocks = []
-
+        cleaned = []
+        last_assistant = None
         for m in messages:
             role = m.get("role")
             content = (m.get("content") or "").strip()
             if not content:
                 continue
+            # De-duplicate consecutive assistant messages
+            if role == "assistant":
+                if last_assistant == content:
+                    continue
+                last_assistant = content
+            else:
+                last_assistant = None
+            cleaned.append({"role": role, "content": content})
+        return cleaned
 
+    # Sanitize conversation history to remove empty and consecutive duplicate assistant messages
+    request.messages = sanitize_messages(request.messages)
+    # Logging: print the length and last roles of sanitized message list
+    print(f"[CHAT][LOG] Sanitized messages count: {len(request.messages)}")
+    if request.messages:
+        print(f"[CHAT][LOG] Last roles: {[m.get('role') for m in request.messages[-min(3, len(request.messages)):]]}")
+
+    # Debug: Log all generation-related request fields received
+    print(f"[CHAT][GEN-ARGS] Received generation fields: temperature={request.temperature!r}, max_new_tokens={request.max_new_tokens!r}, top_p={request.top_p!r}, top_k={request.top_k!r}, do_sample={request.do_sample!r}")
+
+    def build_instruction(messages: List[Dict[str, str]]) -> str:
+        """
+        Build the prompt by concatenating, in order:
+        - system messages (verbatim)
+        - prior dialogue turns (role-labeled by order, no headings)
+        - final user message
+        """
+        system_blocks = []
+        dialogue_blocks = []
+        for m in messages:
+            role = m.get("role")
+            content = (m.get("content") or "").strip()
+            if not content:
+                continue
             if role == "system":
                 system_blocks.append(content)
-            elif role == "user":
-                user_blocks.append(content)
-
-        if not user_blocks:
+            elif role in ("user", "assistant"):
+                dialogue_blocks.append((role, content))
+        if not dialogue_blocks:
             raise HTTPException(status_code=400, detail="No user instruction provided")
-
+        # The current user message is always the last user turn
+        current_user = None
+        for role, content in reversed(dialogue_blocks):
+            if role == "user":
+                current_user = content
+                break
+        if not current_user:
+            raise HTTPException(status_code=400, detail="No user instruction provided")
         instruction_parts = []
-
         if system_blocks:
-            instruction_parts.append(
-                "SYSTEM CONTEXT (background only — do not respond to this):\n"
-                + "\n\n".join(system_blocks)
-            )
-
-        instruction_parts.append("USER INSTRUCTION:\n" + user_blocks[-1])
-
+            instruction_parts.append("\n".join(system_blocks))
+        # Include prior context for continuity (exclude the current user turn)
+        prior_turns = dialogue_blocks[:-1]
+        if prior_turns:
+            formatted = []
+            for role, content in prior_turns[-4:]:  # cap history to avoid drift
+                formatted.append(content)
+            instruction_parts.append("\n".join(formatted))
+        instruction_parts.append(current_user)
         return "\n\n".join(instruction_parts)
 
     instruction = build_instruction(request.messages)
@@ -190,6 +287,7 @@ async def chat(request: ChatRequest):
     print("=== END NORMALIZED ===")
     
     start_time = time.time()
+    MAX_GENERATION_SECONDS = int(os.getenv("MAX_GENERATION_SECONDS", "35"))
     
     # Get model (default to base if not found)
     model_name = request.model.lower()
@@ -242,36 +340,57 @@ async def chat(request: ChatRequest):
         # Simplified EOS handling
         eos_token_id = tokenizer.eos_token_id
 
-        # Generation settings
+    # ============================================================================
+    # Decoding-agnostic server: All stylistic, verbosity, and behavioral controls
+    # are delegated to the client (renderer + behavior packs).
+    # The server only enforces hard safety caps (MAX_NEW_TOKENS_CAP, MAX_GENERATION_SECONDS).
+    # No behavior logic, rewriting, filtering, or exemplar injection is performed here.
+    # ============================================================================
+
+    # Generation settings
+    # Prefer max_new_tokens if provided, else fall back to max_length (backward compatibility)
+    cap = int(os.getenv("MAX_NEW_TOKENS_CAP", "1024"))
+    if getattr(request, "max_new_tokens", None) is not None:
+        max_new_tokens = int(request.max_new_tokens)
+    else:
         max_new_tokens = int(getattr(request, "max_length", 1024))
-        max_new_tokens = max(1, min(max_new_tokens, 512))  # keep responses bounded
+    max_new_tokens = max(1, min(max_new_tokens, cap))
 
-        # Default to deterministic decode (prevents “token soup” during bring-up).
-        # Only enable sampling if the caller sets temperature > 0.
-        temperature = float(getattr(request, "temperature", 0.0))
-        if temperature and temperature > 0.0:
-            do_sample = True
-            temperature = max(0.05, min(temperature, 1.0))
+    # Temperature and do_sample logic
+    # Remove implicit defaulting that could override client intent.
+    # a) Default temperature fallback is None, not 0.7
+    temperature = request.temperature if getattr(request, "temperature", None) is not None else None
+    # b) If temperature is None, set do_sample=False and temperature=1.0
+    if temperature is None:
+        do_sample = False
+        temperature = 1.0
+    else:
+        # c) Only enable sampling if do_sample is True OR (temperature is not None and temperature > 0)
+        if getattr(request, "do_sample", None) is not None:
+            do_sample = bool(request.do_sample)
         else:
-            do_sample = False
-            temperature = 1.0
+            do_sample = temperature > 0
+        temperature = float(temperature)
 
-        gen_kwargs = dict(
-            max_new_tokens=max_new_tokens,
-            do_sample=do_sample,
-            temperature=temperature,
-            logits_processor=logits_processor,
-            eos_token_id=eos_token_id,
-            pad_token_id=tokenizer.pad_token_id or tokenizer.eos_token_id,
-            repetition_penalty=1.1,
-        )
+    gen_kwargs = dict(
+        max_new_tokens=max_new_tokens,
+        do_sample=do_sample,
+        temperature=temperature,
+        logits_processor=logits_processor,
+        eos_token_id=eos_token_id,
+        pad_token_id=tokenizer.pad_token_id or tokenizer.eos_token_id,
+        repetition_penalty=1.1,
+    )
 
-        # Constrained sampling to prevent multilingual/gibberish drift.
-        if do_sample:
-            gen_kwargs.update(
-                top_p=0.9,
-                top_k=50,
-            )
+    # Only apply top_p/top_k if explicitly provided
+    if getattr(request, "top_p", None) is not None:
+        gen_kwargs["top_p"] = float(request.top_p)
+    if getattr(request, "top_k", None) is not None:
+        gen_kwargs["top_k"] = int(request.top_k)
+
+        # Hard wall-clock time budget for generation
+        if time.time() - start_time > MAX_GENERATION_SECONDS:
+            raise HTTPException(status_code=504, detail="Generation time budget exceeded")
 
         outputs = model.generate(
             **inputs,
@@ -296,6 +415,8 @@ async def chat(request: ChatRequest):
             ).strip()
             # Remove common special-token artifacts if present
             response = response_raw.replace(tokenizer.eos_token or "", "").strip()
+
+        # Server does NOT mutate or filter messages or responses based on content.
         
         def update_rolling_summary(existing_summary: Optional[str], user_instruction: str, assistant_reply: str) -> str:
             prompt = (
@@ -336,27 +457,31 @@ async def chat(request: ChatRequest):
             return tokenizer.decode(summary_tokens, skip_special_tokens=True).strip()
 
         new_summary = None
-        if request.update_summary:
+        if request.summary is not None:
             new_summary = update_rolling_summary(
                 request.summary,
-                request.messages[-1]["content"],
+                request.messages[-2]["content"],
                 response
             )
         
         inference_time = time.time() - start_time
         tokens_generated = len(outputs[0]) - prompt_length
+        finish_reason = "length" if tokens_generated >= max_new_tokens else "stop"
         
-        print(f"[CHAT] {model_name}: {tokens_generated} tokens in {inference_time:.2f}s")
-        
+        print(f"[CHAT] {model_name}: {tokens_generated} tokens in {inference_time:.2f}s (finish_reason={finish_reason})")
+        # Debug logging: assistant response length and note that it is NOT appended to history server-side
+        print(f"[CHAT][LOG] Final assistant response length: {len(response)} characters")
+        print(f"[CHAT][LOG] Assistant response returned (server-side, per-request only).")
         return ChatResponse(
             response=response,
             model_used=model_name,
             tokens_generated=tokens_generated,
             inference_time=inference_time,
+            finish_reason=finish_reason,
             summary=new_summary
         )
     except Exception as e:
-        print(f"[CHAT] Error: {e}")
+        print(f"[CHAT][ERROR] Generation failed after {time.time() - start_time:.2f}s: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/models", response_model=List[ModelInfo])
@@ -372,6 +497,7 @@ async def health():
     """Health check endpoint"""
     return {
         "status": "healthy",
+        "ready": MODEL_READY,
         "models_loaded": len(models),
         "available_models": list(models.keys()),
         "device": device

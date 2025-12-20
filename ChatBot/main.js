@@ -691,6 +691,63 @@ ipcMain.handle('load-config', async () => {
   }
 });
 
+// NOTE: behavior_packs.json is intentionally treated as passive configuration data.
+// main.js is responsible ONLY for loading and returning behavior packs to the renderer.
+// All behavior selection, trigger evaluation, exemplar injection, voice resets,
+// and drift correction MUST occur in the renderer at prompt-assembly time.
+// Do NOT add behavioral logic here or attempt to enforce exemplars in main.js.
+// Load behavior packs configuration for a specific profile
+ipcMain.handle('load-behavior-packs', async (event, profileName) => {
+  try {
+    if (!profileName) {
+      console.log('[BEHAVIOR] No profile name provided, using defaults');
+      return {
+        success: true,
+        data: {
+          behavior_version: "1.0",
+          default_mode: "coaching",
+          exemplars: {}
+        },
+        isEmpty: true
+      };
+    }
+    
+    const behaviorPacksPath = path.join(MODELS_DIR, profileName, 'behavior_packs.json');
+    if (fs.existsSync(behaviorPacksPath)) {
+      const behaviorPacks = JSON.parse(fs.readFileSync(behaviorPacksPath, 'utf8'));
+      console.log(`[BEHAVIOR] behavior_packs.json loaded for profile "${profileName}". Renderer is responsible for applying exemplars.`);
+      // Check if pack is empty (only blank stems - no exemplars with actual content)
+      const isEmpty = !behaviorPacks.exemplars ||
+                     Object.keys(behaviorPacks.exemplars).length === 0 ||
+                     Object.values(behaviorPacks.exemplars).every(ex => !ex.text || !ex.text.trim());
+      return {
+        success: true,
+        data: behaviorPacks,
+        isEmpty: isEmpty
+      };
+    } else {
+      console.log(`[BEHAVIOR] No behavior_packs.json file found for profile ${profileName}, using defaults`);
+      return {
+        success: true,
+        data: {
+          behavior_version: "1.0",
+          default_mode: "coaching",
+          exemplars: {}
+        },
+        isEmpty: true
+      };
+    }
+  } catch (error) {
+    console.error('[BEHAVIOR] Error loading behavior packs:', error.message);
+    return {
+      success: false,
+      error: error.message,
+      data: null,
+      isEmpty: true
+    };
+  }
+});
+
 // Save ChatBot configuration
 ipcMain.handle('save-config', async (event, config) => {
   try {
@@ -1844,6 +1901,7 @@ except Exception as e:
       envVarsList.push(`ADAPTER_BASE_PATH='/workspace/models'`);
       envVarsList.push(`PROFILE_NAME='${profileName}'`);
       envVarsList.push(`INFERENCE_PORT='${inferencePort}'`);
+      envVarsList.push(`MAX_NEW_TOKENS_CAP='1536'`);
       const envString = envVarsList.join(' ');
       
       // Start server with nohup (no supervisor dependency)
@@ -1948,42 +2006,89 @@ except Exception as e:
       console.log(`[INIT] [SERVER PREP] Waiting 3 seconds for server to fully initialize...`);
       await new Promise(resolve => setTimeout(resolve, 3000));
       
-      try {
-        // Check health endpoint over SSH (internal, no authentication needed)
-        const healthCheck = await ssh.execCommand(`curl -s ${localHealthUrl} 2>&1 | head -100 || echo "curl_failed"`);
-        console.log(`[INIT] [SERVER PREP] Health check exit code: ${healthCheck.code}`);
-        console.log(`[INIT] [SERVER PREP] Health check stdout: ${healthCheck.stdout.substring(0, 500)}`);
-        if (healthCheck.stderr) {
-          console.log(`[INIT] [SERVER PREP] Health check stderr: ${healthCheck.stderr}`);
-        }
+      // Retry health check every 3 seconds for up to 60 seconds (20 attempts)
+      const maxRetries = 20;
+      const retryInterval = 3000; // 3 seconds
+      const maxRetryTime = 60000; // 60 seconds
+      let healthCheckPassed = false;
+      let attemptCount = 0;
+      const startTime = Date.now();
+      
+      console.log(`[INIT] [HEALTH CHECK] Starting health check retry loop (max ${maxRetries} attempts, ${maxRetryTime/1000}s total)...`);
+      results.steps.push(`Checking server health (will retry every 3s for up to 60s)...`);
+      
+      while (!healthCheckPassed && attemptCount < maxRetries && (Date.now() - startTime) < maxRetryTime) {
+        attemptCount++;
+        const elapsedSeconds = Math.floor((Date.now() - startTime) / 1000);
+        console.log(`[INIT] [HEALTH CHECK] Attempt ${attemptCount}/${maxRetries} (${elapsedSeconds}s elapsed)...`);
         
-        if (healthCheck.stdout.includes('curl_failed') || !healthCheck.stdout.trim()) {
-          console.log(`[INIT] ⚠ Server health check - server may still be starting`);
-          results.steps.push(`⚠ Server health check - server may still be starting`);
-        } else {
-          try {
-            const healthData = JSON.parse(healthCheck.stdout);
-            console.log(`[INIT] [SERVER PREP] Parsed health data:`, JSON.stringify(healthData, null, 2));
-            if (healthData.status === 'healthy' || healthData.status === 'ok') {
-              console.log(`[INIT] ✓ Server health check passed - server is responding correctly`);
-              results.steps.push(`✓ Server health check passed - server is responding`);
-              // Server is responding - set flag to auto-launch chat interface
-              results.healthCheckPassed = true;
-            } else {
-              console.log(`[INIT] ⚠ Server health check - server responded but status is not 'healthy': ${healthData.status || 'unknown'}`);
-              results.steps.push(`⚠ Server health check - status: ${healthData.status || 'unknown'}`);
+        try {
+          // Check health endpoint over SSH (internal, no authentication needed)
+          const healthCheck = await ssh.execCommand(`curl -s ${localHealthUrl} 2>&1 | head -100 || echo "curl_failed"`);
+          console.log(`[INIT] [HEALTH CHECK] Attempt ${attemptCount}: exit code: ${healthCheck.code}`);
+          console.log(`[INIT] [HEALTH CHECK] Attempt ${attemptCount}: stdout length: ${healthCheck.stdout ? healthCheck.stdout.length : 0} chars`);
+          if (healthCheck.stderr) {
+            console.log(`[INIT] [HEALTH CHECK] Attempt ${attemptCount}: stderr: ${healthCheck.stderr.substring(0, 200)}`);
+          }
+          
+          if (healthCheck.stdout.includes('curl_failed') || !healthCheck.stdout.trim()) {
+            console.log(`[INIT] [HEALTH CHECK] Attempt ${attemptCount}: FAILED - curl failed or empty response`);
+            if (attemptCount < maxRetries && (Date.now() - startTime) < maxRetryTime) {
+              console.log(`[INIT] [HEALTH CHECK] Attempt ${attemptCount}: Retrying in 3 seconds...`);
+              await new Promise(resolve => setTimeout(resolve, retryInterval));
+              continue;
             }
-          } catch (e) {
-            console.log(`[INIT] ⚠ Server health check - could not parse health response: ${e.message}`);
-            console.log(`[INIT] [SERVER PREP] Raw response: ${healthCheck.stdout ? healthCheck.stdout.substring(0, 200) : 'no data'}`);
-            results.steps.push(`⚠ Server health check - response format unexpected`);
+          } else {
+            try {
+              const healthData = JSON.parse(healthCheck.stdout);
+              console.log(`[INIT] [HEALTH CHECK] Attempt ${attemptCount}: Parsed health data:`, JSON.stringify(healthData, null, 2));
+              if (healthData.status === 'healthy' || healthData.status === 'ok') {
+                console.log(`[INIT] [HEALTH CHECK] Attempt ${attemptCount}: ✓ PASSED - server is responding correctly`);
+                console.log(`[INIT] ✓ Server health check passed after ${attemptCount} attempt(s) (${elapsedSeconds}s)`);
+                results.steps.push(`✓ Server health check passed after ${attemptCount} attempt(s) (${elapsedSeconds}s)`);
+                // Server is responding - set flag to auto-launch chat interface
+                results.healthCheckPassed = true;
+                healthCheckPassed = true;
+                break;
+              } else {
+                console.log(`[INIT] [HEALTH CHECK] Attempt ${attemptCount}: FAILED - status is not 'healthy': ${healthData.status || 'unknown'}`);
+                if (attemptCount < maxRetries && (Date.now() - startTime) < maxRetryTime) {
+                  console.log(`[INIT] [HEALTH CHECK] Attempt ${attemptCount}: Retrying in 3 seconds...`);
+                  await new Promise(resolve => setTimeout(resolve, retryInterval));
+                  continue;
+                }
+              }
+            } catch (e) {
+              console.log(`[INIT] [HEALTH CHECK] Attempt ${attemptCount}: FAILED - could not parse health response: ${e.message}`);
+              console.log(`[INIT] [HEALTH CHECK] Attempt ${attemptCount}: Raw response: ${healthCheck.stdout ? healthCheck.stdout.substring(0, 200) : 'no data'}`);
+              if (attemptCount < maxRetries && (Date.now() - startTime) < maxRetryTime) {
+                console.log(`[INIT] [HEALTH CHECK] Attempt ${attemptCount}: Retrying in 3 seconds...`);
+                await new Promise(resolve => setTimeout(resolve, retryInterval));
+                continue;
+              }
+            }
+          }
+        } catch (healthError) {
+          console.log(`[INIT] [HEALTH CHECK] Attempt ${attemptCount}: ERROR - ${healthError.message}`);
+          console.log(`[INIT] [HEALTH CHECK] Attempt ${attemptCount}: Error details:`, healthError);
+          if (attemptCount < maxRetries && (Date.now() - startTime) < maxRetryTime) {
+            console.log(`[INIT] [HEALTH CHECK] Attempt ${attemptCount}: Retrying in 3 seconds...`);
+            await new Promise(resolve => setTimeout(resolve, retryInterval));
+            continue;
           }
         }
-      } catch (healthError) {
-        console.log(`[INIT] [SERVER PREP] Health check error: ${healthError.message}`);
-        console.log(`[INIT] [SERVER PREP] Health check error details:`, healthError);
-        console.log(`[INIT] ⚠ Server health check - could not check server status`);
-        results.steps.push(`⚠ Server health check - could not check server status (server may still be starting)`);
+      }
+      
+      // If health check failed after all retries, abort with error
+      if (!healthCheckPassed) {
+        const finalElapsedSeconds = Math.floor((Date.now() - startTime) / 1000);
+        const errorMsg = `Server health check failed after ${attemptCount} attempt(s) over ${finalElapsedSeconds} seconds. The inference server did not respond correctly.`;
+        console.error(`[INIT] ✗ ${errorMsg}`);
+        console.error(`[INIT] [HEALTH CHECK] All ${attemptCount} attempts failed. Aborting initialization.`);
+        results.errors.push(errorMsg);
+        results.steps.push(`✗ ${errorMsg}`);
+        ssh.dispose();
+        return results;
       }
       
       console.log('[INIT] ✓ Step 5: Inference server started');

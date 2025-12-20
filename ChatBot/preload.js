@@ -12,5 +12,6 @@ contextBridge.exposeInMainWorld('electronAPI', {
   sendChatMessage: (config) => ipcRenderer.invoke('send-chat-message', config),
   loadConfig: () => ipcRenderer.invoke('load-config'),
   saveConfig: (config) => ipcRenderer.invoke('save-config', config),
+  loadBehaviorPacks: (profileName) => ipcRenderer.invoke('load-behavior-packs', profileName),
 });
 

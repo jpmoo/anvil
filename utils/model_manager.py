@@ -64,6 +64,23 @@ class ModelManager:
             # If behavioral.json creation fails, log but don't fail model creation
             print(f"Warning: Could not create behavioral.json for {model_name}: {e}")
         
+        # Initialize behavior_packs.json in model's profile directory
+        try:
+            behavior_packs_path = model_dir / "behavior_packs.json"
+            if not behavior_packs_path.exists():
+                # Create with blank stems (empty exemplars)
+                blank_behavior_packs = {
+                    "behavior_version": "1.0",
+                    "default_mode": "coaching",
+                    "exemplars": {}
+                }
+                with open(behavior_packs_path, 'w') as f:
+                    json.dump(blank_behavior_packs, f, indent=2)
+                print(f"Created blank behavior_packs.json for {model_name}")
+        except Exception as e:
+            # If behavior_packs.json creation fails, log but don't fail model creation
+            print(f"Warning: Could not create behavior_packs.json for {model_name}: {e}")
+        
         return model_name
     
     def get_available_models(self, include_archived: bool = False):
