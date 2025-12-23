@@ -6,6 +6,7 @@ import requests
 import subprocess
 from pathlib import Path
 from datetime import datetime
+from typing import Optional
 from utils.training_data import TrainingDataManager
 from utils.fine_tuner import FineTuner
 from utils.model_status import ModelStatus
@@ -44,6 +45,7 @@ def get_ssh_base_options(ssh_port: int) -> list:
         "-p", str(ssh_port),
         "-o", "StrictHostKeyChecking=no",
         "-o", "UserKnownHostsFile=/dev/null",
+        "-o", "LogLevel=ERROR",
         "-o", "BatchMode=yes",
         "-o", "ConnectTimeout=10"
     ]
@@ -918,14 +920,27 @@ def render():
             # SSH Port configuration (optional override)
             st.markdown("---")
             st.markdown("#### SSH Connection Settings")
+            
+            # Check for saved SSH port override from dismissed job
+            saved_port_key = f"saved_ssh_port_override_{model_name}"
+            default_ssh_port = st.session_state.get(saved_port_key, 22)
+            
             ssh_port_override = st.number_input(
                 "SSH Port (optional override)",
                 min_value=1,
                 max_value=65535,
-                value=22,
+                value=default_ssh_port,
                 help="Override the SSH port if the default (22) or auto-detected port is incorrect. Leave as 22 if unsure. This will be used for all SSH connections during training.",
                 key="ssh_port_override_input"
             )
+            
+            # If user changes the port, update the saved value
+            if ssh_port_override != default_ssh_port:
+                if ssh_port_override != 22:
+                    st.session_state[saved_port_key] = ssh_port_override
+                elif saved_port_key in st.session_state:
+                    # User reset to 22, clear saved value
+                    del st.session_state[saved_port_key]
             if ssh_port_override != 22:
                 st.info(f"ℹ️ SSH port override set to **{ssh_port_override}**. This will be used instead of the auto-detected port.")
             
@@ -1173,6 +1188,13 @@ def render():
                                 
                                 # Mark job as dismissed (do NOT stop or destroy instance)
                                 instance_id = active_job.get("instance_id")
+                                
+                                # CRITICAL: Preserve SSH port override before deleting job
+                                ssh_port_override = active_job.get("ssh_port_override")
+                                if ssh_port_override and ssh_port_override != 22:
+                                    # Save to model-specific session state key
+                                    saved_port_key = f"saved_ssh_port_override_{model_name}"
+                                    st.session_state[saved_port_key] = ssh_port_override
                                 
                                 # Reset phase to 1 and clear session state BEFORE deleting job
                                 phase_key = f"training_phase_{instance_id}"
@@ -1912,13 +1934,13 @@ def render():
                                     
                                     # Create directories with retry logic
                                     terminal_output.append(f"[SSH] Creating directories on remote instance...")
-                                    import time
+                                    import time as time_module_mkdir  # Use alias to avoid scoping issues
                                     mkdir_success = False
                                     for retry in range(3):
                                         if retry > 0:
                                             wait_time = 2 ** retry  # Exponential backoff: 2, 4 seconds
                                             terminal_output.append(f"[SSH] Retry {retry}/3 after {wait_time}s wait...")
-                                            time.sleep(wait_time)
+                                            time_module_mkdir.sleep(wait_time)
                                         
                                         mkdir_cmd = [
                                             "ssh"
@@ -2164,13 +2186,13 @@ def render():
                                                 # Directories don't exist, create them with retry logic
                                                 terminal_output.append(f"[SSH] Connecting to {ssh_host}:{ssh_port}")
                                                 terminal_output.append(f"[SSH] Creating directories on remote instance...")
-                                                import time
+                                                import time as time_module_mkdir2  # Use alias to avoid scoping issues
                                                 mkdir_success = False
                                                 for retry in range(3):
                                                     if retry > 0:
                                                         wait_time = 2 ** retry  # Exponential backoff: 2, 4 seconds
                                                         terminal_output.append(f"[SSH] Retry {retry}/3 after {wait_time}s wait...")
-                                                        time.sleep(wait_time)
+                                                        time_module_mkdir2.sleep(wait_time)
                                                     
                                                     mkdir_cmd = [
                                                         "ssh", "-p", str(ssh_port), 
@@ -2304,13 +2326,13 @@ def render():
                                                         ]
                                                         
                                                         # Retry logic for SCP uploads (Vast.ai connections can be flaky)
-                                                        import time
+                                                        import time as time_module_scp  # Use alias to avoid scoping issues
                                                         config_upload_success = False
                                                         for retry in range(3):
                                                             if retry > 0:
                                                                 wait_time = 2 ** retry  # Exponential backoff: 2, 4 seconds
                                                                 terminal_output.append(f"[SCP] Retry {retry}/3 after {wait_time}s wait...")
-                                                                time.sleep(wait_time)
+                                                                time_module_scp.sleep(wait_time)
                                                             
                                                             scp_config_result = subprocess.run(scp_config_cmd, capture_output=True, text=True, timeout=300, input="yes\n")
                                                             if scp_config_result.returncode == 0:
@@ -2361,12 +2383,13 @@ def render():
                                                         ]
                                                         
                                                         # Retry logic for SCP uploads
+                                                        import time as time_module_scp_data  # Use alias to avoid scoping issues
                                                         dataset_upload_success = False
                                                         for retry in range(3):
                                                             if retry > 0:
                                                                 wait_time = 2 ** retry
                                                                 terminal_output.append(f"[SCP] Retry {retry}/3 after {wait_time}s wait...")
-                                                                time.sleep(wait_time)
+                                                                time_module_scp_data.sleep(wait_time)
                                                             
                                                             scp_result = subprocess.run(scp_cmd, capture_output=True, text=True, timeout=300, input="yes\n")
                                                             if scp_result.returncode == 0:
@@ -2500,7 +2523,7 @@ def render():
                                         if ssh_host:
                                             terminal_output.append(f"[SSH] Connecting to {ssh_host}:{ssh_port}")
                                             import subprocess
-                                            import time
+                                            import time as time_module_cleanup  # Use alias to avoid scoping issues
                                             
                                             # Delete uploaded files and directories with retry logic
                                             cleanup_success = False
@@ -2508,7 +2531,7 @@ def render():
                                                 if retry > 0:
                                                     wait_time = 2 ** retry  # Exponential backoff: 2, 4 seconds
                                                     terminal_output.append(f"[SSH] Retry {retry}/3 after {wait_time}s wait...")
-                                                    time.sleep(wait_time)
+                                                    time_module_cleanup.sleep(wait_time)
                                                 
                                                 cleanup_cmd = [
                                                     "ssh", "-p", str(ssh_port), 
@@ -2536,7 +2559,7 @@ def render():
                                                 if retry > 0:
                                                     wait_time = 2 ** retry  # Exponential backoff: 2, 4 seconds
                                                     terminal_output.append(f"[SSH] Retry {retry}/3 after {wait_time}s wait...")
-                                                    time.sleep(wait_time)
+                                                    time_module_cleanup.sleep(wait_time)
                                                 
                                                 mkdir_cmd = [
                                                     "ssh", "-p", str(ssh_port), 
@@ -2793,26 +2816,12 @@ def render():
                                                                 f"    print(f'Created last_run_prepared subdirectory: {{last_run_dir}}')\n"
                                                                 f"    print(f'Created fallback last_run_prepared in working dir: {{working_dir_fallback}}')\n"
                                         f"    \n"
-                                        f"    # Fix tokenizer_type if needed\n"
-                                        f"    tokenizer_type = config.get('tokenizer_type', '')\n"
-                                        f"    base_model = config.get('base_model', '').lower()\n"
-                                        f"    \n"
-                                        f"    if 'gemma' in base_model and tokenizer_type != 'GemmaTokenizer':\n"
-                                        f"        config['tokenizer_type'] = 'GemmaTokenizer'\n"
+                                        f"    # Remove tokenizer_type - let Axolotl auto-detect (per earlier fix)\n"
+                                        f"    # Axolotl will automatically detect the correct tokenizer from the base model\n"
+                                        f"    if 'tokenizer_type' in config:\n"
+                                        f"        removed_tokenizer_type = config.pop('tokenizer_type')\n"
                                         f"        fixed = True\n"
-                                        f"        print('Fixed tokenizer_type to GemmaTokenizer')\n"
-                                        f"    elif 'mistral' in base_model and tokenizer_type not in ['MistralTokenizer', 'AutoTokenizer']:\n"
-                                        f"        config['tokenizer_type'] = 'MistralTokenizer'\n"
-                                        f"        fixed = True\n"
-                                        f"        print('Fixed tokenizer_type to MistralTokenizer')\n"
-                                        f"    elif 'phi' in base_model and tokenizer_type != 'PhiTokenizer':\n"
-                                        f"        config['tokenizer_type'] = 'PhiTokenizer'\n"
-                                        f"        fixed = True\n"
-                                        f"        print('Fixed tokenizer_type to PhiTokenizer')\n"
-                                        f"    elif 'qwen' in base_model and tokenizer_type != 'Qwen2Tokenizer':\n"
-                                        f"        config['tokenizer_type'] = 'Qwen2Tokenizer'\n"
-                                        f"        fixed = True\n"
-                                        f"        print('Fixed tokenizer_type to Qwen2Tokenizer')\n"
+                                        f"        print(f'Removed tokenizer_type={{removed_tokenizer_type}} (Axolotl will auto-detect)')\n"
                                         f"    \n"
                                         f"    # Ensure adapter: 'lora' is set if lora_* parameters exist (required for LoRA mode)\n"
                                         f"    # BUT only if there's no existing adapter path (for incremental training)\n"
@@ -2835,9 +2844,26 @@ def render():
                                         f"    lora_model_dir = config.get('lora_model_dir', '')\n"
                                         f"    adapter_val = config.get('adapter', '')\n"
                                         f"    \n"
+                                        f"    # CRITICAL: Check if adapter path exists - if not, remove it and set to 'lora' for new training\n"
+                                        f"    adapter_val = config.get('adapter')\n"
+                                        f"    if adapter_val and isinstance(adapter_val, str) and adapter_val.startswith('/'):\n"
+                                        f"        # Check if adapter directory actually exists\n"
+                                        f"        import os\n"
+                                        f"        if not os.path.exists(adapter_val) or not os.path.isdir(adapter_val):\n"
+                                        f"            # Adapter path doesn't exist - this is a new training job, not incremental\n"
+                                        f"            config['adapter'] = 'lora'\n"
+                                        f"            fixed = True\n"
+                                        f"            print(f'Removed invalid adapter path {{adapter_val}} (directory does not exist). Set to \"lora\" for new training.')\n"
+                                        f"            # Also remove lora_model_dir if it points to the same non-existent path\n"
+                                        f"            if config.get('lora_model_dir') == adapter_val:\n"
+                                        f"                del config['lora_model_dir']\n"
+                                        f"                print('Removed lora_model_dir (pointed to non-existent adapter path)')\n"
+                                        f"    \n"
                                         f"    # If lora_model_dir is set to output_dir, always remove it (unless there's a valid adapter path)\n"
+                                        f"    lora_model_dir = config.get('lora_model_dir')\n"
                                         f"    if lora_model_dir == output_dir:\n"
                                         f"        # Only keep it if adapter is set to a valid path (incremental training)\n"
+                                        f"        adapter_val = config.get('adapter')\n"
                                         f"        if not adapter_val or not isinstance(adapter_val, str) or not adapter_val.startswith('/'):\n"
                                         f"            del config['lora_model_dir']\n"
                                         f"            fixed = True\n"
@@ -2877,6 +2903,39 @@ def render():
                                         f"        config['model_type'] = 'MistralForCausalLM'\n"
                                         f"        fixed = True\n"
                                         f"        print('Fixed model_type to MistralForCausalLM')\n"
+                                        f"    \n"
+                                        f"    # CRITICAL: Fix Axolotl validation error: 'please set only one of gradient_accumulation_steps or batch_size'\n"
+                                        f"    # Axolotl requires EITHER micro_batch_size + gradient_accumulation_steps OR batch_size, but NOT both gradient_accumulation_steps AND batch_size\n"
+                                        f"    has_gradient_accum = 'gradient_accumulation_steps' in config\n"
+                                        f"    has_batch_size = 'batch_size' in config\n"
+                                        f"    \n"
+                                        f"    if has_gradient_accum and has_batch_size:\n"
+                                        f"        removed_batch_size = config.pop('batch_size')\n"
+                                        f"        fixed = True\n"
+                                        f"        print(f'Removed batch_size={{removed_batch_size}} (conflicts with gradient_accumulation_steps). Axolotl requires only one of gradient_accumulation_steps or batch_size.')\n"
+                                        f"    \n"
+                                        f"    # CRITICAL: Fix Axolotl validation error: early_stopping_patience requires save_steps and eval_steps\n"
+                                        f"    # eval_steps must evenly divide save_steps\n"
+                                        f"    if 'early_stopping_patience' in config:\n"
+                                        f"        has_save_steps = 'save_steps' in config\n"
+                                        f"        has_eval_steps = 'eval_steps' in config\n"
+                                        f"        \n"
+                                        f"        if not has_save_steps or not has_eval_steps:\n"
+                                        f"            # Remove early_stopping_patience if required fields are missing\n"
+                                        f"            removed_patience = config.pop('early_stopping_patience')\n"
+                                        f"            fixed = True\n"
+                                        f"            print(f'Removed early_stopping_patience={{removed_patience}} (requires save_steps and eval_steps to be set)')\n"
+                                        f"        else:\n"
+                                        f"            # Check if eval_steps evenly divides save_steps\n"
+                                        f"            save_steps = config['save_steps']\n"
+                                        f"            eval_steps = config['eval_steps']\n"
+                                        f"            if save_steps % eval_steps != 0:\n"
+                                        f"                # Adjust save_steps to be a multiple of eval_steps\n"
+                                        f"                # Round up to nearest multiple\n"
+                                        f"                adjusted_save_steps = ((save_steps // eval_steps) + 1) * eval_steps\n"
+                                        f"                config['save_steps'] = adjusted_save_steps\n"
+                                        f"                fixed = True\n"
+                                        f"                print(f'Adjusted save_steps from {{save_steps}} to {{adjusted_save_steps}} (must be evenly divisible by eval_steps={{eval_steps}} for early_stopping_patience)')\n"
                                         f"    \n"
                                         f"    # Auto-adjust for small datasets to prevent empty batch errors\n"
                                         f"    # Count training examples from the dataset file\n"
@@ -3340,16 +3399,102 @@ def render():
                                             training_manager._save_job(active_job)
                                     
                                     if ssh_host:
-                                        # Find and embed most recent version weights before training
-                                        terminal_output.append(f"[LOCAL] Looking for most recent version weights to embed...")
+                                        # Find and embed most recent version weights before training (only if incremental training is desired)
+                                        # For first runs or fresh training, skip this step
+                                        terminal_output.append(f"[LOCAL] Checking for previous version weights (for incremental training)...")
                                         from utils.model_manager import ModelManager
                                         model_manager = ModelManager()
                                         latest_version = model_manager.get_most_recent_version(model_name)
                                         
-                                        if latest_version:
+                                        # Only proceed with incremental training if:
+                                        # 1. A previous version exists
+                                        # 2. The config doesn't already specify this is a new training run
+                                        # Default to incremental training (load previous weights if available)
+                                        should_use_incremental = True  # Default to incremental training
+                                        
+                                        if latest_version and should_use_incremental:
                                             weights_path = model_manager.get_version_weights_path(model_name, latest_version)
+                                            
+                                            # CRITICAL: Verify essential adapter files exist before attempting upload
+                                            # If not found at expected path, search in V# folder for alternative locations
+                                            from pathlib import Path
+                                            import os
+                                            
+                                            def find_adapter_with_files(model_name: str, version: int) -> Optional[Path]:
+                                                """Find adapter directory with essential files, checking multiple locations"""
+                                                model_dir = Path("models") / model_name
+                                                version_dir = model_dir / f"V{version}"
+                                                
+                                                if not version_dir.exists():
+                                                    return None
+                                                
+                                                # Check multiple possible locations (same as ChatBot/main.js)
+                                                search_paths = [
+                                                    version_dir / "weights" / "adapter",  # Standard: V{version}/weights/adapter
+                                                    version_dir / "adapter",  # Alternative: V{version}/adapter
+                                                    version_dir / "model" / "adapter",  # Alternative: V{version}/model/adapter
+                                                    version_dir / "weights",  # Fallback: V{version}/weights (files directly)
+                                                ]
+                                                
+                                                for check_path in search_paths:
+                                                    if check_path.exists():
+                                                        config_file = check_path / "adapter_config.json"
+                                                        safetensors_file = check_path / "adapter_model.safetensors"
+                                                        bin_file = check_path / "adapter_model.bin"
+                                                        
+                                                        has_config = config_file.exists()
+                                                        has_weights = safetensors_file.exists() or bin_file.exists()
+                                                        
+                                                        if has_config and has_weights:
+                                                            return check_path
+                                                
+                                                return None
+                                            
+                                            # Try to find adapter with essential files
+                                            adapter_path = None
                                             if weights_path and weights_path.exists():
-                                                terminal_output.append(f"[PRIOR WEIGHTS] ✓ Found version {latest_version} weights at: {weights_path}")
+                                                # Verify essential files exist at the returned path
+                                                config_file = weights_path / "adapter_config.json"
+                                                safetensors_file = weights_path / "adapter_model.safetensors"
+                                                bin_file = weights_path / "adapter_model.bin"
+                                                
+                                                has_config = config_file.exists()
+                                                has_weights = safetensors_file.exists() or bin_file.exists()
+                                                
+                                                if has_config and has_weights:
+                                                    adapter_path = weights_path
+                                                    terminal_output.append(f"[PRIOR WEIGHTS] ✓ Found version {latest_version} weights at: {adapter_path}")
+                                                else:
+                                                    terminal_output.append(f"[PRIOR WEIGHTS] ⚠ Path exists but missing essential files (config: {has_config}, weights: {has_weights})")
+                                                    terminal_output.append(f"[PRIOR WEIGHTS] Searching for adapter files in V{latest_version} folder...")
+                                                    adapter_path = find_adapter_with_files(model_name, latest_version)
+                                                    if adapter_path:
+                                                        terminal_output.append(f"[PRIOR WEIGHTS] ✓ Found adapter files at alternative location: {adapter_path}")
+                                                    else:
+                                                        terminal_output.append(f"[PRIOR WEIGHTS] ✗ Could not find adapter files in V{latest_version} folder")
+                                            else:
+                                                # Path doesn't exist, search in V# folder
+                                                terminal_output.append(f"[PRIOR WEIGHTS] Expected path not found, searching in V{latest_version} folder...")
+                                                adapter_path = find_adapter_with_files(model_name, latest_version)
+                                                if adapter_path:
+                                                    terminal_output.append(f"[PRIOR WEIGHTS] ✓ Found adapter files at: {adapter_path}")
+                                                else:
+                                                    terminal_output.append(f"[PRIOR WEIGHTS] ✗ Could not find adapter files in V{latest_version} folder")
+                                            
+                                            if adapter_path and adapter_path.exists():
+                                                # Verify files one more time before upload
+                                                config_file = adapter_path / "adapter_config.json"
+                                                safetensors_file = adapter_path / "adapter_model.safetensors"
+                                                bin_file = adapter_path / "adapter_model.bin"
+                                                
+                                                if not config_file.exists():
+                                                    terminal_output.append(f"[ERROR] adapter_config.json not found at {adapter_path}")
+                                                    adapter_path = None
+                                                elif not (safetensors_file.exists() or bin_file.exists()):
+                                                    terminal_output.append(f"[ERROR] No adapter weight files found (adapter_model.safetensors or adapter_model.bin) at {adapter_path}")
+                                                    adapter_path = None
+                                            
+                                            if adapter_path and adapter_path.exists():
                                                 terminal_output.append(f"[PRIOR WEIGHTS] Uploading and embedding previous version weights...")
                                                 
                                                 # Upload weights to instance and update config
@@ -3359,7 +3504,7 @@ def render():
                                                     "scp", "-r", "-P", str(ssh_port), 
                                                     "-o", "StrictHostKeyChecking=no", 
                                                     "-o", "ConnectTimeout=30",
-                                                    str(weights_path),
+                                                    str(adapter_path),
                                                     f"root@{ssh_host}:/workspace/previous_adapter"
                                                 ]
                                                 upload_result = subprocess.run(upload_weights_cmd, capture_output=True, text=True, timeout=300, input="yes\n")
@@ -3367,6 +3512,110 @@ def render():
                                                     terminal_output.append(f"[PRIOR WEIGHTS] ✓ Uploaded previous version weights to /workspace/previous_adapter")
                                                     if upload_result.stdout:
                                                         terminal_output.append(f"[PRIOR WEIGHTS] Upload output: {upload_result.stdout[:200]}")
+                                                    
+                                                    # CRITICAL: Verify adapter files were uploaded correctly and are valid
+                                                    verify_adapter_cmd = [
+                                                        "ssh"
+                                                    ] + get_ssh_base_options(ssh_port) + [
+                                                        f"root@{ssh_host}",
+                                                        f"cd /workspace && "
+                                                        f"if [ -f previous_adapter/adapter_config.json ]; then "
+                                                        f"  python3 << 'PYTHON_EOF'\n"
+                                                        f"import json\n"
+                                                        f"import os\n"
+                                                        f"try:\n"
+                                                        f"    config_path = 'previous_adapter/adapter_config.json'\n"
+                                                        f"    if not os.path.exists(config_path):\n"
+                                                        f"        print('config_missing')\n"
+                                                        f"        exit(1)\n"
+                                                        f"    \n"
+                                                        f"    with open(config_path, 'r') as f:\n"
+                                                        f"        config = json.load(f)\n"
+                                                        f"    \n"
+                                                        f"    # Check for required PEFT fields\n"
+                                                        f"    required_fields = ['peft_type', 'task_type']\n"
+                                                        f"    missing = [f for f in required_fields if f not in config]\n"
+                                                        f"    if missing:\n"
+                                                        f"        print(f'config_invalid: missing fields {{missing}}')\n"
+                                                        f"        exit(1)\n"
+                                                        f"    \n"
+                                                        f"    # Check that adapter type is LoRA\n"
+                                                        f"    if config.get('peft_type') != 'LORA':\n"
+                                                        f"        print(f'config_invalid: peft_type is {{config.get(\"peft_type\")}}, expected LORA')\n"
+                                                        f"        exit(1)\n"
+                                                        f"    \n"
+                                                        f"    # Check for weight files\n"
+                                                        f"    has_safetensors = os.path.exists('previous_adapter/adapter_model.safetensors')\n"
+                                                        f"    has_bin = os.path.exists('previous_adapter/adapter_model.bin')\n"
+                                                        f"    if not (has_safetensors or has_bin):\n"
+                                                        f"        print('weights_missing')\n"
+                                                        f"        exit(1)\n"
+                                                        f"    \n"
+                                                        f"    print('adapter_valid')\n"
+                                                        f"    print(f'peft_type: {{config.get(\"peft_type\")}}')\n"
+                                                        f"    print(f'task_type: {{config.get(\"task_type\")}}')\n"
+                                                        f"    print(f'base_model: {{config.get(\"base_model_name_or_path\", \"not_set\")}}')\n"
+                                                        f"except Exception as e:\n"
+                                                        f"    print(f'config_error: {{str(e)}}')\n"
+                                                        f"    exit(1)\n"
+                                                        f"PYTHON_EOF\n"
+                                                        f"else\n"
+                                                        f"  echo 'adapter_missing'\n"
+                                                        f"fi"
+                                                    ]
+                                                    verify_adapter_result = subprocess.run(verify_adapter_cmd, capture_output=True, text=True, timeout=30)
+                                                    
+                                                    if "adapter_valid" in verify_adapter_result.stdout:
+                                                        terminal_output.append(f"[PRIOR WEIGHTS] ✓ Adapter files verified: adapter_config.json and weights found")
+                                                        # Log adapter details
+                                                        for line in verify_adapter_result.stdout.strip().split('\n'):
+                                                            if line.startswith('peft_type:') or line.startswith('task_type:') or line.startswith('base_model:'):
+                                                                terminal_output.append(f"[PRIOR WEIGHTS]   {line}")
+                                                    elif "config_invalid" in verify_adapter_result.stdout or "config_error" in verify_adapter_result.stdout:
+                                                        terminal_output.append(f"[ERROR] Adapter config file is invalid or corrupted!")
+                                                        terminal_output.append(f"[ERROR] Verification output: {verify_adapter_result.stdout}")
+                                                        terminal_output.append(f"[ERROR] This adapter may not be compatible with Axolotl. Training may fail.")
+                                                    elif "weights_missing" in verify_adapter_result.stdout:
+                                                        terminal_output.append(f"[ERROR] Adapter config found but weight files are missing!")
+                                                        terminal_output.append(f"[ERROR] Need adapter_model.safetensors or adapter_model.bin")
+                                                    elif "adapter_missing" in verify_adapter_result.stdout:
+                                                        # Fall back to structure check
+                                                        check_structure_cmd = [
+                                                            "ssh"
+                                                        ] + get_ssh_base_options(ssh_port) + [
+                                                            f"root@{ssh_host}",
+                                                            f"test -d /workspace/previous_adapter && ls -la /workspace/previous_adapter/ | head -10 && echo 'adapter_structure' || echo 'adapter_missing'"
+                                                        ]
+                                                        structure_result = subprocess.run(check_structure_cmd, capture_output=True, text=True, timeout=30)
+                                                        if "adapter_structure" in structure_result.stdout:
+                                                            terminal_output.append(f"[WARNING] Adapter directory exists but structure may be wrong:")
+                                                            terminal_output.append(structure_result.stdout)
+                                                    elif "adapter_structure" in verify_adapter_result.stdout:
+                                                        terminal_output.append(f"[WARNING] Adapter directory exists but structure may be wrong:")
+                                                        terminal_output.append(verify_adapter_result.stdout)
+                                                        # Try to fix: if files are in a subdirectory, move them up
+                                                        fix_structure_cmd = [
+                                                            "ssh"
+                                                        ] + get_ssh_base_options(ssh_port) + [
+                                                            f"root@{ssh_host}",
+                                                            f"cd /workspace && "
+                                                            f"if [ -d previous_adapter/adapter ] && [ -f previous_adapter/adapter/adapter_config.json ]; then "
+                                                            f"  mv previous_adapter/adapter/* previous_adapter/ 2>/dev/null; "
+                                                            f"  rmdir previous_adapter/adapter 2>/dev/null; "
+                                                            f"  echo 'fixed_structure'; "
+                                                            f"fi && "
+                                                            f"test -f /workspace/previous_adapter/adapter_config.json && echo 'adapter_fixed' || echo 'adapter_still_broken'"
+                                                        ]
+                                                        fix_result = subprocess.run(fix_structure_cmd, capture_output=True, text=True, timeout=30)
+                                                        if "adapter_fixed" in fix_result.stdout:
+                                                            terminal_output.append(f"[PRIOR WEIGHTS] ✓ Fixed adapter structure - files moved to correct location")
+                                                        else:
+                                                            terminal_output.append(f"[ERROR] Failed to fix adapter structure. Check remote directory manually.")
+                                                            terminal_output.append(f"[ERROR] Fix result: {fix_result.stdout}")
+                                                    else:
+                                                        terminal_output.append(f"[ERROR] Adapter files not found after upload!")
+                                                        terminal_output.append(f"[ERROR] Verification output: {verify_adapter_result.stdout}")
+                                                        terminal_output.append(f"[ERROR] Upload may have failed - check remote directory /workspace/previous_adapter")
                                                     
                                                     # Update config file to use the adapter
                                                     update_config_cmd = [
@@ -3407,9 +3656,18 @@ def render():
                                                     terminal_output.append(f"[WARNING] Failed to upload previous version weights: {upload_result.stderr[:200]}")
                                                     terminal_output.append(f"[INFO] Will train from base model instead")
                                             else:
-                                                terminal_output.append(f"[INFO] Version {latest_version} exists but weights not found. Training from base model.")
+                                                terminal_output.append(f"[WARNING] Version {latest_version} exists but adapter files not found or incomplete.")
+                                                terminal_output.append(f"[INFO] Searched locations:")
+                                                terminal_output.append(f"[INFO]   - V{latest_version}/weights/adapter")
+                                                terminal_output.append(f"[INFO]   - V{latest_version}/adapter")
+                                                terminal_output.append(f"[INFO]   - V{latest_version}/model/adapter")
+                                                terminal_output.append(f"[INFO]   - V{latest_version}/weights")
+                                                terminal_output.append(f"[INFO] Training from base model instead.")
                                         else:
-                                            terminal_output.append(f"[INFO] No previous versions found. Training from base model.")
+                                            if latest_version:
+                                                terminal_output.append(f"[INFO] Previous version {latest_version} found, but skipping incremental training (fresh training run).")
+                                            else:
+                                                terminal_output.append(f"[INFO] No previous versions found. Training from base model.")
                                         
                                         # CRITICAL: Ensure files are activated before starting training
                                         # Files should already be axolotl_config.yaml and training_data.jsonl (no suffix needed for single job)
@@ -3640,6 +3898,59 @@ def render():
                                                         if line.strip() and "ERROR" not in line:
                                                             terminal_output.append(f"[SSH]   {line}")
                                             
+                                            # CRITICAL: Final config verification - check if adapter path exists before starting training
+                                            terminal_output.append(f"[SSH] Final config verification: Checking adapter path...")
+                                            final_config_check_cmd = [
+                                                "ssh"
+                                            ] + get_ssh_base_options(ssh_port) + [
+                                                f"root@{ssh_host}",
+                                                f"cd /workspace/data && "
+                                                f"python3 << 'PYTHON_EOF'\n"
+                                                f"import yaml\n"
+                                                f"import os\n"
+                                                f"import sys\n"
+                                                f"try:\n"
+                                                f"    with open('axolotl_config.yaml', 'r') as f:\n"
+                                                f"        config = yaml.safe_load(f) or {{}}\n"
+                                                f"    \n"
+                                                f"    fixed = False\n"
+                                                f"    adapter_val = config.get('adapter')\n"
+                                                f"    \n"
+                                                f"    # CRITICAL: If adapter is set to a path, verify it exists\n"
+                                                f"    if adapter_val and isinstance(adapter_val, str) and adapter_val.startswith('/'):\n"
+                                                f"        adapter_config_path = os.path.join(adapter_val, 'adapter_config.json')\n"
+                                                f"        if not os.path.exists(adapter_config_path):\n"
+                                                f"            # Adapter path doesn't exist - remove it and set to 'lora' for new training\n"
+                                                f"            config['adapter'] = 'lora'\n"
+                                                f"            fixed = True\n"
+                                                f"            print(f'FIXED: Removed invalid adapter path {{adapter_val}} (adapter_config.json not found). Set to \"lora\" for new training.')\n"
+                                                f"            # Also remove lora_model_dir if it points to the same non-existent path\n"
+                                                f"            if config.get('lora_model_dir') == adapter_val:\n"
+                                                f"                del config['lora_model_dir']\n"
+                                                f"                print('Removed lora_model_dir (pointed to non-existent adapter path)')\n"
+                                                f"        else:\n"
+                                                f"            print(f'✓ Adapter path verified: {{adapter_val}}')\n"
+                                                f"    \n"
+                                                f"    if fixed:\n"
+                                                f"        with open('axolotl_config.yaml', 'w') as f:\n"
+                                                f"            yaml.dump(config, f, default_flow_style=False, sort_keys=False)\n"
+                                                f"        print('Config file updated')\n"
+                                                f"    else:\n"
+                                                f"        print('Config already correct')\n"
+                                                f"except Exception as e:\n"
+                                                f"    print(f'Error: {{e}}', file=sys.stderr)\n"
+                                                f"    sys.exit(1)\n"
+                                                f"PYTHON_EOF"
+                                            ]
+                                            final_config_check_result = subprocess.run(final_config_check_cmd, capture_output=True, text=True, timeout=30)
+                                            if final_config_check_result.returncode == 0:
+                                                if "FIXED" in final_config_check_result.stdout:
+                                                    terminal_output.append(f"[SSH] Final config check: {final_config_check_result.stdout.strip()}")
+                                                elif "verified" in final_config_check_result.stdout:
+                                                    terminal_output.append(f"[SSH] Final config check: {final_config_check_result.stdout.strip()}")
+                                            else:
+                                                terminal_output.append(f"[WARNING] Final config check failed: {final_config_check_result.stderr[:200]}")
+                                            
                                             # CRITICAL: Ensure sample_packing is disabled before starting training
                                             # This prevents multipack sampler IndexError issues
                                             terminal_output.append(f"[SSH] Ensuring sample_packing is disabled...")
@@ -3777,8 +4088,8 @@ REMOTE_SCRIPT"""
                                                 terminal_output.append(f"[ERROR] Traceback: {traceback.format_exc()[:300]}")
                                             
                                             # Wait a moment and then check if the process actually started
-                                                import time
-                                            time.sleep(3)
+                                            import time as time_module_wait  # Use alias to avoid scoping issues
+                                            time_module_wait.sleep(3)
                                                 
                                             # Quick check to see if log file is being created
                                             try:
@@ -7163,8 +7474,14 @@ REMOTE_SCRIPT"""
                                         f"        import os\n"
                                         f"        adapter_config_path = os.path.join(adapter_val, 'adapter_config.json')\n"
                                         f"        if not os.path.exists(adapter_config_path):\n"
-                                        f"            print(f'WARNING: Adapter config not found at {{adapter_config_path}}')\n"
-                                        f"            print(f'Adapter path may be invalid - training may fail')\n"
+                                        f"            # Adapter path doesn't exist - this is a new training job, not incremental\n"
+                                        f"            config['adapter'] = 'lora'\n"
+                                        f"            fixed = True\n"
+                                        f"            print(f'Removed invalid adapter path {{adapter_val}} (adapter_config.json not found). Set to \"lora\" for new training.')\n"
+                                        f"            # Also remove lora_model_dir if it points to the same non-existent path\n"
+                                        f"            if config.get('lora_model_dir') == adapter_val:\n"
+                                        f"                del config['lora_model_dir']\n"
+                                        f"                print('Removed lora_model_dir (pointed to non-existent adapter path)')\n"
                                         f"        else:\n"
                                         f"            # Verify base model matches\n"
                                         f"            try:\n"
@@ -7206,26 +7523,12 @@ REMOTE_SCRIPT"""
                                         f"    \n"
                                         f"{batch_size_update}"
                                         f"    \n"
-                                        f"    # Fix tokenizer type if it's incorrect\n"
-                                        f"    tokenizer_type = config.get('tokenizer_type', '')\n"
-                                        f"    base_model = config.get('base_model', '').lower()\n"
-                                        f"    \n"
-                                        f"    if 'gemma' in base_model and tokenizer_type == 'Gemma':\n"
-                                        f"        config['tokenizer_type'] = 'GemmaTokenizer'\n"
-                                        f"        print('Fixed: Gemma -> GemmaTokenizer')\n"
-                                        f"    elif 'gemma' in base_model and tokenizer_type != 'GemmaTokenizer':\n"
-                                        f"        config['tokenizer_type'] = 'GemmaTokenizer'\n"
-                                        f"        print(f'Fixed: {{tokenizer_type}} -> GemmaTokenizer')\n"
-                                        f"    elif 'mistral' in base_model and tokenizer_type == 'Mistral':\n"
-                                        f"        config['tokenizer_type'] = 'MistralTokenizer'\n"
-                                        f"        print('Fixed: Mistral -> MistralTokenizer')\n"
-                                        f"    elif 'phi' in base_model and tokenizer_type == 'Phi':\n"
-                                        f"        config['tokenizer_type'] = 'PhiTokenizer'\n"
-                                        f"        print('Fixed: Phi -> PhiTokenizer')\n"
-                                        f"    elif 'qwen' in base_model and tokenizer_type == 'Qwen':\n"
-                                        f"        config['tokenizer_type'] = 'Qwen2Tokenizer'\n"
+                                        f"    # Remove tokenizer_type - let Axolotl auto-detect (per earlier fix)\n"
+                                        f"    # Axolotl will automatically detect the correct tokenizer from the base model\n"
+                                        f"    if 'tokenizer_type' in config:\n"
+                                        f"        removed_tokenizer_type = config.pop('tokenizer_type')\n"
                                         f"        fixed = True\n"
-                                        f"        print('Fixed: Qwen -> Qwen2Tokenizer')\n"
+                                        f"        print(f'Removed tokenizer_type={{removed_tokenizer_type}} (Axolotl will auto-detect)')\n"
                                         f"    \n"
                                         f"    # Also fix model_type if needed\n"
                                         f"    model_type = config.get('model_type', '')\n"
@@ -7388,8 +7691,8 @@ REMOTE_SCRIPT"""
                                                     for attempt in range(1, 4):
                                                         if attempt > 1:
                                                             terminal_output.append(f"[SCP] Retry attempt {attempt}/3...")
-                                                            import time
-                                                            time.sleep(2)  # Wait 2 seconds between retries
+                                                            import time as time_module_scp2  # Use alias to avoid scoping issues
+                                                            time_module_scp2.sleep(2)  # Wait 2 seconds between retries
                                                         
                                                         scp_config_result = subprocess.run(scp_config_cmd, capture_output=True, text=True, timeout=300)
                                                         stdout_filtered = filter_malloc_warnings(scp_config_result.stdout)
@@ -7466,10 +7769,12 @@ REMOTE_SCRIPT"""
                                                                 f"        config['tokenizer_type'] = 'GemmaTokenizer'\n"
                                                                 f"        fixed = True\n"
                                                                 f"        print('Fixed tokenizer_type to GemmaTokenizer')\n"
-                                                                f"    elif 'mistral' in base_model and tokenizer_type not in ['MistralTokenizer', 'AutoTokenizer']:\n"
-                                                                f"        config['tokenizer_type'] = 'MistralTokenizer'\n"
+                                                                f"    # Remove tokenizer_type for Mistral - let Axolotl auto-detect\n"
+                                                                f"    # MistralTokenizer doesn't exist in transformers - Axolotl will auto-detect\n"
+                                                                f"    if 'tokenizer_type' in config and 'mistral' in base_model:\n"
+                                                                f"        removed_tokenizer_type = config.pop('tokenizer_type')\n"
                                                                 f"        fixed = True\n"
-                                                                f"        print('Fixed tokenizer_type to MistralTokenizer')\n"
+                                                                f"        print(f'Removed tokenizer_type={{removed_tokenizer_type}} (Axolotl will auto-detect for Mistral)')\n"
                                                                 f"    elif 'phi' in base_model and tokenizer_type != 'PhiTokenizer':\n"
                                                                 f"        config['tokenizer_type'] = 'PhiTokenizer'\n"
                                                                 f"        fixed = True\n"
@@ -7496,6 +7801,39 @@ REMOTE_SCRIPT"""
                                                                 f"        config['model_type'] = 'MistralForCausalLM'\n"
                                                                 f"        fixed = True\n"
                                                                 f"        print('Fixed model_type to MistralForCausalLM')\n"
+                                                                f"    \n"
+                                                                f"    # CRITICAL: Fix Axolotl validation error: 'please set only one of gradient_accumulation_steps or batch_size'\n"
+                                                                f"    # Axolotl requires EITHER micro_batch_size + gradient_accumulation_steps OR batch_size, but NOT both gradient_accumulation_steps AND batch_size\n"
+                                                                f"    has_gradient_accum = 'gradient_accumulation_steps' in config\n"
+                                                                f"    has_batch_size = 'batch_size' in config\n"
+                                                                f"    \n"
+                                                                f"    if has_gradient_accum and has_batch_size:\n"
+                                                                f"        removed_batch_size = config.pop('batch_size')\n"
+                                                                f"        fixed = True\n"
+                                                                f"        print(f'Removed batch_size={{removed_batch_size}} (conflicts with gradient_accumulation_steps). Axolotl requires only one of gradient_accumulation_steps or batch_size.')\n"
+                                                                f"    \n"
+                                                                f"    # CRITICAL: Fix Axolotl validation error: early_stopping_patience requires save_steps and eval_steps\n"
+                                                                f"    # eval_steps must evenly divide save_steps\n"
+                                                                f"    if 'early_stopping_patience' in config:\n"
+                                                                f"        has_save_steps = 'save_steps' in config\n"
+                                                                f"        has_eval_steps = 'eval_steps' in config\n"
+                                                                f"        \n"
+                                                                f"        if not has_save_steps or not has_eval_steps:\n"
+                                                                f"            # Remove early_stopping_patience if required fields are missing\n"
+                                                                f"            removed_patience = config.pop('early_stopping_patience')\n"
+                                                                f"            fixed = True\n"
+                                                                f"            print(f'Removed early_stopping_patience={{removed_patience}} (requires save_steps and eval_steps to be set)')\n"
+                                                                f"        else:\n"
+                                                                f"            # Check if eval_steps evenly divides save_steps\n"
+                                                                f"            save_steps = config['save_steps']\n"
+                                                                f"            eval_steps = config['eval_steps']\n"
+                                                                f"            if save_steps % eval_steps != 0:\n"
+                                                                f"                # Adjust save_steps to be a multiple of eval_steps\n"
+                                                                f"                # Round up to nearest multiple\n"
+                                                                f"                adjusted_save_steps = ((save_steps // eval_steps) + 1) * eval_steps\n"
+                                                                f"                config['save_steps'] = adjusted_save_steps\n"
+                                                                f"                fixed = True\n"
+                                                                f"                print(f'Adjusted save_steps from {{save_steps}} to {{adjusted_save_steps}} (must be evenly divisible by eval_steps={{eval_steps}} for early_stopping_patience)')\n"
                                                                 f"    \n"
                                                                 f"    if fixed:\n"
                                                                 f"        with open('axolotl_config.yaml', 'w') as f:\n"
@@ -7766,8 +8104,8 @@ REMOTE_SCRIPT"""
                                         terminal_output.append(f"[ERROR] Traceback: {traceback.format_exc()[:300]}")
                                     
                                     # Wait a moment and then check if the process actually started and if logs are being written
-                                    import time
-                                    time.sleep(3)
+                                    import time as time_module_wait2  # Use alias to avoid scoping issues
+                                    time_module_wait2.sleep(3)
                                     
                                     # Quick check to see if log file is being created
                                     try:
@@ -8179,7 +8517,7 @@ REMOTE_SCRIPT"""
                                     # Search more specific paths first to avoid scanning entire /workspace/output
                                     # Limit search to training directory and common checkpoint locations
                                     check_files_cmd = [
-                                        "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=30",
+                                        "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null", "-o", "LogLevel=ERROR", "-o", "ConnectTimeout=30",
                                         f"root@{ssh_host}",
                                         """bash -c '
                                         # Search in most likely locations first (faster)
@@ -8218,7 +8556,7 @@ REMOTE_SCRIPT"""
                                     # Step 4a: Find the adapter location (may be in checkpoint directory)
                                     terminal_output.append(f"[SSH] Locating adapter files on remote instance...")
                                     find_adapter_cmd = [
-                                        "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=30",
+                                        "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null", "-o", "LogLevel=ERROR", "-o", "ConnectTimeout=30",
                                         f"root@{ssh_host}",
                                         """bash -c '
                                         # First, try to find the latest checkpoint directory with adapter (limit depth for speed)
@@ -8267,7 +8605,7 @@ REMOTE_SCRIPT"""
                                     # SCP will create weights_dir/adapter when downloading remote:/path/to/adapter
                                     # This is the desired behavior - files go to weights_dir/adapter/
                                     scp_adapter_cmd = [
-                                        "scp", "-P", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=30", "-r",
+                                        "scp", "-P", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null", "-o", "LogLevel=ERROR", "-o", "ConnectTimeout=30", "-r",
                                         f"root@{ssh_host}:{adapter_dir_remote}",
                                         str(weights_dir)
                                     ]
@@ -8322,7 +8660,15 @@ REMOTE_SCRIPT"""
                                         adapter_dir_local.mkdir(parents=True, exist_ok=True)
                                         
                                         # Try downloading each essential file individually
+                                        # Only download files that don't already exist locally to avoid duplicates
                                         for file_name in adapter_files:
+                                            # Skip if file already exists locally (avoid duplicate downloads)
+                                            local_file = adapter_dir_local / file_name
+                                            if local_file.exists():
+                                                file_size = local_file.stat().st_size
+                                                terminal_output.append(f"[SKIP] {file_name} already exists locally ({file_size / 1024 / 1024:.2f} MB) - skipping download")
+                                                continue
+                                            
                                             # Try multiple possible locations
                                             remote_paths = [
                                                 f"{adapter_dir_remote}/{file_name}",  # Found location
@@ -8349,7 +8695,7 @@ REMOTE_SCRIPT"""
                                             for remote_path in remote_paths:
                                                 terminal_output.append(f"[SCP] Trying to download: {file_name} from {remote_path}")
                                                 scp_file_cmd = [
-                                                    "scp", "-P", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=30",
+                                                    "scp", "-P", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null", "-o", "LogLevel=ERROR", "-o", "ConnectTimeout=30",
                                                     f"root@{ssh_host}:{remote_path}",
                                                     str(adapter_dir_local / file_name)
                                                 ]
@@ -8702,7 +9048,7 @@ REMOTE_SCRIPT"""
                                     try:
                                         import subprocess
                                         test_cmd = [
-                                            "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", 
+                                            "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null", "-o", "LogLevel=ERROR", 
                                             "-o", "ConnectTimeout=5", "-o", "BatchMode=yes",
                                             f"root@{ssh_host}",
                                             "echo 'connected'"
@@ -8807,8 +9153,9 @@ REMOTE_SCRIPT"""
                     "is_yaml": True
                 }
                 yaml_metadata_path = queue_dir / f"{Path(yaml_uploader.name).stem}_metadata.json"
+                import json as json_module_yaml  # Use alias to avoid scoping issues
                 with open(yaml_metadata_path, 'w') as f:
-                    json.dump(yaml_metadata, f, indent=2)
+                    json_module_yaml.dump(yaml_metadata, f, indent=2)
                 
                 st.success(f"✅ YAML file '{yaml_uploader.name}' uploaded successfully!")
                 # Use st.session_state to prevent rerun loop - just clear the uploader
@@ -8909,7 +9256,7 @@ REMOTE_SCRIPT"""
                                                 file_metadata["attached_yaml"] = None
                                                 # Save updated metadata
                                                 with open(metadata_file, 'w', encoding='utf-8') as f:
-                                                    json.dump(file_metadata, f, indent=2)
+                                                    json_module_detach.dump(file_metadata, f, indent=2)
                                                 files_updated += 1
                                         except Exception as update_error:
                                             st.warning(f"⚠️ Could not update {metadata_file.name}: {update_error}")
@@ -9005,8 +9352,9 @@ REMOTE_SCRIPT"""
                     }
                     metadata_path = queue_dir / f"{Path(uploaded_file.name).stem}_metadata.json"
                     # Write metadata with explicit encoding and ensure it's flushed
+                    import json as json_module_write  # Use alias to avoid scoping issues
                     with open(metadata_path, 'w', encoding='utf-8') as f:
-                        json.dump(metadata, f, indent=2, ensure_ascii=False)
+                        json_module_write.dump(metadata, f, indent=2, ensure_ascii=False)
                         f.flush()  # Ensure data is written to disk
                         import os
                         if hasattr(f, 'fileno'):

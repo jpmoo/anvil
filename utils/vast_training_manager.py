@@ -282,6 +282,78 @@ class VastTrainingManager:
                     config_modified = True
                     self.logger.log("INFO", "Removed lora_model_dir (was pointing to output_dir - causes adapter loading errors)")
             
+            # CRITICAL: Fix Axolotl validation error: "please set only one of gradient_accumulation_steps or batch_size"
+            # Axolotl requires EITHER:
+            #   - micro_batch_size + gradient_accumulation_steps (preferred)
+            #   OR
+            #   - batch_size (legacy)
+            # But NOT both gradient_accumulation_steps AND batch_size together
+            
+            has_gradient_accum = "gradient_accumulation_steps" in config
+            has_batch_size = "batch_size" in config
+            has_micro_batch = "micro_batch_size" in config
+            
+            # If both gradient_accumulation_steps and batch_size are present, remove batch_size
+            # (prefer keeping gradient_accumulation_steps + micro_batch_size)
+            if has_gradient_accum and has_batch_size:
+                removed_batch_size = config.pop("batch_size")
+                config_modified = True
+                self.logger.log("WARNING", f"Removed batch_size={removed_batch_size} from config (conflicts with gradient_accumulation_steps). Axolotl requires only one of gradient_accumulation_steps or batch_size.")
+            
+            # Fix Axolotl validation issue: at least TWO of micro_batch_size, gradient_accumulation_steps, batch_size must be set
+            # Count how many of these fields are present (after removing batch_size if needed)
+            batch_fields = []
+            if "micro_batch_size" in config:
+                batch_fields.append("micro_batch_size")
+            if "gradient_accumulation_steps" in config:
+                batch_fields.append("gradient_accumulation_steps")
+            if "batch_size" in config:
+                batch_fields.append("batch_size")
+            
+            # Ensure at least 2 fields are set
+            if len(batch_fields) < 2:
+                # Need to add at least one more field
+                if "micro_batch_size" not in config and "batch_size" not in config:
+                    # Add micro_batch_size (preferred)
+                    config["micro_batch_size"] = 4
+                    config_modified = True
+                    self.logger.log("INFO", "Fixed Axolotl validation: Added micro_batch_size=4 (at least 2 batch fields required)")
+                
+                if "gradient_accumulation_steps" not in config:
+                    # Add gradient_accumulation_steps
+                    config["gradient_accumulation_steps"] = 4
+                    config_modified = True
+                    self.logger.log("INFO", "Fixed Axolotl validation: Added gradient_accumulation_steps=4 (at least 2 batch fields required)")
+            
+            # If batch_size is set but micro_batch_size is not, add micro_batch_size
+            if "batch_size" in config and "micro_batch_size" not in config:
+                config["micro_batch_size"] = config["batch_size"]
+                config_modified = True
+                self.logger.log("INFO", f"Fixed Axolotl validation: Added micro_batch_size={config['batch_size']} (copied from batch_size)")
+            
+            # CRITICAL: Fix Axolotl validation error: early_stopping_patience requires save_steps and eval_steps
+            # eval_steps must evenly divide save_steps
+            if "early_stopping_patience" in config:
+                has_save_steps = "save_steps" in config
+                has_eval_steps = "eval_steps" in config
+                
+                if not has_save_steps or not has_eval_steps:
+                    # Remove early_stopping_patience if required fields are missing
+                    removed_patience = config.pop("early_stopping_patience")
+                    config_modified = True
+                    self.logger.log("WARNING", f"Removed early_stopping_patience={removed_patience} from config (requires save_steps and eval_steps to be set)")
+                else:
+                    # Check if eval_steps evenly divides save_steps
+                    save_steps = config["save_steps"]
+                    eval_steps = config["eval_steps"]
+                    if save_steps % eval_steps != 0:
+                        # Adjust save_steps to be a multiple of eval_steps
+                        # Round up to nearest multiple
+                        adjusted_save_steps = ((save_steps // eval_steps) + 1) * eval_steps
+                        config["save_steps"] = adjusted_save_steps
+                        config_modified = True
+                        self.logger.log("WARNING", f"Adjusted save_steps from {save_steps} to {adjusted_save_steps} (must be evenly divisible by eval_steps={eval_steps} for early_stopping_patience)")
+            
             if config_modified:
                 # Write updated config back to file
                 with open(config_path, 'w') as f:
@@ -292,7 +364,8 @@ class VastTrainingManager:
             total_examples = dataset_stats.get("total_examples", 0)
             if total_examples > 0:
                 # Auto-calculate epochs based on dataset size (same logic as default config)
-                batch_size = config.get("micro_batch_size", 4)
+                # Calculate effective batch size from micro_batch_size and gradient_accumulation_steps
+                batch_size = config.get("micro_batch_size") or config.get("batch_size", 4)
                 gradient_accumulation_steps = config.get("gradient_accumulation_steps", 4)
                 effective_batch_size = batch_size * gradient_accumulation_steps
                 
@@ -1218,7 +1291,7 @@ class VastTrainingManager:
             # This helps catch "Connection refused" errors early
             import time
             test_cmd = [
-                "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
+                "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null", "-o", "LogLevel=ERROR", "-o", "ConnectTimeout=10",
                 f"root@{ssh_host}",
                 "echo 'SSH connection test'"
             ]
@@ -1234,7 +1307,7 @@ class VastTrainingManager:
             
             # Ensure the target directory exists on the remote instance
             mkdir_cmd = [
-                "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
+                "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null", "-o", "LogLevel=ERROR", "-o", "ConnectTimeout=10",
                 f"root@{ssh_host}",
                 "mkdir -p /workspace/data && mkdir -p /workspace/output/training && echo 'Directories ready'"
             ]
@@ -1249,7 +1322,7 @@ class VastTrainingManager:
                     # If it's just the welcome message, the command might have succeeded
                     # Check if directories exist
                     check_cmd = [
-                        "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
+                        "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null", "-o", "LogLevel=ERROR", "-o", "ConnectTimeout=10",
                         f"root@{ssh_host}",
                         "test -d /workspace/data && echo 'exists' || echo 'missing'"
                     ]
@@ -1267,7 +1340,7 @@ class VastTrainingManager:
                 try:
                     if dataset_path.exists():
                         cmd = [
-                            "scp", "-P", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=30",
+                            "scp", "-P", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null", "-o", "LogLevel=ERROR", "-o", "ConnectTimeout=30",
                             str(dataset_path),
                             f"root@{ssh_host}:/workspace/data/training_data.jsonl"
                         ]
@@ -1287,7 +1360,7 @@ class VastTrainingManager:
                                 if attempt < max_retries - 1:
                                     print(f"[DEBUG] Directory missing, creating it and retrying in {retry_delay} seconds (attempt {attempt + 1}/{max_retries})")
                                     mkdir_cmd = [
-                                        "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
+                                        "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null", "-o", "LogLevel=ERROR", "-o", "ConnectTimeout=10",
                                         f"root@{ssh_host}",
                                         "mkdir -p /workspace/data"
                                     ]
@@ -1315,7 +1388,7 @@ class VastTrainingManager:
                 try:
                     if config_path.exists():
                         cmd = [
-                            "scp", "-P", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=30",
+                            "scp", "-P", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null", "-o", "LogLevel=ERROR", "-o", "ConnectTimeout=30",
                             str(config_path),
                             f"root@{ssh_host}:/workspace/data/axolotl_config.yaml"
                         ]
@@ -1335,7 +1408,7 @@ class VastTrainingManager:
                                 if attempt < max_retries - 1:
                                     print(f"[DEBUG] Directory missing, creating it and retrying in {retry_delay} seconds (attempt {attempt + 1}/{max_retries})")
                                     mkdir_cmd = [
-                                        "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
+                                        "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null", "-o", "LogLevel=ERROR", "-o", "ConnectTimeout=10",
                                         f"root@{ssh_host}",
                                         "mkdir -p /workspace/data"
                                     ]
@@ -1375,7 +1448,7 @@ class VastTrainingManager:
                         "version": version_num
                     })
                     cmd = [
-                        "scp", "-r", "-P", str(ssh_port), "-o", "StrictHostKeyChecking=no",
+                        "scp", "-r", "-P", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null", "-o", "LogLevel=ERROR",
                         str(adapter_path),
                         f"root@{ssh_host}:{remote_adapter_path}"
                     ]
@@ -1396,7 +1469,7 @@ class VastTrainingManager:
                     
                     # Verify adapter was uploaded correctly
                     verify_cmd = [
-                        "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
+                        "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null", "-o", "LogLevel=ERROR", "-o", "ConnectTimeout=10",
                         f"root@{ssh_host}",
                         f"test -f {remote_adapter_path}/adapter_config.json && echo 'adapter_uploaded' || echo 'adapter_missing'"
                     ]
@@ -1410,7 +1483,7 @@ class VastTrainingManager:
                     # This ensures user-provided YAML files work with incremental training
                     self.logger.log("INFO", f"Updating remote config to use previous adapter: {remote_adapter_path}")
                     update_config_cmd = [
-                        "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
+                        "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null", "-o", "LogLevel=ERROR", "-o", "ConnectTimeout=10",
                         f"root@{ssh_host}",
                         f"""cd /workspace/data && python3 << 'PYTHON_EOF'
 import yaml
@@ -1603,7 +1676,7 @@ PYTHON_EOF"""
             })
             
             check_files_cmd = [
-                "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
+                "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null", "-o", "LogLevel=ERROR", "-o", "ConnectTimeout=10",
                 f"root@{ssh_host}",
                 f"find {output_dir} -type f -name '*.bin' -o -name '*.safetensors' -o -name 'adapter_config.json' 2>/dev/null | head -20"
             ]
@@ -1622,7 +1695,7 @@ PYTHON_EOF"""
             # First, find where the adapter actually is (may be in a checkpoint directory)
             self.logger.log("INFO", "Locating adapter files on remote instance...")
             find_adapter_cmd = [
-                "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
+                "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null", "-o", "LogLevel=ERROR", "-o", "ConnectTimeout=10",
                 f"root@{ssh_host}",
                 """bash -c '
                 # First, try to find the latest checkpoint directory with adapter
@@ -1677,7 +1750,7 @@ PYTHON_EOF"""
             adapter_dir.mkdir(parents=True, exist_ok=True)
             
             cmd = [
-                "scp", "-r", "-P", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=30",
+                "scp", "-r", "-P", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null", "-o", "LogLevel=ERROR", "-o", "ConnectTimeout=30",
                 f"root@{ssh_host}:{adapter_path}",
                 str(weights_dir)
             ]
@@ -1713,6 +1786,14 @@ PYTHON_EOF"""
                 self.logger.log("INFO", "Directory download failed, trying individual adapter files")
                 
                 for file_name in essential_files + optional_files:
+                    # Skip if file already exists locally (avoid duplicate downloads)
+                    local_file = adapter_dir / file_name
+                    if local_file.exists():
+                        file_size = local_file.stat().st_size / 1024 / 1024  # Size in MB
+                        self.logger.log("INFO", f"Skipping {file_name} - already exists locally ({file_size:.2f} MB)")
+                        downloaded_files.append(file_name)
+                        continue
+                    
                     # Try multiple possible locations including checkpoints
                     alt_paths = [
                         f"{adapter_path}/{file_name}",  # Found location
@@ -1723,7 +1804,7 @@ PYTHON_EOF"""
                     # Also try latest checkpoint if we haven't already
                     if "checkpoint" not in adapter_path:
                         find_checkpoint_cmd = [
-                            "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
+                            "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null", "-o", "LogLevel=ERROR", "-o", "ConnectTimeout=10",
                             f"root@{ssh_host}",
                             "find /workspace/output/training -type d -name 'checkpoint-*' 2>/dev/null | sort -V | tail -1"
                         ]
@@ -1736,7 +1817,7 @@ PYTHON_EOF"""
                     downloaded_file = False
                     for try_path in alt_paths:
                         cmd = [
-                            "scp", "-P", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=30",
+                            "scp", "-P", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null", "-o", "LogLevel=ERROR", "-o", "ConnectTimeout=30",
                             f"root@{ssh_host}:{try_path}",
                             str(adapter_dir / file_name)
                         ]
@@ -1746,7 +1827,7 @@ PYTHON_EOF"""
                             self.logger.log("SUCCESS", f"Downloaded {file_name}")
                             downloaded_file = True
                             break
-                
+                    
                     if not downloaded_file and file_name in essential_files:
                         self.logger.log("WARNING", f"Failed to download essential file: {file_name}")
                 
@@ -2198,7 +2279,7 @@ PYTHON_EOF"""
             # 3. Check disk space
             try:
                 check_disk_cmd = [
-                    "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
+                    "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null", "-o", "LogLevel=ERROR", "-o", "ConnectTimeout=10",
                     f"root@{ssh_host}",
                     "df -h /workspace 2>/dev/null | tail -1 | awk '{print $4}' | sed 's/G//' || echo '0'"
                 ]
@@ -2222,7 +2303,7 @@ PYTHON_EOF"""
             # 4. Check GPU availability
             try:
                 check_gpu_cmd = [
-                    "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
+                    "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null", "-o", "LogLevel=ERROR", "-o", "ConnectTimeout=10",
                     f"root@{ssh_host}",
                     "nvidia-smi --query-gpu=name,memory.total --format=csv,noheader 2>/dev/null || echo 'NO_GPU'"
                 ]
@@ -2240,7 +2321,7 @@ PYTHON_EOF"""
             # 5. Check required directories
             try:
                 check_dirs_cmd = [
-                    "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
+                    "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null", "-o", "LogLevel=ERROR", "-o", "ConnectTimeout=10",
                     f"root@{ssh_host}",
                     "test -d /workspace && test -d /workspace/data && test -d /workspace/output && echo 'DIRS_OK' || echo 'DIRS_MISSING'"
                 ]
@@ -2255,7 +2336,7 @@ PYTHON_EOF"""
             # 6. Check Python and basic tools
             try:
                 check_python_cmd = [
-                    "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
+                    "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null", "-o", "LogLevel=ERROR", "-o", "ConnectTimeout=10",
                     f"root@{ssh_host}",
                     "python3 --version 2>&1 || python --version 2>&1 || echo 'NO_PYTHON'"
                 ]
@@ -2417,7 +2498,7 @@ PYTHON_EOF"""
             # Check if training is still running
             # Check for training process
             check_process_cmd = [
-                "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
+                "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null", "-o", "LogLevel=ERROR", "-o", "ConnectTimeout=10",
                 f"root@{ssh_host}",
                 "ps aux | grep -E '(axolotl|accelerate|train)' | grep -v grep || echo 'no_training'"
             ]
@@ -2453,7 +2534,7 @@ PYTHON_EOF"""
             else:
                 # Check what processes ARE running (to help debug)
                 all_processes_cmd = [
-                    "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
+                    "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null", "-o", "LogLevel=ERROR", "-o", "ConnectTimeout=10",
                     f"root@{ssh_host}",
                     "ps aux | head -20"
                 ]
@@ -2470,7 +2551,7 @@ PYTHON_EOF"""
             
             # Check for output directory and latest checkpoint
             check_output_cmd = [
-                "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
+                "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null", "-o", "LogLevel=ERROR", "-o", "ConnectTimeout=10",
                 f"root@{ssh_host}",
                 "ls -la /workspace/output/training 2>/dev/null | tail -5 || echo 'no_output'"
             ]
@@ -2493,7 +2574,7 @@ PYTHON_EOF"""
             
             # Also check if the directory exists at all
             check_dir_exists_cmd = [
-                "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
+                "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null", "-o", "LogLevel=ERROR", "-o", "ConnectTimeout=10",
                 f"root@{ssh_host}",
                 "test -d /workspace/output/training && echo 'dir_exists' || echo 'dir_missing'"
             ]
@@ -2507,7 +2588,7 @@ PYTHON_EOF"""
             # Get last few lines of training logs if available
             # Check multiple possible log locations and also check stdout/stderr
             log_cmd = [
-                "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
+                "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null", "-o", "LogLevel=ERROR", "-o", "ConnectTimeout=10",
                 f"root@{ssh_host}",
                 """bash -c '
                     # Try to find and tail training logs
@@ -2564,7 +2645,7 @@ PYTHON_EOF"""
             if not logs or len(logs) < 10:
                 # Check for output in /workspace/axolotl directory (where training runs)
                 check_axolotl_output_cmd = [
-                    "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
+                    "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null", "-o", "LogLevel=ERROR", "-o", "ConnectTimeout=10",
                     f"root@{ssh_host}",
                     """bash -c '
                         # Check for any output files or logs in axolotl directory
@@ -2591,7 +2672,7 @@ PYTHON_EOF"""
             if not logs or len(logs.strip()) < 10:
                 # Try to get output from training process
                 output_cmd = [
-                    "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
+                    "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null", "-o", "LogLevel=ERROR", "-o", "ConnectTimeout=10",
                     f"root@{ssh_host}",
                     "journalctl -u vastai --no-pager -n 50 2>/dev/null || dmesg | tail -30 2>/dev/null || echo 'no_system_logs'"
                 ]
@@ -2632,7 +2713,7 @@ PYTHON_EOF"""
             
             # Check for actual adapter files in multiple locations
             check_adapter_cmd = [
-                "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
+                "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null", "-o", "LogLevel=ERROR", "-o", "ConnectTimeout=10",
                 f"root@{ssh_host}",
                 """bash -c '
                     # Check multiple possible locations for adapter files
@@ -2674,7 +2755,7 @@ PYTHON_EOF"""
             
             # Also check for any weight files (bin, safetensors, etc.)
             check_weights_cmd = [
-                "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
+                "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null", "-o", "LogLevel=ERROR", "-o", "ConnectTimeout=10",
                 f"root@{ssh_host}",
                 """bash -c '
                     # Look for any weight files
@@ -2709,7 +2790,7 @@ PYTHON_EOF"""
             
             # Check if training files were uploaded (check if they exist on instance)
             check_files_cmd = [
-                "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
+                "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null", "-o", "LogLevel=ERROR", "-o", "ConnectTimeout=10",
                 f"root@{ssh_host}",
                 "test -f /workspace/data/training_data.jsonl && test -f /workspace/data/axolotl_config.yaml && echo 'files_exist' || echo 'no_files'"
             ]
@@ -2726,14 +2807,14 @@ PYTHON_EOF"""
             
             # Also check each file individually for more detail
             check_data_file_cmd = [
-                "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
+                "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null", "-o", "LogLevel=ERROR", "-o", "ConnectTimeout=10",
                 f"root@{ssh_host}",
                 "ls -lh /workspace/data/training_data.jsonl 2>&1 || echo 'data_file_missing'"
             ]
             data_file_result = subprocess.run(check_data_file_cmd, capture_output=True, text=True, timeout=15)
             
             check_config_file_cmd = [
-                "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
+                "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null", "-o", "LogLevel=ERROR", "-o", "ConnectTimeout=10",
                 f"root@{ssh_host}",
                 "ls -lh /workspace/data/axolotl_config.yaml 2>&1 || echo 'config_file_missing'"
             ]
@@ -2757,7 +2838,7 @@ PYTHON_EOF"""
             
             # Check if training ever started by looking for evidence
             check_training_started_cmd = [
-                "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
+                "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null", "-o", "LogLevel=ERROR", "-o", "ConnectTimeout=10",
                 f"root@{ssh_host}",
                 """bash -c '
                     # Check for evidence that training started

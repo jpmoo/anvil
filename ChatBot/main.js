@@ -469,8 +469,13 @@ async function establishSSHTunnel(host, sshPort, username, sshKeyPath, remotePor
       console.log(`[SSH TUNNEL] Process exited with code ${code}, signal ${signal}`);
       if (code !== 0 && code !== null) {
         console.error(`[SSH TUNNEL] Tunnel process exited unexpectedly`);
+        // Don't immediately cleanup - preserve config for potential reconnection
+        // Only clear the process reference
+        sshTunnelProcess = null;
+      } else {
+        // Normal exit (code 0) - full cleanup
+        cleanupSSHTunnel();
       }
-      cleanupSSHTunnel();
     });
     
     // Give SSH time to bind the local port; trust the process if still alive
@@ -507,6 +512,33 @@ async function cleanupSSHTunnel() {
     sshTunnelProcess = null;
     sshTunnelLocalPort = null;
     sshTunnelConfig = null;
+  }
+}
+
+// Check if tunnel is alive and reconnect if needed
+async function ensureSSHTunnel() {
+  // Only check/reconnect if we're using localhost (tunneled connection)
+  if (!sshTunnelConfig) {
+    return; // No tunnel configured, using direct connection
+  }
+  
+  // Check if tunnel process is still alive
+  const isAlive = sshTunnelProcess && 
+                  !sshTunnelProcess.killed && 
+                  sshTunnelProcess.exitCode === null;
+  
+  if (!isAlive) {
+    console.warn(`[SSH TUNNEL] Tunnel process is not alive, attempting to reconnect...`);
+    try {
+      const { host, port, username, sshKeyPath, remotePort } = sshTunnelConfig;
+      await establishSSHTunnel(host, port, username, sshKeyPath, remotePort);
+      console.log(`[SSH TUNNEL] ✓ Tunnel re-established successfully`);
+      // Give tunnel a moment to bind
+      await new Promise(resolve => setTimeout(resolve, 1000));
+    } catch (error) {
+      console.error(`[SSH TUNNEL] ✗ Failed to re-establish tunnel: ${error.message}`);
+      throw new Error(`SSH tunnel connection lost and could not be re-established: ${error.message}`);
+    }
   }
 }
 
@@ -620,17 +652,51 @@ ipcMain.handle('get-profile-versions', async (event, profileName) => {
     for (const entry of entries) {
       if (entry.isDirectory() && entry.name.match(/^V\d+$/)) {
         const versionNum = parseInt(entry.name.substring(1));
-        const weightsPath = path.join(profileDir, entry.name, 'weights', 'adapter');
+        const versionDir = path.join(profileDir, entry.name);
         
-        if (fs.existsSync(weightsPath)) {
+        // Check for adapter in the standard location: V{version}/weights/adapter
+        const weightsPath = path.join(versionDir, 'weights', 'adapter');
+        
+        // Also check alternative locations for backward compatibility
+        const altPaths = [
+          weightsPath,  // Standard: V{version}/weights/adapter
+          path.join(versionDir, 'adapter'),  // Alternative: V{version}/adapter
+          path.join(versionDir, 'model', 'adapter'),  // Alternative: V{version}/model/adapter
+        ];
+        
+        let foundPath = null;
+        let hasEssentialFiles = false;
+        
+        for (const checkPath of altPaths) {
+          if (fs.existsSync(checkPath)) {
+            // Verify essential files exist
+            const configFile = path.join(checkPath, 'adapter_config.json');
+            const safetensorsFile = path.join(checkPath, 'adapter_model.safetensors');
+            const binFile = path.join(checkPath, 'adapter_model.bin');
+            
+            const hasConfig = fs.existsSync(configFile);
+            const hasWeights = fs.existsSync(safetensorsFile) || fs.existsSync(binFile);
+            
+            if (hasConfig && hasWeights) {
+              foundPath = checkPath;
+              hasEssentialFiles = true;
+              console.log(`[APP] ✓ Found version ${versionNum} with essential files at: ${checkPath}`);
+              break;
+            } else if (fs.existsSync(checkPath) && fs.readdirSync(checkPath).length > 0) {
+              // Directory exists but missing essential files
+              console.log(`[APP] ⚠ Version ${versionNum} directory exists at ${checkPath} but missing essential files (config: ${hasConfig}, weights: ${hasWeights})`);
+            }
+          }
+        }
+        
+        if (foundPath && hasEssentialFiles) {
           versions.push({
             version: versionNum,
-            path: weightsPath,
+            path: foundPath,
             exists: true
           });
-          console.log(`[APP] Found version ${versionNum} at: ${weightsPath}`);
         } else {
-          console.log(`[APP] Version ${versionNum} directory exists but no adapter weights found`);
+          console.log(`[APP] Version ${versionNum} directory exists but no valid adapter weights found in any expected location`);
         }
       }
     }
@@ -716,10 +782,39 @@ ipcMain.handle('load-behavior-packs', async (event, profileName) => {
     if (fs.existsSync(behaviorPacksPath)) {
       const behaviorPacks = JSON.parse(fs.readFileSync(behaviorPacksPath, 'utf8'));
       console.log(`[BEHAVIOR] behavior_packs.json loaded for profile "${profileName}". Renderer is responsible for applying exemplars.`);
-      // Check if pack is empty (only blank stems - no exemplars with actual content)
-      const isEmpty = !behaviorPacks.exemplars ||
-                     Object.keys(behaviorPacks.exemplars).length === 0 ||
-                     Object.values(behaviorPacks.exemplars).every(ex => !ex.text || !ex.text.trim());
+      
+      // Check if pack is empty - handle both old and new schema formats
+      let isEmpty = true;
+      
+      // New schema: check triggers with exemplars arrays
+      if (behaviorPacks.triggers && typeof behaviorPacks.triggers === 'object') {
+        const hasContent = Object.values(behaviorPacks.triggers).some(trigger => {
+          if (trigger.exemplars && Array.isArray(trigger.exemplars)) {
+            return trigger.exemplars.some(ex => {
+              if (typeof ex === 'string') return ex.trim().length > 0;
+              if (ex && typeof ex === 'object' && ex.text) return ex.text.trim().length > 0;
+              return false;
+            });
+          }
+          return false;
+        });
+        isEmpty = !hasContent;
+      }
+      // Old schema: check exemplars object directly
+      else if (behaviorPacks.exemplars && typeof behaviorPacks.exemplars === 'object') {
+        const hasContent = Object.values(behaviorPacks.exemplars).some(ex => {
+          if (typeof ex === 'string') return ex.trim().length > 0;
+          if (ex && typeof ex === 'object') {
+            if (Array.isArray(ex.text)) {
+              return ex.text.some(t => typeof t === 'string' && t.trim().length > 0);
+            }
+            return ex.text && typeof ex.text === 'string' && ex.text.trim().length > 0;
+          }
+          return false;
+        });
+        isEmpty = !hasContent;
+      }
+      
       return {
         success: true,
         data: behaviorPacks,
@@ -1636,6 +1731,24 @@ except Exception as e:
           }
           console.log(`[INIT] ✓ Local path verified: ${version.path}`);
           
+          // Verify essential adapter files exist before upload
+          const essentialFiles = [
+            'adapter_config.json',
+            'adapter_model.safetensors',
+            'adapter_model.bin'
+          ];
+          
+          const foundEssentialFiles = essentialFiles.filter(fileName => {
+            const filePath = path.join(version.path, fileName);
+            return fs.existsSync(filePath);
+          });
+          
+          if (foundEssentialFiles.length === 0) {
+            throw new Error(`No essential adapter files found in ${version.path}. Expected at least one of: ${essentialFiles.join(', ')}`);
+          }
+          
+          console.log(`[INIT] ✓ Found essential files: ${foundEssentialFiles.join(', ')}`);
+          
           // Verify SSH connection before proceeding
           if (!ssh.isConnected) {
             throw new Error('SSH connection lost before upload. Please reconnect.');
@@ -1652,19 +1765,27 @@ except Exception as e:
           // Calculate total size and file count before upload
           const getAllFiles = (dir) => {
             const files = [];
-            const entries = fs.readdirSync(dir, { withFileTypes: true });
-            for (const entry of entries) {
-              const fullPath = path.join(dir, entry.name);
-              if (entry.isDirectory()) {
-                files.push(...getAllFiles(fullPath));
-              } else if (!entry.name.startsWith('.') && entry.name !== 'node_modules') {
-                files.push(fullPath);
+            try {
+              const entries = fs.readdirSync(dir, { withFileTypes: true });
+              for (const entry of entries) {
+                const fullPath = path.join(dir, entry.name);
+                if (entry.isDirectory()) {
+                  files.push(...getAllFiles(fullPath));
+                } else if (!entry.name.startsWith('.') && entry.name !== 'node_modules') {
+                  files.push(fullPath);
+                }
               }
+            } catch (error) {
+              console.error(`[INIT] Error reading directory ${dir}:`, error.message);
             }
             return files;
           };
           
           const allFiles = getAllFiles(version.path);
+          
+          if (allFiles.length === 0) {
+            throw new Error(`No files found in adapter directory: ${version.path}`);
+          }
           let totalSize = 0;
           const localFileSizes = new Map(); // Map of relative path -> size
           
@@ -2033,16 +2154,52 @@ except Exception as e:
           
           if (healthCheck.stdout.includes('curl_failed') || !healthCheck.stdout.trim()) {
             console.log(`[INIT] [HEALTH CHECK] Attempt ${attemptCount}: FAILED - curl failed or empty response`);
+            
+            // Check if process is still running
+            const processStillRunning = await ssh.execCommand('pgrep -f "uvicorn utils.inference_server:app" || echo "not_running"');
+            if (processStillRunning.stdout.trim() === 'not_running') {
+              console.error(`[INIT] [HEALTH CHECK] Attempt ${attemptCount}: Process is NOT running! Server may have crashed.`);
+              // Get error logs
+              const errorLogCheck = await ssh.execCommand('tail -100 /workspace/logs/inference-stderr.log 2>/dev/null || echo no_logs');
+              if (errorLogCheck.stdout.trim() !== 'no_logs') {
+                console.error(`[INIT] [HEALTH CHECK] Server error logs (last 100 lines):`);
+                console.error(errorLogCheck.stdout);
+              }
+              const stdoutLogCheck = await ssh.execCommand('tail -50 /workspace/logs/inference-stdout.log 2>/dev/null || echo no_logs');
+              if (stdoutLogCheck.stdout.trim() !== 'no_logs') {
+                console.log(`[INIT] [HEALTH CHECK] Server stdout logs (last 50 lines):`);
+                console.log(stdoutLogCheck.stdout);
+              }
+            } else {
+              console.log(`[INIT] [HEALTH CHECK] Attempt ${attemptCount}: Process is still running (PID: ${processStillRunning.stdout.trim()}), but health endpoint not responding`);
+              // Check if port is listening
+              const portCheck = await ssh.execCommand(`netstat -tlnp 2>/dev/null | grep :${inferencePort} || ss -tlnp 2>/dev/null | grep :${inferencePort} || echo "port_not_listening"`);
+              if (portCheck.stdout.includes('port_not_listening')) {
+                console.error(`[INIT] [HEALTH CHECK] Attempt ${attemptCount}: Port ${inferencePort} is NOT listening! Server may not have bound to port.`);
+              } else {
+                console.log(`[INIT] [HEALTH CHECK] Attempt ${attemptCount}: Port ${inferencePort} appears to be listening`);
+              }
+              
+              // Show recent error logs even if process is running (might be startup errors)
+              if (attemptCount % 3 === 0) { // Every 3rd attempt, check logs
+                const errorLogCheck = await ssh.execCommand('tail -50 /workspace/logs/inference-stderr.log 2>/dev/null || echo no_logs');
+                if (errorLogCheck.stdout.trim() !== 'no_logs' && errorLogCheck.stdout.trim().length > 0) {
+                  console.log(`[INIT] [HEALTH CHECK] Recent error logs (last 50 lines):`);
+                  console.log(errorLogCheck.stdout.substring(0, 1000));
+                }
+              }
+            }
+            
             if (attemptCount < maxRetries && (Date.now() - startTime) < maxRetryTime) {
               console.log(`[INIT] [HEALTH CHECK] Attempt ${attemptCount}: Retrying in 3 seconds...`);
               await new Promise(resolve => setTimeout(resolve, retryInterval));
               continue;
             }
           } else {
-            try {
+          try {
               const healthData = JSON.parse(healthCheck.stdout);
               console.log(`[INIT] [HEALTH CHECK] Attempt ${attemptCount}: Parsed health data:`, JSON.stringify(healthData, null, 2));
-              if (healthData.status === 'healthy' || healthData.status === 'ok') {
+            if (healthData.status === 'healthy' || healthData.status === 'ok') {
                 console.log(`[INIT] [HEALTH CHECK] Attempt ${attemptCount}: ✓ PASSED - server is responding correctly`);
                 console.log(`[INIT] ✓ Server health check passed after ${attemptCount} attempt(s) (${elapsedSeconds}s)`);
                 results.steps.push(`✓ Server health check passed after ${attemptCount} attempt(s) (${elapsedSeconds}s)`);
@@ -2050,15 +2207,15 @@ except Exception as e:
                 results.healthCheckPassed = true;
                 healthCheckPassed = true;
                 break;
-              } else {
+            } else {
                 console.log(`[INIT] [HEALTH CHECK] Attempt ${attemptCount}: FAILED - status is not 'healthy': ${healthData.status || 'unknown'}`);
                 if (attemptCount < maxRetries && (Date.now() - startTime) < maxRetryTime) {
                   console.log(`[INIT] [HEALTH CHECK] Attempt ${attemptCount}: Retrying in 3 seconds...`);
                   await new Promise(resolve => setTimeout(resolve, retryInterval));
                   continue;
                 }
-              }
-            } catch (e) {
+            }
+          } catch (e) {
               console.log(`[INIT] [HEALTH CHECK] Attempt ${attemptCount}: FAILED - could not parse health response: ${e.message}`);
               console.log(`[INIT] [HEALTH CHECK] Attempt ${attemptCount}: Raw response: ${healthCheck.stdout ? healthCheck.stdout.substring(0, 200) : 'no data'}`);
               if (attemptCount < maxRetries && (Date.now() - startTime) < maxRetryTime) {
@@ -2067,8 +2224,8 @@ except Exception as e:
                 continue;
               }
             }
-          }
-        } catch (healthError) {
+        }
+      } catch (healthError) {
           console.log(`[INIT] [HEALTH CHECK] Attempt ${attemptCount}: ERROR - ${healthError.message}`);
           console.log(`[INIT] [HEALTH CHECK] Attempt ${attemptCount}: Error details:`, healthError);
           if (attemptCount < maxRetries && (Date.now() - startTime) < maxRetryTime) {
@@ -2082,7 +2239,35 @@ except Exception as e:
       // If health check failed after all retries, abort with error
       if (!healthCheckPassed) {
         const finalElapsedSeconds = Math.floor((Date.now() - startTime) / 1000);
-        const errorMsg = `Server health check failed after ${attemptCount} attempt(s) over ${finalElapsedSeconds} seconds. The inference server did not respond correctly.`;
+        
+        // Final diagnostic: check process status and logs
+        console.error(`[INIT] [HEALTH CHECK] Final diagnostic check...`);
+        const finalProcessCheck = await ssh.execCommand('pgrep -f "uvicorn utils.inference_server:app" || echo "not_running"');
+        console.error(`[INIT] [HEALTH CHECK] Final process check: ${finalProcessCheck.stdout.trim()}`);
+        
+        // Get comprehensive error logs
+        const finalErrorLogs = await ssh.execCommand('tail -200 /workspace/logs/inference-stderr.log 2>/dev/null || echo no_logs');
+        if (finalErrorLogs.stdout.trim() !== 'no_logs' && finalErrorLogs.stdout.trim().length > 0) {
+          console.error(`[INIT] [HEALTH CHECK] Final error logs (last 200 lines):`);
+          console.error(finalErrorLogs.stdout);
+        }
+        
+        const finalStdoutLogs = await ssh.execCommand('tail -100 /workspace/logs/inference-stdout.log 2>/dev/null || echo no_logs');
+        if (finalStdoutLogs.stdout.trim() !== 'no_logs' && finalStdoutLogs.stdout.trim().length > 0) {
+          console.log(`[INIT] [HEALTH CHECK] Final stdout logs (last 100 lines):`);
+          console.log(finalStdoutLogs.stdout);
+        }
+        
+        // Check port binding
+        const finalPortCheck = await ssh.execCommand(`netstat -tlnp 2>/dev/null | grep :${inferencePort} || ss -tlnp 2>/dev/null | grep :${inferencePort} || echo "port_not_listening"`);
+        console.error(`[INIT] [HEALTH CHECK] Port ${inferencePort} status: ${finalPortCheck.stdout.trim()}`);
+        
+        // Try a verbose curl to see what's happening
+        const verboseCurl = await ssh.execCommand(`curl -v http://localhost:${inferencePort}/health 2>&1 | head -50 || echo "curl_failed"`);
+        console.error(`[INIT] [HEALTH CHECK] Verbose curl output:`);
+        console.error(verboseCurl.stdout);
+        
+        const errorMsg = `Server health check failed after ${attemptCount} attempt(s) over ${finalElapsedSeconds} seconds. The inference server did not respond correctly. Check logs above for details.`;
         console.error(`[INIT] ✗ ${errorMsg}`);
         console.error(`[INIT] [HEALTH CHECK] All ${attemptCount} attempts failed. Aborting initialization.`);
         results.errors.push(errorMsg);
@@ -2187,7 +2372,7 @@ except Exception as e:
       // Fallback only if somehow not set (should not happen)
       if (externalPortValue) {
         results.inferenceUrl = `http://${host}:${externalPortValue}`;
-      } else {
+            } else {
         results.inferenceUrl = 'http://127.0.0.1:8888';
       }
     }
@@ -3065,6 +3250,24 @@ ipcMain.handle('prepare-inference-server', async (event, { host, port, username 
       console.log(`[vLLM] Uploading ${versionName} adapter...`);
       
       try {
+        // Verify essential adapter files exist before upload
+        const essentialFiles = [
+          'adapter_config.json',
+          'adapter_model.safetensors',
+          'adapter_model.bin'
+        ];
+        
+        const foundEssentialFiles = essentialFiles.filter(fileName => {
+          const filePath = path.join(version.path, fileName);
+          return fs.existsSync(filePath);
+        });
+        
+        if (foundEssentialFiles.length === 0) {
+          throw new Error(`No essential adapter files found in ${version.path}. Expected at least one of: ${essentialFiles.join(', ')}`);
+        }
+        
+        console.log(`[vLLM] ✓ Found essential files: ${foundEssentialFiles.join(', ')}`);
+        
         // Create remote directory for this version
         const versionMkdirCommand = `mkdir -p ${remoteVersionDir}`;
         console.log(`[SSH] Executing: ${versionMkdirCommand}`);
@@ -3080,19 +3283,28 @@ ipcMain.handle('prepare-inference-server', async (event, { host, port, username 
         // Calculate total size for display
         const getAllFiles = (dir) => {
           const files = [];
-          const entries = fs.readdirSync(dir, { withFileTypes: true });
-          for (const entry of entries) {
-            const fullPath = path.join(dir, entry.name);
-            if (entry.isDirectory()) {
-              files.push(...getAllFiles(fullPath));
-            } else if (!entry.name.startsWith('.') && entry.name !== 'node_modules') {
-              files.push(fullPath);
+          try {
+            const entries = fs.readdirSync(dir, { withFileTypes: true });
+            for (const entry of entries) {
+              const fullPath = path.join(dir, entry.name);
+              if (entry.isDirectory()) {
+                files.push(...getAllFiles(fullPath));
+              } else if (!entry.name.startsWith('.') && entry.name !== 'node_modules') {
+                files.push(fullPath);
+              }
             }
+          } catch (error) {
+            console.error(`[vLLM] Error reading directory ${dir}:`, error.message);
           }
           return files;
         };
         
         const allFiles = getAllFiles(version.path);
+        
+        if (allFiles.length === 0) {
+          throw new Error(`No files found in adapter directory: ${version.path}`);
+        }
+        
         let totalSize = 0;
         for (const file of allFiles) {
           try {
@@ -3133,20 +3345,20 @@ ipcMain.handle('prepare-inference-server', async (event, { host, port, username 
             const progressCallback = (progressLine) => {
               // Log progress to console
               console.log(`[vLLM] [${versionName} Upload Progress] ${progressLine}`);
-              
-              // Update progress step
+                      
+                      // Update progress step
               const progressStep = `Uploading ${versionName} adapter... ${progressLine}`;
               if (progressStep !== lastProgressStep) {
-                const lastStepIndex = results.steps.length - 1;
+                      const lastStepIndex = results.steps.length - 1;
                 if (lastStepIndex >= 0 && results.steps[lastStepIndex].includes('Uploading') && results.steps[lastStepIndex].includes(versionName)) {
-                  results.steps[lastStepIndex] = progressStep;
-                } else {
-                  results.steps.push(progressStep);
-                }
+                        results.steps[lastStepIndex] = progressStep;
+                      } else {
+                        results.steps.push(progressStep);
+                      }
                 lastProgressStep = progressStep;
               }
             };
-            
+        
             // Use rsync to upload
             await uploadAdapterWithRsync(
               version.path,
@@ -3178,13 +3390,13 @@ ipcMain.handle('prepare-inference-server', async (event, { host, port, username 
             
             if (isConnectionError && uploadAttempts < maxUploadAttempts) {
               console.log(`[vLLM] Connection error detected, will retry...`);
-              results.steps.push(`⚠ Connection error, retrying (${uploadAttempts}/${maxUploadAttempts})...`);
-              continue; // Retry
-            } else {
+                results.steps.push(`⚠ Connection error, retrying (${uploadAttempts}/${maxUploadAttempts})...`);
+                continue; // Retry
+              } else {
               // Not a retryable error or max attempts reached
-              const finalError = new Error(`Upload failed after ${maxUploadAttempts} attempts: ${errorMsg}`);
-              finalError.stack = errorStack;
-              throw finalError;
+                const finalError = new Error(`Upload failed after ${maxUploadAttempts} attempts: ${errorMsg}`);
+                finalError.stack = errorStack;
+                throw finalError;
             }
           }
         }
@@ -3548,22 +3760,8 @@ except Exception as e:
         results.steps.push(`⚠ Warning: Model name contains spaces: ${actualBaseModel}`);
       }
       
-      // Check for common Gemma model name patterns
-      if (org === 'google' && modelName.includes('gemma')) {
-        const gemmaPattern = /gemma-?(\d+)?-?(\d+)?b?-?it?/i;
-        const match = modelName.match(gemmaPattern);
-        if (match) {
-          console.log(`[vLLM] ✓ Detected Gemma model pattern`);
-          console.log(`[vLLM]   Full model identifier: ${actualBaseModel}`);
-          
-          // Gemma 3 is valid and supported - no warning needed
-          // Note: Gemma 3 models (e.g., google/gemma-3-4b-it) are fully supported by recent vLLM versions
-        } else {
-          console.warn(`[vLLM] ⚠ Model name doesn't match common Gemma patterns`);
-          console.warn(`[vLLM]   Expected format: google/gemma-{version}-{size}b-it`);
-          console.warn(`[vLLM]   Example: google/gemma-2-2b-it or google/gemma-7b-it`);
-        }
-      }
+      // Model name validation is generic - no model-specific checks needed
+      // vLLM supports all standard HuggingFace models including Mistral, Llama, Gemma, etc.
     }
     
     console.log('[vLLM] ========================================\n');
@@ -5164,7 +5362,7 @@ environment=HF_TOKEN="${hfToken || ''}"
       } catch (tunnelError) {
         console.warn(`[vLLM] ⚠ Failed to establish SSH tunnel: ${tunnelError.message}`);
         console.warn(`[vLLM] Falling back to external URL`);
-        storedVLLMUrl = vllmUrl || `http://${host}:8000`;
+      storedVLLMUrl = vllmUrl || `http://${host}:8000`;
       }
       
       console.log(`[vLLM] Stored model info with baseModel: ${actualBaseModel}`);
@@ -6004,7 +6202,7 @@ function makeHttpRequest(url, options) {
 }
 
 // Send chat message to FastAPI inference server
-ipcMain.handle('send-chat-message', async (event, { message, version, prependedText, useSummary, conversationSummary, conversationHistory }) => {
+ipcMain.handle('send-chat-message', async (event, { message, version, prependedText, useSummary, conversationSummary, conversationHistory, temperature, max_tokens, repetition_penalty }) => {
   if (!storedModelInfo || !storedVLLMUrl) {
     throw new Error('Inference server not prepared. Please prepare the inference server first.');
   }
@@ -6045,9 +6243,10 @@ ipcMain.handle('send-chat-message', async (event, { message, version, prependedT
     
     // Add conversation history (excluding the last user message if it exists, as we're replacing it)
     // History should already be in alternating user/assistant format
+    // Fix: Handle expansions that create consecutive assistant messages
     if (conversationHistory && conversationHistory.length > 0) {
       // Filter out the last user message if it exists, as we're building a new one
-      const historyToAdd = [...conversationHistory];
+      let historyToAdd = [...conversationHistory];
       if (historyToAdd.length > 0 && historyToAdd[historyToAdd.length - 1].role === 'user') {
         historyToAdd.pop(); // Remove last user message
       }
@@ -6059,8 +6258,25 @@ ipcMain.handle('send-chat-message', async (event, { message, version, prependedT
         historyToAdd.shift(); // Remove first assistant message if history starts with it
       }
       
-      messages.push(...historyToAdd);
-      console.log('[CHAT] Added', historyToAdd.length, 'messages from conversation history');
+      // Fix: Normalize conversation history to remove consecutive assistant messages
+      // When expansions exist, they create consecutive assistant messages - keep only the last one
+      const normalizedHistory = [];
+      for (let i = 0; i < historyToAdd.length; i++) {
+        const msg = historyToAdd[i];
+        const lastNormalized = normalizedHistory[normalizedHistory.length - 1];
+        
+        // Skip consecutive assistant messages - keep only the last one (expansion if it exists)
+        if (msg.role === 'assistant' && lastNormalized && lastNormalized.role === 'assistant') {
+          // Replace the previous assistant with this one (expansion takes precedence)
+          normalizedHistory[normalizedHistory.length - 1] = msg;
+          console.log('[CHAT] Normalized: Replaced previous assistant message with expansion');
+        } else {
+          normalizedHistory.push(msg);
+        }
+      }
+      
+      messages.push(...normalizedHistory);
+      console.log('[CHAT] Added', normalizedHistory.length, 'messages from conversation history (normalized from', historyToAdd.length, 'original)');
     }
     
     // REQUIRED user message - this is ONLY the user's typed message, nothing else
@@ -6109,6 +6325,17 @@ ipcMain.handle('send-chat-message', async (event, { message, version, prependedT
       messages: messages
     };
     
+    // Add optional generation parameters if provided
+    if (temperature !== undefined && temperature !== null) {
+      payload.temperature = temperature;
+    }
+    if (max_tokens !== undefined && max_tokens !== null) {
+      payload.max_new_tokens = max_tokens;
+    }
+    if (repetition_penalty !== undefined && repetition_penalty !== null) {
+      payload.repetition_penalty = repetition_penalty;
+    }
+    
     console.log('\n[CHAT] ========================================');
     console.log('[CHAT] Sending message to FastAPI inference server...');
     console.log(`[CHAT] Selected version from UI: "${version}"`);
@@ -6126,6 +6353,16 @@ ipcMain.handle('send-chat-message', async (event, { message, version, prependedT
     const inferenceApiUrl = storedVLLMUrl; // Reusing the same stored URL variable
     console.log(`[CHAT] Using inference server URL: ${inferenceApiUrl}`);
     
+    // Ensure SSH tunnel is alive before health check (if using tunneled connection)
+    if (inferenceApiUrl.includes('127.0.0.1') || inferenceApiUrl.includes('localhost')) {
+      try {
+        await ensureSSHTunnel();
+      } catch (error) {
+        console.warn(`[CHAT] Tunnel check failed during health check: ${error.message}`);
+        // Continue anyway - health check will fail if tunnel is truly needed
+      }
+    }
+    
     // Check if inference server is accessible (from local machine, not via SSH)
     console.log(`[CHAT] Checking if inference server is accessible at ${inferenceApiUrl}...`);
     
@@ -6142,10 +6379,11 @@ ipcMain.handle('send-chat-message', async (event, { message, version, prependedT
     let healthCode = null;
     let availableModels = [];
     try {
-      // Check /health endpoint first
+      // Check /health endpoint first with increased timeout (30 seconds for slow servers)
       const healthResponse = await makeHttpRequest(`${inferenceApiUrl}/health`, {
         method: 'GET',
-        headers: healthHeaders
+        headers: healthHeaders,
+        timeout: 30000 // 30 seconds for health check (server may be slow to respond)
       });
       healthCode = healthResponse.statusCode.toString();
       console.log(`[CHAT] Inference server health check HTTP code: ${healthCode}`);
@@ -6166,7 +6404,8 @@ ipcMain.handle('send-chat-message', async (event, { message, version, prependedT
         try {
           const modelsResponse = await makeHttpRequest(`${inferenceApiUrl}/models`, {
             method: 'GET',
-            headers: healthHeaders
+            headers: healthHeaders,
+            timeout: 30000
           });
           if (modelsResponse.statusCode === 200 && modelsResponse.data) {
             const modelsData = JSON.parse(modelsResponse.data);
@@ -6184,19 +6423,34 @@ ipcMain.handle('send-chat-message', async (event, { message, version, prependedT
       } else {
         healthCode = '000';
       }
-      console.log(`[CHAT] Inference server health check failed: ${error.message}`);
+      console.warn(`[CHAT] Inference server health check failed: ${error.message}`);
+      console.warn(`[CHAT] ⚠ Health check failed, but proceeding with chat request anyway (server may be slow to respond)`);
     }
     
+    // Make health check non-blocking - don't throw errors, just warn
+    // The actual chat request will fail if the server is truly unreachable
     if (healthCode === '000' || healthCode === '' || healthCode.includes('connection')) {
-      throw new Error(`Inference server is not accessible at ${inferenceApiUrl}. Make sure the server is running and the URL is correct.`);
+      console.warn(`[CHAT] ⚠ Health check indicates server may not be accessible, but proceeding with request anyway`);
+      console.warn(`[CHAT] ⚠ If the request fails, check that the server is running at ${inferenceApiUrl}`);
     }
     
     if (healthCode === '401') {
-      throw new Error(`Inference server requires authentication (HTTP 401). The app should have automatically enabled Basic Auth. Please check the inference server URL test.`);
+      console.warn(`[CHAT] ⚠ Health check returned 401 (authentication required), but proceeding with request`);
+      console.warn(`[CHAT] ⚠ If the request fails, check Basic Auth configuration`);
     }
     
-    if (healthCode !== '200') {
-      console.warn(`[CHAT] ⚠ Inference server health check returned HTTP ${healthCode} - may still be loading`);
+    if (healthCode && healthCode !== '200' && healthCode !== '000' && healthCode !== '') {
+      console.warn(`[CHAT] ⚠ Inference server health check returned HTTP ${healthCode} - may still be loading, proceeding anyway`);
+    }
+    
+    // Ensure SSH tunnel is alive before making request (if using tunneled connection)
+    if (inferenceApiUrl.includes('127.0.0.1') || inferenceApiUrl.includes('localhost')) {
+      try {
+        await ensureSSHTunnel();
+      } catch (error) {
+        console.error(`[CHAT] Tunnel check failed: ${error.message}`);
+        // Continue anyway - the request will fail if tunnel is truly needed
+      }
     }
     
     // Make HTTP request directly (not via SSH) to FastAPI /chat endpoint
@@ -6216,16 +6470,46 @@ ipcMain.handle('send-chat-message', async (event, { message, version, prependedT
     // Build request body as JSON string
     const requestBody = JSON.stringify(payload);
     
-    // Fix 3: Increase client timeout for chat requests (60 seconds for LLM responses)
-    const response = await makeHttpRequest(chatApiUrl, {
-      method: 'POST',
-      headers: {
-        ...chatHeaders,
-        'Accept': 'application/json'
-      },
-      body: requestBody,
-      timeout: 60000 // 60 seconds for chat requests (LLMs can take 10-30+ seconds)
-    });
+    // Tier 1 Fix: Raise renderer HTTP timeout to 120 seconds for longer expansions
+    // Wrap in try-catch to handle connection failures and attempt tunnel reconnection
+    let response;
+    try {
+      response = await makeHttpRequest(chatApiUrl, {
+        method: 'POST',
+        headers: {
+          ...chatHeaders,
+          'Accept': 'application/json'
+        },
+        body: requestBody,
+        timeout: 120000 // 120 seconds for chat requests (allows longer expansions up to 900 tokens)
+      });
+    } catch (error) {
+      // If connection refused and we're using localhost, try reconnecting tunnel once
+      if ((error.code === 'ECONNREFUSED' || error.originalError?.code === 'ECONNREFUSED') &&
+          (inferenceApiUrl.includes('127.0.0.1') || inferenceApiUrl.includes('localhost'))) {
+        console.warn(`[CHAT] Connection refused, attempting tunnel reconnection...`);
+        try {
+          await ensureSSHTunnel();
+          // Retry the request after reconnection
+          await new Promise(resolve => setTimeout(resolve, 1500)); // Give tunnel time to bind
+          response = await makeHttpRequest(chatApiUrl, {
+            method: 'POST',
+            headers: {
+              ...chatHeaders,
+              'Accept': 'application/json'
+            },
+            body: requestBody,
+            timeout: 120000
+          });
+          console.log(`[CHAT] ✓ Request succeeded after tunnel reconnection`);
+        } catch (retryError) {
+          console.error(`[CHAT] ✗ Request failed even after tunnel reconnection: ${retryError.message}`);
+          throw error; // Throw original error
+        }
+      } else {
+        throw error; // Not a tunnel issue, throw original error
+      }
+    }
     
     console.log(`[CHAT] HTTP status: ${response.statusCode}`);
     console.log(`[CHAT] Response length: ${response.data ? response.data.length : 0} chars`);

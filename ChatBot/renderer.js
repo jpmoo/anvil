@@ -5,7 +5,15 @@ let sshTested = false;
 let modelInfo = null;
 let conversationHistory = [];
 let conversationSummary = '';
+// Memory-safe working memory: layered artifact (recent turns + rolling summary + pinned working-notes)
+let conversationWorkingMemory = {
+  summary: '', // 2–4 sentences, rolling
+  key_threads: [] // 5–9 short bullets (strings)
+};
+// Shared Understanding: concise rolling summary of agreed context (not a conversation log, but a contract of what is understood)
+let sharedUnderstanding = []; // Array of short bullet points (strings) representing established facts/patterns
 let configLoaded = false; // Track if config has been loaded to prevent overwriting user input
+let kickoffIssued = false; // True if we generated an opening greeting for a brand-new chat
 
 let behaviorPacks = null; // Loaded behavior packs configuration
 
@@ -30,12 +38,19 @@ function normalizeBehaviorPack(pack) {
   };
 
   // Flatten triggers → exemplars
+  // Supports both legacy `when` mapping and simple trigger-keyed exemplars.
   pack.exemplars = {};
   if (pack.triggers) {
     Object.entries(pack.triggers).forEach(([key, trigger]) => {
+      if (!trigger) return;
       if (trigger.exemplars) {
+        // If trigger.when exists, preserve it; otherwise default to [key]
+        const whenList = trigger.when
+          ? Object.keys(trigger.when)
+          : [key];
+
         pack.exemplars[key] = {
-          when: trigger.when ? Object.keys(trigger.when) : [],
+          when: whenList,
           text: trigger.exemplars
         };
       }
@@ -47,52 +62,344 @@ function normalizeBehaviorPack(pack) {
 
 // === Behavior-pack–driven style helpers ===
 
+// Infer conversation phase based on assistant turn count
+function inferConversationPhase(conversationHistory, behaviorPack) {
+  if (!behaviorPack?.conversation_phase) {
+    return "reflection";
+  }
+
+  const assistantTurns = conversationHistory.filter(
+    m => m.role === "assistant"
+  ).length;
+
+  if (assistantTurns === 0) return "reflection";
+  if (assistantTurns === 1) return "sensemaking";
+  return "structuring";
+}
+
 // Build a system message from the loaded behavior pack, if present
-function buildSystemFromBehaviorPack() {
+// Per PDF: "Prefer fewer system messages; consolidate identity + stance"
+// Per PDF: "Do not inject conversation phase labels into prompts"
+function buildSystemFromBehaviorPack(phase = null, isKickoff = false) {
   if (!behaviorPacks) return '';
   const parts = [];
-  if (behaviorPacks.profile_intent?.identity) parts.push(behaviorPacks.profile_intent.identity);
-  if (behaviorPacks.profile_intent?.stance) parts.push(behaviorPacks.profile_intent.stance);
-  if (Array.isArray(behaviorPacks.profile_intent?.avoid) && behaviorPacks.profile_intent.avoid.length) {
-    parts.push(`Avoid: ${behaviorPacks.profile_intent.avoid.join(', ')}`);
+
+  // Only include identity and stance - consolidated single system prepend
+  if (behaviorPacks.profile_intent?.identity) {
+    parts.push(behaviorPacks.profile_intent.identity);
+    console.log('[BEHAVIOR] Using profile_intent.identity from behavior_packs.json');
   }
-  if (behaviorPacks.tone_guidance?.voice) parts.push(`Voice: ${behaviorPacks.tone_guidance.voice}`);
-  if (behaviorPacks.tone_guidance?.opening_style) parts.push(`Opening style: ${behaviorPacks.tone_guidance.opening_style}`);
-  if (Array.isArray(behaviorPacks.tone_guidance?.preferred_openings) && behaviorPacks.tone_guidance.preferred_openings.length) {
-    parts.push(`Preferred openings: ${behaviorPacks.tone_guidance.preferred_openings.join(' | ')}`);
+  if (behaviorPacks.profile_intent?.stance) {
+    parts.push(behaviorPacks.profile_intent.stance);
+    console.log('[BEHAVIOR] Using profile_intent.stance from behavior_packs.json');
+  }
+
+  // Phase-sensitive guidance (read from behavior pack, do not name phases explicitly)
+  // Phase-Based Prompt Subtraction: Each phase replaces prior guidance, not adds to it
+  if (phase && behaviorPacks.conversation_phase?.phases?.[phase]) {
+    const phaseConfig = behaviorPacks.conversation_phase.phases[phase];
+    if (phase === 'reflection') {
+      // Reflection has different guidance for kickoff vs subsequent turns
+      const guidance = isKickoff 
+        ? phaseConfig.guidance_kickoff 
+        : phaseConfig.guidance_subsequent;
+      if (guidance) {
+        parts.push(guidance);
+        console.log(`[BEHAVIOR] Using conversation_phase.phases.${phase}.guidance_${isKickoff ? 'kickoff' : 'subsequent'} from behavior_packs.json`);
+      }
+    } else {
+      // Other phases have single guidance
+      if (phaseConfig.guidance) {
+        parts.push(phaseConfig.guidance);
+        console.log(`[BEHAVIOR] Using conversation_phase.phases.${phase}.guidance from behavior_packs.json`);
+      }
+    }
+  }
+  
+  // Repetition prevention (read from behavior pack)
+  // Order matters: most critical instructions first
+  if (behaviorPacks.repetition_prevention) {
+    // Most critical: multi-sentence idea repetition
+    if (behaviorPacks.repetition_prevention.multi_sentence_ban) {
+      parts.push(behaviorPacks.repetition_prevention.multi_sentence_ban);
+      console.log('[BEHAVIOR] Using repetition_prevention.multi_sentence_ban from behavior_packs.json');
+    }
+    if (behaviorPacks.repetition_prevention.idea_progression) {
+      parts.push(behaviorPacks.repetition_prevention.idea_progression);
+      console.log('[BEHAVIOR] Using repetition_prevention.idea_progression from behavior_packs.json');
+    }
+    if (behaviorPacks.repetition_prevention.within_response_ban) {
+      parts.push(behaviorPacks.repetition_prevention.within_response_ban);
+      console.log('[BEHAVIOR] Using repetition_prevention.within_response_ban from behavior_packs.json');
+    }
+    if (behaviorPacks.repetition_prevention.exact_phrase_ban) {
+      parts.push(behaviorPacks.repetition_prevention.exact_phrase_ban);
+      console.log('[BEHAVIOR] Using repetition_prevention.exact_phrase_ban from behavior_packs.json');
+    }
+    if (behaviorPacks.repetition_prevention.lexical_reuse_ban) {
+      parts.push(behaviorPacks.repetition_prevention.lexical_reuse_ban);
+      console.log('[BEHAVIOR] Using repetition_prevention.lexical_reuse_ban from behavior_packs.json');
+    }
+    if (behaviorPacks.repetition_prevention.sentence_variation) {
+      parts.push(behaviorPacks.repetition_prevention.sentence_variation);
+      console.log('[BEHAVIOR] Using repetition_prevention.sentence_variation from behavior_packs.json');
+    }
+  }
+
+  // Enforce output_contract constraints without semantic interpretation
+  if (behaviorPacks.output_contract?.rule) {
+    parts.push(behaviorPacks.output_contract.rule);
+    console.log('[BEHAVIOR] Using output_contract.rule from behavior_packs.json');
+  }
+  if (Array.isArray(behaviorPacks.output_contract?.must_not) && behaviorPacks.output_contract.must_not.length) {
+    parts.push(`Must not: ${behaviorPacks.output_contract.must_not.join(', ')}`);
+    console.log('[BEHAVIOR] Using output_contract.must_not from behavior_packs.json');
+  }
+
+  // Removed: conversation_phase.default injection (per PDF: no phase labels)
+  // Removed: progression_required phase anchoring (per PDF: no phase labels)
+  // Removed: avoid/allow lists (not needed in consolidated system message)
+
+  if (parts.length > 0) {
+    console.log('[BEHAVIOR] Built consolidated system message from behavior_packs.json (', parts.length, 'parts)');
   }
   return parts.join('\n');
 }
+
+// Format Shared Understanding block for prompt injection
+// This is a contract of what is already understood, not a conversation log
+function formatSharedUnderstanding() {
+  if (!Array.isArray(sharedUnderstanding) || sharedUnderstanding.length === 0) {
+    return '';
+  }
+  
+  const bullets = sharedUnderstanding
+    .filter(item => typeof item === "string" && item.trim())
+    .slice(0, 12); // Limit to 12 points for conciseness
+  
+  if (bullets.length === 0) {
+    return '';
+  }
+  
+  const parts = [];
+  const formatting = behaviorPacks?.memory_formatting || {};
+  parts.push(formatting.shared_understanding_header || '--- Shared Understanding ---');
+  parts.push(formatting.shared_understanding_instruction || 'The following points have already been established. Do not restate these points. Build on them.');
+  parts.push(bullets.map(b => `- ${b.trim()}`).join('\n'));
+  parts.push(formatting.shared_understanding_footer || '--- End Shared Understanding ---');
+  
+  return parts.join('\n');
+}
+
+// Format working memory for prompt injection (kept as SYSTEM content, not UI text)
+function formatWorkingMemoryForPrompt() {
+  const s = conversationWorkingMemory?.summary?.trim();
+  const threads = Array.isArray(conversationWorkingMemory?.key_threads)
+    ? conversationWorkingMemory.key_threads.filter(t => typeof t === "string" && t.trim()).slice(0, 9)
+    : [];
+  const parts = [];
+  const formatting = behaviorPacks?.memory_formatting || {};
+  // Reduce repetition: treat working memory as already-known background
+  parts.push(formatting.working_memory_intro || 'Assume the following context is already understood. Do not restate it unless the user explicitly asks.');
+  if (s) parts.push(`${formatting.working_memory_summary_label || 'Conversation summary:'}\n${s}`);
+  if (threads.length) {
+    parts.push(`${formatting.working_memory_threads_label || 'Key threads / open loops:'}\n- ${threads.join('\n- ')}`);
+  }
+  return parts.join('\n\n').trim();
+}
+
+// Fix 1 & 2: Compress conversation history - remove full assistant responses
+// Replace with semantic summaries via Shared Understanding block (injected in system prompt)
+// Preserve meaning, not phrasing. Keep only user messages to avoid lexical reuse.
+function compressConversationHistory(history) {
+  if (!Array.isArray(history) || history.length === 0) {
+    return [];
+  }
+  
+  // Remove all assistant messages - their semantic content is already captured in:
+  // 1. Shared Understanding block (established facts/patterns)
+  // 2. Working memory summary (rolling context)
+  // This prevents Mistral from reusing exact phrases from prior assistant responses
+  const compressed = history.filter(msg => msg.role === 'user');
+  
+  // CRITICAL: Remove ALL trailing user messages, since we're about to add a new user message
+  // This prevents consecutive user messages which would violate the message sequence validation
+  // The last user message will be added fresh as part of the current request
+  // Since we filtered to only user messages, all messages are user messages, so we remove all trailing ones
+  const originalCompressedLength = compressed.length;
+  let removedUserCount = 0;
+  while (compressed.length > 0 && compressed[compressed.length - 1].role === 'user') {
+    compressed.pop();
+    removedUserCount++;
+  }
+  if (removedUserCount > 0) {
+    console.log(`[COMPRESS] Removed ${removedUserCount} trailing user message(s) from compressed history to prevent duplicate user role`);
+  }
+  
+  const assistantCount = history.length - originalCompressedLength;
+  console.log(`[COMPRESS] Compressed history: ${history.length} messages -> ${compressed.length} messages (removed ${assistantCount} assistant messages + ${removedUserCount} trailing user message(s))`);
+  
+  return compressed;
+}
+
+// Parse working memory from model response
+function parseWorkingMemory(text) {
+  const out = { summary: '', key_threads: [], sharedUnderstanding: [] };
+  if (!text || typeof text !== "string") return out;
+  
+  const summaryMatch = text.match(/SUMMARY:\s*([\s\S]*?)(?:\n\s*(?:KEY_THREADS|SHARED_UNDERSTANDING):|$)/i);
+  if (summaryMatch) out.summary = summaryMatch[1].trim();
+  
+  const threadsMatch = text.match(/KEY_THREADS:\s*([\s\S]*?)(?:\n\s*SHARED_UNDERSTANDING:|$)/i);
+  if (threadsMatch) {
+    const lines = threadsMatch[1].split(/\r?\n/).map(l => l.trim());
+    out.key_threads = lines
+      .filter(l => l.startsWith("-"))
+      .map(l => l.replace(/^[-*]\s*/, "").trim())
+      .filter(Boolean)
+      .slice(0, 9);
+  }
+  
+  const sharedMatch = text.match(/SHARED_UNDERSTANDING:\s*([\s\S]*)$/i);
+  if (sharedMatch) {
+    const lines = sharedMatch[1].split(/\r?\n/).map(l => l.trim());
+    out.sharedUnderstanding = lines
+      .filter(l => l.startsWith("-"))
+      .map(l => l.replace(/^[-*]\s*/, "").trim())
+      .filter(Boolean)
+      .slice(0, 12);
+  }
+  
+  // Fallback: if no markers, treat whole thing as summary
+  if (!out.summary && !out.key_threads.length && !out.sharedUnderstanding.length) out.summary = text.trim();
+  return out;
+}
 function getStyleRules() {
-  return behaviorPacks?.style_rules || {};
+  const rules = behaviorPacks?.style_rules || {};
+  if (Object.keys(rules).length > 0) {
+    console.log('[BEHAVIOR] Using style_rules from behavior_packs.json');
+  }
+  return rules;
 }
 
 function violatesOpeningRules(text) {
-  if (!text) return false;
-  const rules = getStyleRules();
-  const patterns = rules.forbidden_opening_patterns || [];
-  const opening = text.trim().slice(0, 200).toLowerCase();
-  return patterns.some(p => {
-    try {
-      return new RegExp(p, 'i').test(opening);
-    } catch {
-      return false;
-    }
-  });
+  // Disabled for Mistral: opening behavior is enforced via training + behavior pack
+  return false;
 }
 
-function containsForbiddenTerms(text) {
-  if (!text) return false;
-  const rules = getStyleRules();
-  const terms = rules.forbidden_terms || [];
-  return terms.some(term =>
-    new RegExp(`\\b${term}\\b`, 'i').test(text)
-  );
+function escapeRegExp(str) {
+  return String(str).replace(/[.*+?^${}()|[\\]\\]/g, '\\$&');
 }
-let pendingExemplarSystemText = null; // One-shot exemplar appended to the next request as system text
+function containsForbiddenTerms(text, enforceStrict = true) {
+  // Disabled for Mistral: semantic constraints handled in training
+  return false;
+}
+let pendingExemplarSystemTexts = []; // One-shot exemplar(s) appended to the next request as system text
 let exemplarRotationIndex = {}; // Track rotation index for each trigger
-let usedTriggers = new Set();
 let isSending = false; // Prevent accidental double-send / concurrent sendMessage calls
+let triggersQueuedThisTurn = new Set(); // de-dupe triggers per send
+// Helper to kickoff conversation - only if behavior pack explicitly requests it
+// Per PDF: "Do not inject assistant messages when a conversation starts; allow the model to generate the first response"
+// This function is now disabled by default - the model will generate the first response when user sends a message
+async function kickoffConversationIfEmpty() {
+  // Check if behavior pack explicitly requests kickoff
+  const shouldKickoff = behaviorPacks?.conversation_phase?.enable_kickoff === true;
+  if (!shouldKickoff) {
+    console.log('[KICKOFF][DEBUG] Kickoff disabled - model will generate first response when user sends message');
+    return;
+  }
+
+  console.log('[KICKOFF][DEBUG] Entering kickoffConversationIfEmpty()', {
+    historyLength: Array.isArray(conversationHistory) ? conversationHistory.length : 'not-array',
+    hasAssistantHistory: Array.isArray(conversationHistory) && conversationHistory.some(m => m.role === 'assistant'),
+    hasAssistantUI: !!document.getElementById('chatMessages')?.querySelector('.message.assistant'),
+    modelInfoPresent: !!modelInfo
+  });
+  // Check if there's already an assistant message, either in history or UI
+  // If so, return early; otherwise, proceed with kickoff
+  const hasAssistantHistory = Array.isArray(conversationHistory)
+    && conversationHistory.some(msg => msg.role === 'assistant');
+  const chatMessagesDiv = document.getElementById('chatMessages');
+  const hasAssistantUI = chatMessagesDiv
+    ? !!chatMessagesDiv.querySelector('.message.assistant')
+    : false;
+  if (hasAssistantHistory || hasAssistantUI) {
+    console.log('[KICKOFF][DEBUG] Aborting kickoff: assistant already present', {
+      hasAssistantHistory,
+      hasAssistantUI
+    });
+    return;
+  }
+  if (!modelInfo) {
+    console.log('[KICKOFF][DEBUG] Aborting kickoff: modelInfo not yet available');
+    return;
+  }
+
+  console.log('[CHAT] New conversation detected; issuing silent kickoff prompt');
+
+  try {
+    // Use behavior pack guidance for kickoff prompt, or default minimal prompt
+    const kickoffPrompt = behaviorPacks?.conversation_phase?.kickoff_prompt || "Greet the user in one sentence.";
+
+    // Kickoff turn: use reflection phase with isKickoff=true to get reflection instructions
+    const behaviorSystem = buildSystemFromBehaviorPack('reflection', true);
+    // No shared understanding on kickoff (first turn)
+    const memoryPrepend = formatWorkingMemoryForPrompt();
+    const combinedSystem = [behaviorSystem, memoryPrepend].filter(Boolean).join("\n\n");
+
+    const result = await window.electronAPI.sendChatMessage({
+      message: kickoffPrompt,
+      version: document.getElementById('versionSelect')?.value || 'base',
+      prependedText: wrapSystemBlocks(combinedSystem, pendingExemplarSystemTexts),
+      useSummary: false,
+      conversationSummary: '',
+      conversationHistory: [],
+      temperature: getBehaviorPackTemperature(),
+      max_tokens: 650
+    });
+    console.log('[KICKOFF][DEBUG] Kickoff LLM response received', {
+      success: result?.success,
+      responseLength: result?.response?.length ?? 0,
+      rawResponse: result?.response
+    });
+    
+    // Per PDF: "Do not rewrite responses by replacing them with renderer-authored text"
+    // If validation fails, skip displaying the message rather than using a fallback
+    if (result?.success && result.response?.trim()) {
+      let assistantGreeting = result.response.trim();
+      
+      // Validate: reject non-ASCII characters - if present, skip message (don't use fallback)
+      if (/[^\x00-\x7F]/.test(assistantGreeting)) {
+        console.warn('[KICKOFF][WARN] Non-ASCII characters detected in greeting; skipping message (no fallback)');
+        return; // Skip displaying invalid greeting
+      }
+      
+      addMessage('assistant', assistantGreeting, true, { isOpening: true });
+      kickoffIssued = true;
+      console.log('[KICKOFF][DEBUG] Assistant greeting added to UI and history');
+      saveConfig();
+    } else {
+      // No response or empty response - skip displaying (no fallback)
+      console.warn('[KICKOFF][WARN] No valid greeting received; skipping (no fallback)');
+    }
+  } catch (error) {
+    console.error('[CHAT] Error during kickoff conversation:', error);
+    // Don't display any fallback message on error
+  } finally {
+    // One-shot semantics
+    pendingExemplarSystemTexts = [];
+    triggersQueuedThisTurn.clear();
+  }
+}
+
+// Helper to get temperature from behavior packs with logging
+function getBehaviorPackTemperature() {
+  const temp = behaviorPacks?.generation_settings?.temperature;
+  if (temp !== undefined) {
+    console.log(`[BEHAVIOR] Using temperature ${temp} from behavior_packs.json generation_settings`);
+  }
+  return temp;
+}
 
 // Load behavior packs configuration for a specific profile
 async function loadBehaviorPacks(profileName) {
@@ -167,7 +474,10 @@ function hideBehaviorPackWarning() {
 //  2) when-based matching: exemplars[key] = { when: [..triggers..], text: ... }
 // Rotates across all matching exemplar texts per trigger.
 function getExemplarForTrigger(trigger) {
-  if (!behaviorPacks || !behaviorPacks.exemplars) return null;
+  if (!behaviorPacks || !behaviorPacks.exemplars) {
+    console.log(`[BEHAVIOR] No exemplar found for trigger "${trigger}" (behavior packs not loaded or no exemplars)`);
+    return null;
+  }
 
   const exemplarsObj = behaviorPacks.exemplars;
   const matches = [];
@@ -191,90 +501,188 @@ function getExemplarForTrigger(trigger) {
     }
   }
 
-  if (matches.length === 0) return null;
+  if (matches.length === 0) {
+    console.log(`[BEHAVIOR] No exemplar found for trigger "${trigger}" in behavior_packs.json`);
+    return null;
+  }
 
   const index = exemplarRotationIndex[trigger] ?? 0;
   const selected = matches[index % matches.length];
   exemplarRotationIndex[trigger] = index + 1;
+  console.log(`[BEHAVIOR] Retrieved exemplar for trigger "${trigger}" from behavior_packs.json (rotation index: ${index}, total matches: ${matches.length})`);
   return selected;
 }
 
-// Inject exemplar as one-shot system text (not shown in UI, not saved to history)
-// Allows per-turn triggers to fire repeatedly; one-shots only once per session.
+// Inject exemplar(s) as one-shot system text(s) (not shown in UI, not saved to history)
+// Per PDF: "Avoid stacking exemplars unless a trigger explicitly fires"
+// Per PDF: "Prefer fewer system messages" - cap at 1 exemplar for Mistral
 function injectExemplar(trigger) {
   const exemplarText = getExemplarForTrigger(trigger);
   if (!exemplarText) return false;
 
-  if (containsForbiddenTerms(exemplarText)) {
-    console.warn('[BEHAVIOR] Exemplar blocked due to forbidden terms (behavior pack rules)');
-    return false;
+  if (!Array.isArray(pendingExemplarSystemTexts)) pendingExemplarSystemTexts = [];
+  // Per PDF: Avoid stacking - only add if not already present, cap at 1 for Mistral
+  if (!pendingExemplarSystemTexts.includes(exemplarText)) {
+    pendingExemplarSystemTexts.push(exemplarText);
+    if (pendingExemplarSystemTexts.length > 1) {
+      // Keep only the most recent exemplar (Mistral prefers fewer system messages)
+      pendingExemplarSystemTexts = pendingExemplarSystemTexts.slice(-1);
+    }
   }
 
-  console.log(`[BEHAVIOR] Queuing exemplar for trigger: ${trigger}`);
-  pendingExemplarSystemText = exemplarText;
-  console.log('[BEHAVIOR] Applied exemplar:', trigger);
+  console.log(`[BEHAVIOR] Applied exemplar for trigger "${trigger}" (count: ${pendingExemplarSystemTexts.length})`);
   return true;
+}
+
+// Queue a trigger to be injected on the next request, deduped per send
+function queueTrigger(trigger) {
+  if (triggersQueuedThisTurn.has(trigger)) return;
+
+  triggersQueuedThisTurn.add(trigger);
+  injectExemplar(trigger);
 }
 
 // (Behavior-pack–driven forbidden checks and opening rules now used. See helpers above.)
 
 // Detect lack of concrete, practical practice in assistant responses
 function lacksConcretePractice(text) {
-  if (!text) return true;
-  return !/(student work|common assessment|lesson plan|exit ticket|protocol|agenda|artifact|look at|bring|examine|decide|try next|instructional move|next meeting)/i.test(text);
+  // Disabled: Mistral handles concreteness via training
+  return false;
 }
 
 // Detect if a response is too brief to be useful (behavior-pack–driven)
 function isTooBrief(text) {
-  if (!text) return true;
-  const minChars = behaviorPacks?.generation_settings?.min_length_chars;
-  if (!minChars) return false;
-  return text.trim().length < minChars;
+  // Disabled: brevity is acceptable and model-controlled
+  return false;
 }
 
-// Build a rewrite instruction that forces plain-language, example-driven coaching
-function buildRewriteInstruction(userMessage, badAssistantText) {
+// Detect short continuation prompts (e.g., "Tell me more", "Tell me more.")
+function isContinuationPrompt(text) {
+  if (!text) return false;
+
+  // Normalize: lowercase, trim, collapse spaces, strip trailing punctuation
+  let t = text
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, ' ')
+    .replace(/[.!?]+$/g, '');
+
+  // Also handle quoted / parenthetical stray punctuation at end
+  t = t.replace(/["')\]]+$/g, '');
+
+  // Keep this intentionally short to avoid false positives
+  if (t.length > 40) return false;
+
   return (
-    `Rewrite your last response so it follows the system instructions.\n\n` +
-    `Hard rules:\n` +
-    `- Do NOT use labels or headings like "Current step", "Diagnosis", "Next step", "Reflection gap", "framework", "stage", or "diagram".\n` +
-    `- Speak as a thoughtful human colleague. Use concrete, practical examples (routines, artifacts, questions teams examine, decisions teams make).\n` +
-    `- Ground it in the leader's situation and explain your reasoning plainly.\n` +
-    `- Do NOT end with questions unless they truly help decide the next move.\n\n` +
-    `User message:\n${userMessage}\n\n` +
-    `Your previous (non-compliant) draft:\n${badAssistantText}\n\n` +
-    `Return ONLY the revised answer.`
+    t === 'tell me more' ||
+    t === 'tell me more please' ||
+    t === 'say more' ||
+    t === 'go deeper' ||
+    t === 'expand' ||
+    t.startsWith('can you expand') ||
+    t.startsWith('say more about') ||
+    t.startsWith('what might that look like')
   );
 }
 
+// Build a continuation instruction that extends the last assistant message
+// Per PDF: Remove hardcoded coaching phrases - use neutral continuation request
+// Fix 5: Redefine Continuation Mode
+// Continuation should use working memory, not full assistant prose
+function buildContinuationInstruction() {
+  const summary = conversationWorkingMemory?.summary?.trim() || '';
+  const threads = Array.isArray(conversationWorkingMemory?.key_threads)
+    ? conversationWorkingMemory.key_threads.filter(t => typeof t === "string" && t.trim()).slice(0, 5)
+    : [];
+  
+  const parts = [];
+  const continuationConfig = behaviorPacks?.continuation_mode || {};
+  parts.push(continuationConfig.instruction || "Please continue your previous response. Stay in the same voice and perspective.");
+  
+  if (summary) {
+    parts.push(`\n${continuationConfig.context_label || 'Context from previous exchange:'}\n${summary}`);
+  }
+  
+  if (threads.length > 0) {
+    parts.push(`\n${continuationConfig.key_points_label || 'Key points to build on:'}\n${threads.map(t => `- ${t}`).join('\n')}`);
+  }
+  
+  parts.push(`\n${continuationConfig.continue_prompt || 'Continue:'}`);
+  
+  return parts.join('\n').trim();
+}
+
+// Build a rewrite instruction using behavior_packs.json guidance
+// Per PDF: "Rewrite prompts must request neutral transformation (e.g., language-only rewrite) and must not introduce new coaching content"
+// Per PDF: "Only trigger a rewrite when a hard constraint is violated"
+function buildRewriteInstruction(userMessage, badAssistantText) {
+  const guidance = behaviorPacks?.rewrite_guidance || {};
+  const basePrompt =
+    guidance.rewrite_prompt ||
+    guidance.purpose ||
+    "Rewrite the response to use English only while preserving the meaning and tone.";
+
+  // Per PDF: Neutral transformation only - no phase labels, no coaching content
+  // Per PDF: Language-only rewrite for guardrail violations
+  return `
+${basePrompt}
+
+Original response:
+${badAssistantText}
+
+Return only the revised response in English.
+`;
+}
+
 // Wrap system content to reduce the model mistaking it for user content
-function wrapSystemBlocks(userSystem, exemplar) {
+// Per PDF: Use plain delimiters instead of XML-like tags for Mistral compatibility
+function wrapSystemBlocks(userSystem, exemplars) {
   const blocks = [];
-  if (exemplar && exemplar.trim()) {
-    blocks.push(`<SYSTEM_EXEMPLAR>\n${exemplar.trim()}\n</SYSTEM_EXEMPLAR>`);
+  const list = Array.isArray(exemplars)
+    ? exemplars
+    : (typeof exemplars === 'string' && exemplars.trim() ? [exemplars] : []);
+  for (const ex of list) {
+    if (ex && ex.trim()) {
+      blocks.push(
+        `--- SYSTEM EXEMPLAR (one-shot) ---\n` +
+        `Use the following example to guide tone and structure. Do not mention, quote, or refer to the example.\n\n` +
+        `${ex.trim()}\n` +
+        `--- END SYSTEM EXEMPLAR ---`
+      );
+    }
   }
   if (userSystem && userSystem.trim()) {
-    blocks.push(`<SYSTEM_PREPEND>\n${userSystem.trim()}\n</SYSTEM_PREPEND>`);
+    blocks.push(`--- SYSTEM INSTRUCTIONS ---\n${userSystem.trim()}\n--- END SYSTEM INSTRUCTIONS ---`);
   }
   return blocks.join('\n\n');
 }
 
-// Fix 3: Normalize conversation history before sending to enforce strict role alternation
+// Memory-safe normalization: preserve content by MERGING consecutive same-role messages
+// rather than dropping them. This reduces "mechanical" forgetting while still keeping a clean history.
 function normalizeConversation(messages) {
   const cleaned = [];
-  for (const msg of messages) {
+  for (const msg of (messages || [])) {
+    if (!msg || !msg.role || typeof msg.content !== "string") continue;
+    
+    // First message must be user or system (same as before)
     if (cleaned.length === 0) {
-      // First message must be user or system
       if (msg.role === "user" || msg.role === "system") {
-        cleaned.push(msg);
+        cleaned.push({ ...msg });
       }
       continue;
     }
+    
     const last = cleaned[cleaned.length - 1];
-    // Only add if role alternates (no duplicate consecutive roles)
-    if (msg.role !== last.role) {
-      cleaned.push(msg);
+    
+    // If role repeats, MERGE with a clear separator
+    if (msg.role === last.role) {
+      last.content = `${last.content}\n\n---\n\n${msg.content}`.trim();
+      // Preserve meta if present (prefer last meta)
+      if (msg.meta) last.meta = { ...(last.meta || {}), ...(msg.meta || {}) };
+      continue;
     }
+    
+    cleaned.push({ ...msg });
   }
   return cleaned;
 }
@@ -285,7 +693,7 @@ async function saveConfig() {
     // Read directly from input fields to ensure we save current values, not stale sshConfig
     const sshHostInput = document.getElementById('sshHost');
     const sshPortInput = document.getElementById('sshPort');
-    const prependedTextInput = document.getElementById('prependedText');
+    // System messages now come entirely from behavior_packs.json - no user input field
     
     // Get SSH values from input fields
     let sshHost = sshHostInput ? sshHostInput.value.trim() : '';
@@ -337,8 +745,11 @@ async function saveConfig() {
       sshHost: sshHost,
       sshPort: sshPort,
       internalPort: internalPort,
-      prependedText: prependedTextInput ? prependedTextInput.value.trim() : '',
+      // System messages come from behavior_packs.json, not user input
       conversationHistory: conversationHistory || [], // Save the conversation history
+      conversationSummary: conversationSummary || '', // Save summary for backward compatibility
+      conversationWorkingMemory: conversationWorkingMemory || { summary: '', key_threads: [] }, // Save working memory
+      sharedUnderstanding: sharedUnderstanding || [], // Save shared understanding
       selectedProfile: profileSelect ? profileSelect.value : '', // Save selected profile
       selectedVersion: versionSelect ? versionSelect.value : 'base' // Save selected version (default to 'base')
       // Token is not saved - it's retrieved automatically during setup
@@ -419,13 +830,7 @@ async function loadConfig() {
         }
       }
       
-      // Load system message
-      if (config.prependedText !== undefined) {
-        const prependedTextInput = document.getElementById('prependedText');
-        if (prependedTextInput) {
-          prependedTextInput.value = config.prependedText;
-        }
-      }
+      // System messages now come entirely from behavior_packs.json - no longer loading from config
       
       // Load conversation history
       if (config.conversationHistory !== undefined && Array.isArray(config.conversationHistory)) {
@@ -440,6 +845,39 @@ async function loadConfig() {
             addMessage(msg.role, msg.content, false); // Add to UI but don't add to history again
           });
         }
+      }
+      
+      // Load conversation summary (backward compatibility)
+      if (config.conversationSummary !== undefined) {
+        conversationSummary = config.conversationSummary || '';
+      }
+      
+      // Load working memory
+      if (config.conversationWorkingMemory !== undefined) {
+        conversationWorkingMemory = {
+          summary: config.conversationWorkingMemory.summary || conversationSummary || '',
+          key_threads: Array.isArray(config.conversationWorkingMemory.key_threads) 
+            ? config.conversationWorkingMemory.key_threads 
+            : []
+        };
+        console.log('[CONFIG] Loaded working memory:', {
+          summaryLength: conversationWorkingMemory.summary.length,
+          threadsCount: conversationWorkingMemory.key_threads.length
+        });
+      } else if (conversationSummary) {
+        // Migrate old summary to working memory format
+        conversationWorkingMemory = {
+          summary: conversationSummary,
+          key_threads: []
+        };
+      }
+      
+      // Load shared understanding
+      if (config.sharedUnderstanding !== undefined && Array.isArray(config.sharedUnderstanding)) {
+        sharedUnderstanding = config.sharedUnderstanding.filter(item => typeof item === "string" && item.trim());
+        console.log('[CONFIG] Loaded shared understanding:', sharedUnderstanding.length, 'points');
+      } else {
+        sharedUnderstanding = [];
       }
       
       // Load selected profile (will be restored after profiles are loaded)
@@ -520,8 +958,7 @@ window.addEventListener('DOMContentLoaded', async () => {
   setTimeout(setupVLLMUrlListeners, 0);
   document.getElementById('sendBtn').addEventListener('click', sendMessage);
   
-  // Set up listeners for system message
-  const prependedTextInput = document.getElementById('prependedText');
+  // System messages now come entirely from behavior_packs.json - no input field listeners needed
   const clearChatBtn = document.getElementById('clearChatBtn');
   
   // Set up listener for version selection
@@ -533,11 +970,7 @@ window.addEventListener('DOMContentLoaded', async () => {
     });
   }
   
-  if (prependedTextInput) {
-    prependedTextInput.addEventListener('input', () => {
-      saveConfig();
-    });
-  }
+  // System messages are loaded from behavior_packs.json when profile is selected
   
   if (clearChatBtn) {
     clearChatBtn.addEventListener('click', async () => {
@@ -550,20 +983,16 @@ window.addEventListener('DOMContentLoaded', async () => {
 
       // Save config to persist the cleared history
       saveConfig();
-      
+
       // Clear one-shot exemplar before voice_reset injection (one-shot semantics)
-      pendingExemplarSystemText = null;
-      usedTriggers.clear();
-      
-      // Load behavior packs for the current profile and inject exemplar for voice_reset if available
+      pendingExemplarSystemTexts = [];
+      triggersQueuedThisTurn.clear();
+
+      // Load behavior packs for the current profile
       const profileName = modelInfo?.profileName || null;
       await loadBehaviorPacks(profileName);
-      if (chatMessages) {
-        // Try to inject exemplar for voice_reset, fallback to default message
-        if (!injectExemplar('voice_reset')) {
-          addMessage('assistant', 'Hello! I\'m glad to be talking with you today!');
-        }
-      }
+      // Always run kickoff to ensure a greeting appears
+      await kickoffConversationIfEmpty();
     });
   }
   document.getElementById('chatInput').addEventListener('keydown', (e) => {
@@ -1230,16 +1659,25 @@ async function updateIncrementalSummary(newUserMessage, newAssistantResponse, cu
         ? selectedProfile.name 
         : 'Assistant';
     summaryPrompt += `New exchange:\n\nUser: ${newUserMessage}\n\n${profileName}: ${newAssistantResponse}\n\n`;
-    summaryPrompt += `Please provide an updated summary that:\n`;
+    summaryPrompt += `Please provide an updated summary and key threads that:\n`;
     summaryPrompt += `- Incorporates the new exchange above\n`;
     
     if (currentSummary && currentSummary.trim()) {
       summaryPrompt += `- Preserves important context from the previous summary\n`;
     }
     
-    summaryPrompt += `- Is concise (2-3 sentences)\n`;
-    summaryPrompt += `- Focuses on main topics, decisions, and key information\n\n`;
-    summaryPrompt += `Updated summary:`;
+    summaryPrompt += `- Identifies 5-9 key threads, open loops, or important facts\n`;
+    summaryPrompt += `- Is concise (2-4 sentences for summary)\n`;
+    summaryPrompt += `- Focuses on main topics, decisions, and key information\n`;
+    summaryPrompt += `- Extracts established facts, patterns, or agreements that have been confirmed (for Shared Understanding)\n\n`;
+    summaryPrompt += `Return format (plain text):\n`;
+    summaryPrompt += `SUMMARY: <2-4 sentences>\n`;
+    summaryPrompt += `KEY_THREADS:\n`;
+    summaryPrompt += `- <short bullet>\n`;
+    summaryPrompt += `- <short bullet>\n`;
+    summaryPrompt += `SHARED_UNDERSTANDING:\n`;
+    summaryPrompt += `- <established fact or pattern>\n`;
+    summaryPrompt += `- <established fact or pattern>\n`;
     
     console.log('[SUMMARY] Summary update prompt:');
     console.log('----------------------------------------');
@@ -1255,19 +1693,47 @@ async function updateIncrementalSummary(newUserMessage, newAssistantResponse, cu
       useSummary: false, // Don't include summary in summary generation
       conversationSummary: '', // No summary context for summary generation
       conversationHistory: [], // Empty history for summary generation
-      temperature: behaviorPacks?.generation_settings?.temperature,
-      max_tokens: behaviorPacks?.generation_settings?.max_tokens
+      temperature: getBehaviorPackTemperature(),
+      max_tokens: (() => {
+        const max = behaviorPacks?.generation_settings?.max_tokens;
+        if (max !== undefined) {
+          console.log(`[BEHAVIOR] Using max_tokens ${max} from behavior_packs.json generation_settings`);
+        }
+        return max;
+      })()
     });
     
     if (summaryResult.success && summaryResult.response) {
-      conversationSummary = summaryResult.response.trim();
-      console.log('[SUMMARY] Updated summary:');
+      // Parse working memory from response
+      const parsed = parseWorkingMemory(summaryResult.response);
+      conversationWorkingMemory = {
+        summary: parsed.summary || '',
+        key_threads: parsed.key_threads || []
+      };
+      
+      // Update shared understanding (merge new points with existing, removing duplicates)
+      if (Array.isArray(parsed.sharedUnderstanding) && parsed.sharedUnderstanding.length > 0) {
+        const existingPoints = new Set(sharedUnderstanding.map(p => p.toLowerCase().trim()));
+        const newPoints = parsed.sharedUnderstanding.filter(p => {
+          const normalized = p.toLowerCase().trim();
+          return normalized && !existingPoints.has(normalized);
+        });
+        sharedUnderstanding = [...sharedUnderstanding, ...newPoints].slice(0, 12); // Keep max 12 points
+        console.log('[SUMMARY] Updated shared understanding:', sharedUnderstanding.length, 'points');
+      }
+      
+      // Keep conversationSummary for backward compatibility
+      conversationSummary = parsed.summary || summaryResult.response.trim();
+      
+      console.log('[SUMMARY] Updated working memory:');
       console.log('----------------------------------------');
-      console.log(conversationSummary);
+      console.log('Summary:', conversationSummary);
+      console.log('Key threads:', conversationWorkingMemory.key_threads);
+      console.log('Shared understanding:', sharedUnderstanding);
       console.log('----------------------------------------');
       console.log('[SUMMARY] ========================================\n');
       
-      // Save config to persist the updated summary
+      // Save config to persist the updated working memory and shared understanding
       saveConfig();
     } else {
       console.error('[SUMMARY] Failed to generate summary:', summaryResult.error);
@@ -1278,13 +1744,15 @@ async function updateIncrementalSummary(newUserMessage, newAssistantResponse, cu
         : (selectedProfile && selectedProfile.name) 
           ? selectedProfile.name 
           : 'Assistant';
-      conversationSummary = recentMessages
+      const fallbackSummary = recentMessages
         .map(m => {
           const roleLabel = m.role === 'user' ? 'User' : profileName;
           const content = m.content.length > 150 ? m.content.substring(0, 150) + '...' : m.content;
           return `${roleLabel}: ${content}`;
         })
         .join('\n\n');
+      conversationSummary = fallbackSummary;
+      conversationWorkingMemory = { summary: fallbackSummary, key_threads: [] };
       console.log('[SUMMARY] Using fallback summary method');
       
       // Save config to persist the fallback summary
@@ -1360,21 +1828,517 @@ async function showChatInterface() {
     // Load behavior packs for the current profile and inject exemplar if available
     const profileName = modelInfo?.profileName || null;
     await loadBehaviorPacks(profileName);
-    
-    // Clear one-shot exemplar before conversation_start injection (one-shot semantics)
-    pendingExemplarSystemText = null;
-    
-    // Try to inject exemplar for conversation_start, fallback to default message
-    if (!injectExemplar('conversation_start')) {
-      addMessage('assistant', 'Hello! I\'m glad to be talking with you today!');
-    }
+
+    // Diagnostic log before kickoff
+    console.log('[CHAT][DEBUG] Calling kickoffConversationIfEmpty() from showChatInterface');
+    // Trigger a single conversational opening if this is a brand-new chat
+    await kickoffConversationIfEmpty();
   } catch (error) {
     console.error('Error showing chat interface:', error);
     showStatus('prepareStatus', 'Error loading chat interface: ' + error.message, 'error');
   }
 }
 
-function addMessage(role, content, addToHistory = true) {
+// Clean up formatting artifacts from model output
+function cleanFormattingArtifacts(text) {
+  if (!text || typeof text !== 'string') return text;
+  
+  // Strip UI artifacts: Remove phrases like 'Show less', 'Nano message completed', etc.
+  const uiArtifacts = [
+    /show\s+less/gi,
+    /nano\s+message\s+completed/gi,
+    /message\s+completed/gi,
+    /\[end\s+of\s+response\]/gi,
+    /\[response\s+complete\]/gi,
+    /\[finished\]/gi,
+    /languages?:\s*en/gi, // Remove "languages: en" artifacts
+    /<\/body>/gi, // Remove HTML body tags
+    /<break\s*\/?>/gi, // Remove <break /> tags
+    /add\s+a\s+break\s+after\s+your\s+response/gi, // Remove instruction artifacts
+    /add\s+a\s+break/gi // Remove "add a break" instructions
+  ];
+  for (const pattern of uiArtifacts) {
+    text = text.replace(pattern, '');
+  }
+  
+  // Remove CSS-like syntax: {property: value} or {property:value}
+  // This catches patterns like {margin-left: 0.75em}
+  text = text.replace(/\{[^}]*\}/g, '');
+  
+  // Remove regex-like patterns: .* or .+ (standalone, not in context)
+  // Match patterns like ".*" at start of lines or after spaces
+  text = text.replace(/(?:^|\s)\.\*+(?:\s|$)/gm, ' ');
+  text = text.replace(/(?:^|\s)\.\++(?:\s|$)/gm, ' ');
+  
+  // Remove CSS property patterns only when they appear in isolation
+  // Match patterns like "margin-left: 0.75em" that appear standalone
+  text = text.replace(/\b(margin|padding|font|color|background|border|width|height|display|position|top|left|right|bottom|text-align|line-height|white-space|opacity|z-index|float|clear|overflow|visibility|cursor|outline|box-shadow|text-shadow|transform|transition|animation|flex|grid|align|justify|gap|order|flex-direction|flex-wrap|align-items|align-content|justify-content|justify-items|grid-template|grid-area|grid-column|grid-row):\s*[^;}\s,]+(?:\s|$)/gi, '');
+  
+  // Clean up multiple spaces (but preserve intentional spacing)
+  text = text.replace(/[ \t]{3,}/g, ' ');
+  
+  // Clean up spaces before punctuation (but keep space after sentence-ending punctuation)
+  text = text.replace(/\s+([.,!?;:])/g, '$1');
+  
+  // Remove trailing whitespace from lines
+  text = text.replace(/[ \t]+$/gm, '');
+  
+  // Clean up any double spaces that might have been created
+  text = text.replace(/\s{2,}/g, ' ');
+  
+  return text.trim();
+}
+
+// Check if text has significant non-English content (threshold-based, not binary)
+// Tier 3 Fix: Update non-English detection to allow Unicode punctuation
+// Permit curly quotes, em/en dashes, ellipses, and typographic apostrophes
+// Do not treat smart punctuation as language switching
+function hasSignificantNonEnglish(text, threshold = 0.02) {
+  if (!text || typeof text !== 'string') return false;
+  const totalChars = text.length;
+  if (totalChars === 0) return false;
+  
+  // Tier 3: Allow Unicode punctuation (curly quotes, dashes, ellipses, apostrophes)
+  // These are common in English typography and should not trigger multilingual detection
+  const unicodePunctuation = [
+    /[\u2018\u2019\u201A\u201B]/g, // Typographic apostrophes and single quotes
+    /[\u201C\u201D\u201E\u201F]/g, // Typographic double quotes
+    /[\u2013\u2014]/g, // En dash and em dash
+    /[\u2026]/g, // Ellipsis
+    /[\u00A0]/g, // Non-breaking space
+  ];
+  
+  // Remove Unicode punctuation from text before checking for non-English
+  let textForCheck = text;
+  for (const pattern of unicodePunctuation) {
+    textForCheck = textForCheck.replace(pattern, '');
+  }
+  
+  // Only trigger multilingual guardrails for actual non-Latin characters or known foreign alphabets
+  // Exclude common Unicode punctuation that's valid in English
+  const nonLatinChars = (textForCheck.match(/[^\x00-\x7F]/g) || []).length;
+  const ratio = nonLatinChars / totalChars;
+  return ratio > threshold;
+}
+
+// Sanitize HTML - remove dangerous tags but preserve safe formatting tags
+function sanitizeHtml(html) {
+  if (!html || typeof html !== 'string') return '';
+  
+  // List of allowed safe HTML tags
+  const allowedTags = ['div', 'p', 'span', 'strong', 'em', 'b', 'i', 'u', 'br', 'hr', 
+                       'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'ul', 'ol', 'li', 
+                       'blockquote', 'pre', 'code', 'a'];
+  
+  // Remove dangerous tags and their content (script, iframe, object, embed, etc.)
+  html = html.replace(/<script[\s\S]*?<\/script>/gi, '');
+  html = html.replace(/<iframe[\s\S]*?<\/iframe>/gi, '');
+  html = html.replace(/<object[\s\S]*?<\/object>/gi, '');
+  html = html.replace(/<embed[\s\S]*?<\/embed>/gi, '');
+  html = html.replace(/<form[\s\S]*?<\/form>/gi, '');
+  html = html.replace(/<input[^>]*>/gi, '');
+  html = html.replace(/<button[^>]*>[\s\S]*?<\/button>/gi, '');
+  
+  // Remove dangerous attributes from allowed tags (onclick, onerror, etc.)
+  html = html.replace(/\s*on\w+\s*=\s*["'][^"']*["']/gi, '');
+  html = html.replace(/\s*on\w+\s*=\s*[^\s>]*/gi, '');
+  html = html.replace(/\s*javascript:/gi, '');
+  html = html.replace(/\s*data:text\/html/gi, '');
+  
+  // Remove style attributes that could contain dangerous CSS
+  html = html.replace(/\s*style\s*=\s*["'][^"']*["']/gi, '');
+  
+  // Only keep allowed tags, remove others but preserve their content
+  const tagPattern = /<\/?([a-zA-Z][a-zA-Z0-9]*)[^>]*>/g;
+  html = html.replace(tagPattern, (match, tagName) => {
+    const lowerTag = tagName.toLowerCase();
+    if (allowedTags.includes(lowerTag)) {
+      // Preserve allowed tags but remove all attributes for safety
+      if (match.startsWith('</')) {
+        return `</${lowerTag}>`;
+      } else {
+        return `<${lowerTag}>`;
+      }
+    } else {
+      // Remove disallowed tags but keep their content
+      return '';
+    }
+  });
+  
+  return html;
+}
+
+// Simple markdown to HTML converter with XSS protection
+function markdownToHtml(text) {
+  if (!text || typeof text !== 'string') return '';
+  
+  // Clean up formatting artifacts first
+  text = cleanFormattingArtifacts(text);
+  
+  // Check if text already contains HTML tags
+  const hasHtmlTags = /<[a-zA-Z][^>]*>/.test(text);
+  
+  // Escape HTML to prevent XSS
+  // Note: We don't escape apostrophes (') as they're safe in HTML text content
+  // Only escape them if needed in attribute values, but we're using textContent/innerHTML for content
+  function escapeHtml(unsafe) {
+    return unsafe
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;");
+      // Removed apostrophe escaping - apostrophes are safe in HTML text content
+  }
+  
+  // Store code blocks and inline code to preserve them
+  const codeBlocks = [];
+  const inlineCodes = [];
+  let placeholderIndex = 0;
+  
+  // Replace code blocks with placeholders
+  let html = text.replace(/```([\s\S]*?)```/g, (match, code) => {
+    const placeholder = `__CODEBLOCK_${placeholderIndex}__`;
+    codeBlocks[placeholderIndex] = escapeHtml(code.trim());
+    placeholderIndex++;
+    return placeholder;
+  });
+  
+  // Replace inline code with placeholders
+  html = html.replace(/`([^`\n]+)`/g, (match, code) => {
+    const placeholder = `__INLINECODE_${placeholderIndex}__`;
+    inlineCodes[placeholderIndex] = escapeHtml(code);
+    placeholderIndex++;
+    return placeholder;
+  });
+  
+  // If text contains HTML tags, sanitize them first, then process markdown
+  // Otherwise, escape all HTML and process markdown normally
+  if (hasHtmlTags) {
+    // Sanitize existing HTML (remove dangerous tags/attributes, keep safe ones)
+    // This preserves tags like <div>, <p>, <strong>, etc. but removes <script>, etc.
+    html = sanitizeHtml(html);
+    // Don't escape HTML here - we want to preserve the safe tags
+    // Markdown processing below will work on text content, and won't interfere with existing HTML tags
+  } else {
+    // Escape all HTML first (no existing HTML, so safe to escape)
+    html = escapeHtml(html);
+  }
+  
+  // Restore code blocks
+  for (let i = 0; i < codeBlocks.length; i++) {
+    html = html.replace(`__CODEBLOCK_${i}__`, `<pre><code>${codeBlocks[i]}</code></pre>`);
+  }
+  
+  // Restore inline code
+  for (let i = 0; i < inlineCodes.length; i++) {
+    html = html.replace(`__INLINECODE_${i}__`, `<code>${inlineCodes[i]}</code>`);
+  }
+  
+  // Process headers (must be on their own line)
+  // Only process if not already inside HTML tags (simple check - if hasHtmlTags, skip headers)
+  if (!hasHtmlTags) {
+    html = html.replace(/^### (.+?)$/gm, '<h3>$1</h3>');
+    html = html.replace(/^## (.+?)$/gm, '<h2>$1</h2>');
+    html = html.replace(/^# (.+?)$/gm, '<h1>$1</h1>');
+  }
+  
+  // Process links
+  html = html.replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>');
+  
+  // Process bold (**text** or __text__) - but be careful not to double-process if already in HTML
+  // Only process if we escaped HTML (i.e., no existing HTML tags)
+  if (!hasHtmlTags) {
+    html = html.replace(/\*\*([^*\n]+)\*\*/g, '<strong>$1</strong>');
+    html = html.replace(/__(.+?)__/g, '<strong>$1</strong>');
+    
+    // Process italic (*text* or _text_) - avoid conflicts with bold
+    html = html.replace(/(?<!\*)\*([^*\n]+)\*(?!\*)/g, '<em>$1</em>');
+    html = html.replace(/(?<!_)_([^_\n]+)_(?!_)/g, '<em>$1</em>');
+  }
+  
+  // Process lists line by line
+  const lines = html.split('\n');
+  const processedLines = [];
+  let inUnorderedList = false;
+  let inOrderedList = false;
+  let orderedListStart = 1; // Track starting number for ordered lists
+  let lastOrderedListNumber = 0; // Track the last list item number we processed
+  let linesSinceLastListItem = 0; // Track how many non-list lines since last list item
+  
+  for (let i = 0; i < lines.length; i++) {
+    let line = lines[i];
+    let trimmedLine = line.trim();
+    
+    // Check for blank lines - these should close lists and create paragraph breaks
+    if (trimmedLine === '') {
+      if (inUnorderedList) {
+        processedLines.push('</ul>');
+        inUnorderedList = false;
+      }
+      if (inOrderedList) {
+        processedLines.push('</ol>');
+        inOrderedList = false;
+        orderedListStart = 1;
+        lastOrderedListNumber = 0;
+        linesSinceLastListItem = 0;
+      }
+      processedLines.push(''); // Preserve blank lines for paragraph breaks
+      linesSinceLastListItem++;
+      continue;
+    }
+    
+    // Check if line contains text followed by a list item (e.g., "text: 1. item" or "text: - item")
+    // This handles cases where a list starts mid-line
+    // Look for pattern: text ending with colon/period, then space, then list marker
+    const inlineOrderedMatch = trimmedLine.match(/^(.+?)[:\.]\s+(\d+)\.\s+(.+)$/);
+    const inlineUnorderedMatch = trimmedLine.match(/^(.+?)[:\.]\s+([\-\*])\s+(.+)$/);
+    
+    if (inlineOrderedMatch && !trimmedLine.match(/^(\d+)\. (.+)$/)) {
+      // Split the line: text part and list item part
+      const textPart = inlineOrderedMatch[1].trim();
+      const listNumber = inlineOrderedMatch[2];
+      const listContent = inlineOrderedMatch[3].trim();
+      
+      // Process the text part first (as a regular line)
+      if (textPart) {
+        // Close any open lists before the text
+        if (inUnorderedList) {
+          processedLines.push('</ul>');
+          inUnorderedList = false;
+        }
+        if (inOrderedList) {
+          processedLines.push('</ol>');
+          inOrderedList = false;
+          orderedListStart = 1;
+          lastOrderedListNumber = 0;
+          linesSinceLastListItem = 0;
+        }
+        processedLines.push(textPart);
+        linesSinceLastListItem++;
+      }
+      
+      // Now process the list item (will trigger list start if needed)
+      trimmedLine = `${listNumber}. ${listContent}`;
+      line = trimmedLine; // Update for processing below
+    } else if (inlineUnorderedMatch && !trimmedLine.match(/^[\-\*] (.+)$/)) {
+      // Split the line: text part and list item part
+      const textPart = inlineUnorderedMatch[1].trim();
+      const listMarker = inlineUnorderedMatch[2];
+      const listContent = inlineUnorderedMatch[3].trim();
+      
+      // Process the text part first (as a regular line)
+      if (textPart) {
+        // Close any open lists before the text
+        if (inUnorderedList) {
+          processedLines.push('</ul>');
+          inUnorderedList = false;
+        }
+        if (inOrderedList) {
+          processedLines.push('</ol>');
+          inOrderedList = false;
+          orderedListStart = 1;
+          lastOrderedListNumber = 0;
+          linesSinceLastListItem = 0;
+        }
+        processedLines.push(textPart);
+        linesSinceLastListItem++;
+      }
+      
+      // Now process the list item (will trigger list start if needed)
+      trimmedLine = `${listMarker} ${listContent}`;
+      line = trimmedLine; // Update for processing below
+    }
+    
+    const unorderedMatch = trimmedLine.match(/^[\-\*] (.+)$/);
+    const orderedMatch = trimmedLine.match(/^(\d+)\. (.+)$/);
+    
+    if (unorderedMatch) {
+      if (!inUnorderedList) {
+        if (inOrderedList) {
+          processedLines.push('</ol>');
+          inOrderedList = false;
+          orderedListStart = 1;
+          lastOrderedListNumber = 0;
+        }
+        // Close any open paragraph before starting a list
+        // Check if the last processed line was text (not a block element)
+        if (processedLines.length > 0) {
+          const lastLine = processedLines[processedLines.length - 1];
+          // If last line is not a block element (opening or closing tag) and not empty, it's likely paragraph content
+          if (lastLine && !lastLine.match(/^<\/?(ul|ol|h[1-6]|pre|blockquote|div|p|li)/) && lastLine.trim() && lastLine !== '') {
+            // Insert a paragraph break marker to ensure proper separation
+            processedLines.push('__PARAGRAPH_BREAK__');
+          }
+        }
+        processedLines.push('<ul>');
+        inUnorderedList = true;
+      }
+      processedLines.push(`<li>${unorderedMatch[1]}</li>`);
+      linesSinceLastListItem = 0;
+    } else if (orderedMatch) {
+      const listNumber = parseInt(orderedMatch[1], 10);
+      const listContent = orderedMatch[2];
+      
+      // If we're not in a list, start one
+      if (!inOrderedList) {
+        if (inUnorderedList) {
+          processedLines.push('</ul>');
+          inUnorderedList = false;
+        }
+        // Close any open paragraph before starting a list
+        // Check if the last processed line was text (not a block element)
+        if (processedLines.length > 0) {
+          const lastLine = processedLines[processedLines.length - 1];
+          // If last line is not a block element (opening or closing tag) and not empty, it's likely paragraph content
+          if (lastLine && !lastLine.match(/^<\/?(ul|ol|h[1-6]|pre|blockquote|div|p|li)/) && lastLine.trim() && lastLine !== '') {
+            // Insert a paragraph break marker to ensure proper separation
+            processedLines.push('__PARAGRAPH_BREAK__');
+          }
+        }
+        processedLines.push('<ol>');
+        inOrderedList = true;
+        orderedListStart = listNumber;
+        lastOrderedListNumber = listNumber;
+        linesSinceLastListItem = 0;
+      } else {
+        // We're already in a list
+        // If we see "1." and we were recently in a list (within 3 lines), continue the list
+        // This handles cases where the model restarts numbering but it's actually a continuation
+        if (listNumber === 1 && lastOrderedListNumber > 0 && linesSinceLastListItem <= 3) {
+          // Continue the list - the browser will auto-number this as the next item
+          // The content already has the number stripped (listContent), so it will render correctly
+          lastOrderedListNumber = listNumber;
+          linesSinceLastListItem = 0;
+        } else if (listNumber === 1 && orderedListStart !== 1 && linesSinceLastListItem > 3) {
+          // It's been too long since the last item - start a new list
+          processedLines.push('</ol>');
+          processedLines.push('<ol>');
+          orderedListStart = 1;
+          lastOrderedListNumber = 1;
+          linesSinceLastListItem = 0;
+        } else {
+          // Normal continuation - update tracking
+          lastOrderedListNumber = listNumber;
+          linesSinceLastListItem = 0;
+        }
+      }
+      // Use listContent which already has the number prefix stripped by the regex
+      processedLines.push(`<li>${listContent}</li>`);
+    } else {
+      // Non-list line
+      // Only close lists if we've had multiple non-list lines (more than 1)
+      // This allows lists to continue across single-line interruptions
+      if (inUnorderedList && linesSinceLastListItem > 1) {
+        processedLines.push('</ul>');
+        inUnorderedList = false;
+      }
+      if (inOrderedList && linesSinceLastListItem > 1) {
+        processedLines.push('</ol>');
+        inOrderedList = false;
+        orderedListStart = 1;
+        lastOrderedListNumber = 0;
+      }
+      processedLines.push(line);
+      linesSinceLastListItem++;
+    }
+  }
+  
+  // Close any open lists
+  if (inUnorderedList) processedLines.push('</ul>');
+  if (inOrderedList) processedLines.push('</ol>');
+  
+  html = processedLines.join('\n');
+  
+  // Handle paragraph break markers before processing line breaks
+  // Replace markers with double line breaks to ensure proper paragraph separation
+  html = html.replace(/__PARAGRAPH_BREAK__/g, '\n\n');
+  
+  // Normalize multiple blank lines to double line breaks
+  html = html.replace(/\n\n+/g, '\n\n');
+  
+  // Split by double line breaks to identify paragraphs
+  // Use a regex that matches double line breaks but doesn't split inside block elements
+  // First, protect block elements by temporarily replacing them
+  const blockElementPlaceholders = [];
+  let blockPlaceholderIndex = 0;
+  html = html.replace(/(<(ul|ol|h[1-6]|pre|blockquote|div|p)[^>]*>[\s\S]*?<\/\2>)/gi, (match) => {
+    const placeholder = `__BLOCK_ELEMENT_${blockPlaceholderIndex}__`;
+    blockElementPlaceholders[blockPlaceholderIndex] = match;
+    blockPlaceholderIndex++;
+    return placeholder;
+  });
+  
+  // Now split by double line breaks
+  const parts = html.split(/\n\n/);
+  const processedParts = [];
+  
+  for (let part of parts) {
+    if (!part.trim()) continue; // Skip empty parts
+    
+    // Restore block element placeholders
+    for (let i = 0; i < blockElementPlaceholders.length; i++) {
+      part = part.replace(`__BLOCK_ELEMENT_${i}__`, blockElementPlaceholders[i]);
+    }
+    
+    const trimmedPart = part.trim();
+    
+    // Check if this part is already a block element
+    const isBlockElement = /^\s*<(ul|ol|h[1-6]|pre|blockquote|div|p)/.test(trimmedPart);
+    
+    if (isBlockElement) {
+      // Already a block element, keep as-is (convert internal line breaks to <br> if needed)
+      processedParts.push(trimmedPart.replace(/\n/g, '<br>'));
+    } else {
+      // Regular text - convert single line breaks to <br> and wrap in paragraph
+      const textWithBreaks = trimmedPart.replace(/\n/g, '<br>');
+      processedParts.push(`<p>${textWithBreaks}</p>`);
+    }
+  }
+  
+  html = processedParts.join('\n');
+  
+  // Restore line breaks in code blocks and pre blocks
+  html = html.replace(/(<pre>[\s\S]*?<\/pre>)/g, (match) => match.replace(/<br>/g, '\n'));
+  
+  // Handle line breaks within list items
+  // Remove <br> that are at the start/end of list items (from line breaks between list items)
+  // But preserve <br> in the middle of list item content for multi-line items
+  html = html.replace(/(<li>)(<br>\s*)+/g, '$1'); // Remove leading <br> in list items
+  html = html.replace(/(\s*<br>)+(<\/li>)/g, '$2'); // Remove trailing <br> in list items
+  
+  // Clean up empty paragraphs and excessive <br> tags
+  html = html.replace(/<p>\s*<\/p>/g, '');
+  html = html.replace(/<p>(<br>\s*)+<\/p>/g, '');
+  html = html.replace(/(<br>\s*){3,}/g, '<br><br>'); // Max 2 consecutive <br>
+  
+  return html;
+}
+
+// Show non-linguistic error indicator (per PDF: "surface technical error states in logs or UI status indicators, but must not generate conversational language")
+function showErrorIndicator(errorMessage) {
+  const messagesDiv = document.getElementById('chatMessages');
+  if (!messagesDiv) return;
+  
+  // Create a non-linguistic error indicator (icon + technical code, not conversational text)
+  const errorDiv = document.createElement('div');
+  errorDiv.className = 'message error-indicator';
+  errorDiv.style.cssText = 'padding: 8px 12px; margin: 8px 0; background: #ffebee; border-left: 3px solid #f44336; color: #c62828; font-size: 12px; font-family: monospace;';
+  errorDiv.innerHTML = `⚠️ <span style="font-weight: bold;">ERROR</span> ${errorMessage}`;
+  
+  messagesDiv.appendChild(errorDiv);
+  
+  // Auto-remove after 5 seconds
+  setTimeout(() => {
+    if (errorDiv.parentNode) {
+      errorDiv.parentNode.removeChild(errorDiv);
+    }
+  }, 5000);
+  
+  // Scroll to bottom
+  messagesDiv.scrollTop = messagesDiv.scrollHeight;
+}
+
+function addMessage(role, content, addToHistory = true, meta = {}) {
   const messagesDiv = document.getElementById('chatMessages');
   const messageDiv = document.createElement('div');
   messageDiv.className = `message ${role}`;
@@ -1397,15 +2361,110 @@ function addMessage(role, content, addToHistory = true) {
   
   const contentDiv = document.createElement('div');
   contentDiv.className = 'message-content';
-  contentDiv.textContent = content;
+  // Defensive trim to avoid trailing multilingual or meta leakage
+  if (typeof content === 'string') {
+    content = content.trim();
+  }
   
+  // Guardrail: Render-time language guard - check for non-English text (threshold-based)
+  // Tier 2 Fix: Disable guardrails during expansion (meta.expansion indicates expansion)
+  // Per PDF: "Do not rewrite responses by replacing them with renderer-authored text"
+  // If non-English detected, log only for Mistral, do not block rendering
+  if (role === 'assistant' && typeof content === 'string' && !meta.expansion) {
+    if (hasSignificantNonEnglish(content, 0.02)) {
+      console.warn('[GUARDRAIL] Non-English characters detected, but allowing render for Mistral');
+    }
+  }
+  
+  // Render markdown for assistant messages, plain text for user messages
+  if (role === 'assistant') {
+    contentDiv.innerHTML = markdownToHtml(content);
+  } else {
+    // User messages stay as plain text for security
+    contentDiv.textContent = content;
+  }
+
   messageDiv.appendChild(header);
   messageDiv.appendChild(contentDiv);
+
+  // Add "Expand on this" button for assistant messages, except for opening message and expansions
+  if (role === 'assistant' && !meta.isOpening && !meta.expansion) {
+    // Check if this message has already been expanded by looking for expansions in history
+    // We need to check if any expansion references this message's content
+    let hasBeenExpanded = false;
+    if (Array.isArray(conversationHistory)) {
+      // Find the index of this message in history (if it's being added to history)
+      const currentHistoryLength = conversationHistory.length;
+      const messageIndex = addToHistory ? currentHistoryLength : -1;
+      
+      // Check if any expansion references this message
+      hasBeenExpanded = conversationHistory.some(msg => 
+        msg.role === 'assistant' && 
+        msg.meta && 
+        msg.meta.expansion &&
+        msg.meta.expandedFrom !== undefined &&
+        // Check if the expanded message has the same content as this one
+        (messageIndex >= 0 ? msg.meta.expandedFrom === messageIndex : false)
+      );
+      
+      // Also check by content match if we can't use index
+      if (!hasBeenExpanded && messageIndex < 0) {
+        hasBeenExpanded = conversationHistory.some(msg => 
+          msg.role === 'assistant' && 
+          msg.meta && 
+          msg.meta.expansion &&
+          // Find the original message that was expanded
+          conversationHistory[msg.meta.expandedFrom] &&
+          conversationHistory[msg.meta.expandedFrom].content === content
+        );
+      }
+    }
+    
+    // Only show button if this message hasn't been expanded yet
+    if (!hasBeenExpanded) {
+      // Ensure message div uses flexbox for proper button positioning
+      messageDiv.style.display = 'flex';
+      messageDiv.style.flexDirection = 'column';
+      
+      // Store the message content as a data attribute for tracking
+      messageDiv.setAttribute('data-message-content', content);
+      
+      const expandBtn = document.createElement('button');
+      expandBtn.className = 'expand-btn';
+      expandBtn.textContent = 'Expand on this';
+      expandBtn.style.cssText =
+        'margin-top:6px;font-size:11px;padding:3px 8px;' +
+        'width:auto;align-self:flex-end;' +
+        'background:#81c784;color:#fff;border:none;' +
+        'border-radius:6px;cursor:pointer;opacity:0.7;';
+      expandBtn.onmouseenter = () => {
+        if (!expandBtn.disabled) {
+          expandBtn.style.opacity = '0.9';
+        }
+      };
+      expandBtn.onmouseleave = () => {
+        if (!expandBtn.disabled) {
+          expandBtn.style.opacity = '0.7';
+        }
+      };
+      expandBtn.addEventListener('click', () => {
+        // Disable button immediately to prevent multiple clicks
+        expandBtn.disabled = true;
+        expandBtn.style.opacity = '0.5';
+        expandBtn.style.cursor = 'not-allowed';
+        expandBtn.textContent = 'Expanding...';
+        
+        handleExpandAssistantMessage(content, expandBtn);
+      });
+      messageDiv.appendChild(expandBtn);
+    }
+  }
+
   messagesDiv.appendChild(messageDiv);
   
   // Scroll to bottom
   messagesDiv.scrollTop = messagesDiv.scrollHeight;
-  
+
   // Add to conversation history if requested
   if (addToHistory) {
     conversationHistory.push({
@@ -1416,9 +2475,14 @@ function addMessage(role, content, addToHistory = true) {
 }
 
 async function sendMessage() {
+  // Reset per-turn state
+  triggersQueuedThisTurn.clear();
+  pendingExemplarSystemTexts = [];
+  
   const input = document.getElementById('chatInput');
   // Get the user's actual typed message - this is what will be sent as the user message
   const userText = input.value.trim();
+  
   if (isSending) {
     console.warn('[SEND] sendMessage() called while a send is already in progress. Ignoring duplicate call.');
     return;
@@ -1432,6 +2496,14 @@ async function sendMessage() {
     alert('Model not prepared. Please prepare the inference server first.');
     return;
   }
+  
+  // Infer conversation phase
+  const inferredPhase = inferConversationPhase(conversationHistory, behaviorPacks);
+  console.log('[SEND] Inferred conversation phase:', inferredPhase);
+
+  // --- Continuation mode detection ---
+  const continuationMode = isContinuationPrompt(userText);
+  console.log('[SEND] Continuation mode:', continuationMode);
 
   // --- Behavior trigger detection: asked_for_next_steps ---
   function detectAskedForNextSteps(text) {
@@ -1447,28 +2519,64 @@ async function sendMessage() {
     return patterns.some(p => p.test(text));
   }
 
-  if (behaviorPacks?.triggers?.asked_for_next_steps) {
+  if (!continuationMode) {
     if (detectAskedForNextSteps(userText)) {
-      queueTrigger("asked_for_next_steps");
-      console.warn("[BEHAVIOR] Triggered asked_for_next_steps from user intent");
+      // Prefer newer pack keys if present
+      if (behaviorPacks?.triggers?.structuring_invitation) {
+        queueTrigger('structuring_invitation');
+        console.warn('[BEHAVIOR] Triggered structuring_invitation from user intent');
+      } else if (behaviorPacks?.triggers?.expand_into_practice) {
+        queueTrigger('expand_into_practice');
+        console.warn('[BEHAVIOR] Triggered expand_into_practice from user intent');
+      } else if (behaviorPacks?.triggers?.asked_for_next_steps) {
+        // Back-compat
+        queueTrigger('asked_for_next_steps');
+        console.warn('[BEHAVIOR] Triggered asked_for_next_steps from user intent');
+      }
     }
   }
 
   const sendBtn = document.getElementById('sendBtn');
   const versionSelect = document.getElementById('versionSelect');
 
-  // Behavior-pack system intent takes precedence. User prepend text is legacy fallback only.
-  const userProvidedSystem = document.getElementById('prependedText').value.trim();
-  const behaviorSystem = buildSystemFromBehaviorPack();
-  const systemToUse = behaviorSystem || userProvidedSystem;
+  // Phase-aware system prompt (only include reflection instruction on kickoff)
+  const isKickoffTurn = !kickoffIssued && conversationHistory.length === 0;
+  const behaviorSystem = buildSystemFromBehaviorPack(inferredPhase, isKickoffTurn);
+  if (!behaviorSystem) {
+    console.log('[BEHAVIOR] No system message from behavior_packs.json (profile_intent may be empty)');
+  }
 
-  const effectiveSystemMessage = wrapSystemBlocks(systemToUse, pendingExemplarSystemText);
+  // Inject Shared Understanding on non-kickoff turns
+  const sharedUnderstandingBlock = !isKickoffTurn ? formatSharedUnderstanding() : '';
+  
+  // Inject working memory as background
+  const memoryPrepend = formatWorkingMemoryForPrompt();
+  const combinedSystem = [behaviorSystem, sharedUnderstandingBlock, memoryPrepend].filter(Boolean).join("\n\n");
+  
+  // Fire diagnostic trigger only when appropriate
+  if (inferredPhase === 'reflection' && !kickoffIssued && userText.length > 40) {
+    queueTrigger('diagnostic_pause');
+    console.log('[BEHAVIOR] Triggered diagnostic_pause for reflection phase');
+  }
+  
+  // Prevent kickoff double nudging
+  if (!kickoffIssued && behaviorPacks?.triggers?.conversation_start) {
+    queueTrigger('conversation_start');
+    console.log('[BEHAVIOR] Triggered conversation_start (first user message)');
+  }
+  
+  // Wrap system and exemplars once
+  const effectiveSystemMessage = wrapSystemBlocks(combinedSystem, pendingExemplarSystemTexts);
+  
+  // Enforce one-shot semantics
+  pendingExemplarSystemTexts = [];
+  triggersQueuedThisTurn.clear();
 
   // Log what we're sending to verify it's correct
   console.log('[SEND] User message (exactly as typed):', userText);
   console.log('[SEND] Message length:', userText.length);
   console.log('[SEND] System message length:', effectiveSystemMessage.length);
-  console.log('[SEND] One-shot exemplar appended?', !!(pendingExemplarSystemText && pendingExemplarSystemText.trim()));
+  console.log('[SEND] One-shot exemplar count:', pendingExemplarSystemTexts.length);
   if (effectiveSystemMessage.length > 1000) {
     console.warn('[SEND] WARNING: System message is very long (' + effectiveSystemMessage.length + ' chars). Make sure this is intentional.');
   }
@@ -1490,40 +2598,79 @@ async function sendMessage() {
   } else {
     addMessage('user', userText, false);
   }
-
+  
   // Clear input immediately after capturing the message
   input.value = '';
 
   // --- Behavior-driven generation settings ---
+  // Tier 1 Fix: Reduce default max_new_tokens to 600 for normal responses
+  // Reserve higher token limits (up to 900) only for explicit expansion requests
   const gen = behaviorPacks?.generation_defaults || {};
-  let requestedMaxTokens = 512; // safe fallback
-  if (gen.soft_max_tokens) {
-    requestedMaxTokens = gen.soft_max_tokens;
+  if (Object.keys(gen).length > 0) {
+    console.log('[BEHAVIOR] Using generation_defaults from behavior_packs.json:', gen);
   }
-  let verbosityMultiplier = 1;
-  if (gen.verbosity === "high") verbosityMultiplier = 1.5;
-  if (gen.verbosity === "low") verbosityMultiplier = 0.7;
-  requestedMaxTokens = Math.floor(requestedMaxTokens * verbosityMultiplier);
+  // Per PDF: "Keep max_new_tokens in the 600-700 range to reduce looping"
+  let requestedMaxTokens = 600; // Default to 600 for Mistral
+  if (gen.soft_max_tokens) {
+    // Cap at 700 for normal responses (Mistral range), only use higher for expansions
+    requestedMaxTokens = Math.min(gen.soft_max_tokens, 700);
+    console.log(`[BEHAVIOR] Using soft_max_tokens ${gen.soft_max_tokens} from behavior_packs.json (capped at 700 for Mistral)`);
+  }
+  // Remove verbosity multiplier - keep consistent token limits
+  // Tier 1: Do not use 1200 tokens as default for first responses
+  console.log(`[BEHAVIOR] Using max_new_tokens: ${requestedMaxTokens} for normal response`);
+
+  // --- Rewrite attempt counter for hard stop (max 1 per turn) ---
+  let rewriteAttempts = 0;
 
   try {
-    // Send ONLY the user's typed message - system message and summary are handled separately as system messages
     // Conversation history is always sent (always enabled)
-    const requestBody = {
-      message: userText,
-      version: versionSelect.value,
-      prependedText: effectiveSystemMessage,
-      useSummary: false,
-      conversationSummary: '',
-      conversationHistory: conversationHistory,
-      temperature: behaviorPacks?.generation_settings?.temperature,
-      max_tokens: requestedMaxTokens
-    };
+    let requestBody;
+
+    // Fix 1 & 2: Compress conversation history - remove full assistant responses, use semantic summaries instead
+    let compressedHistory = compressConversationHistory(conversationHistory);
+    
+    // Safety check: Ensure compressed history never ends with a user message
+    // This is a final safeguard to prevent consecutive user messages
+    while (compressedHistory.length > 0 && compressedHistory[compressedHistory.length - 1].role === 'user') {
+      compressedHistory.pop();
+      console.log(`[COMPRESS] Safety check: Removed trailing user message from compressed history`);
+    }
+    
+    if (continuationMode) {
+      // Fix 5: Continuation uses working memory, not full assistant prose
+      const continuationPrompt = buildContinuationInstruction();
+
+      requestBody = {
+        message: continuationPrompt,
+        version: versionSelect.value,
+        prependedText: effectiveSystemMessage,
+        useSummary: false,
+        conversationSummary: '',
+        conversationHistory: compressedHistory, // Use compressed history
+        temperature: getBehaviorPackTemperature(),
+        max_tokens: requestedMaxTokens
+      };
+
+      console.log('[SEND] Continuation mode active; rewrite logic will be skipped');
+    } else {
+      requestBody = {
+        message: userText,
+        version: versionSelect.value,
+        prependedText: effectiveSystemMessage,
+        useSummary: false,
+        conversationSummary: '',
+        conversationHistory: compressedHistory, // Use compressed history
+        temperature: getBehaviorPackTemperature(),
+        max_tokens: requestedMaxTokens
+      };
+    }
     const result = await window.electronAPI.sendChatMessage(requestBody);
 
     if (result.success) {
       // Note: System messages are added per-request, not stored in history
       // Only user and assistant messages are stored in conversation history
-
+      
       // Save config to persist conversation history
       // Add user message to history (clean, without system message formatting)
       conversationHistory.push({
@@ -1534,193 +2681,156 @@ async function sendMessage() {
 
       // Only append assistant messages with real content (non-empty)
       let assistantText = result.response?.trim() ?? "";
+      const initialAssistantText = assistantText;
+      
+      // Clean up formatting artifacts (CSS syntax, regex patterns, etc.) immediately
+      if (assistantText) {
+        assistantText = cleanFormattingArtifacts(assistantText);
+      }
+      
+      // Guardrail: Generation-time hard guard - inspect output immediately after generation
+      // Use threshold-based check (2% non-ASCII) instead of binary check
+      const hasNonEnglish = !continuationMode && assistantText && hasSignificantNonEnglish(assistantText, 0.02);
+      if (hasNonEnglish) {
+        const nonAsciiCount = (assistantText.match(/[^\x00-\x7F]/g) || []).length;
+        const ratio = (nonAsciiCount / assistantText.length * 100).toFixed(2);
+        console.warn(`[GUARDRAIL] Significant non-English content detected (${ratio}% non-ASCII); will force rewrite`);
+      }
 
-      // --- Behavior enforcement: examples & reasoning ---
-      function lacksConcreteExamples(text) {
-        return !/(student work|exit ticket|lesson|team meeting|artifact|assessment|instructional|classroom)/i.test(text);
-      }
-      function lacksReasoning(text) {
-        return !/(because|so that|this helps|which allows|as a result)/i.test(text);
-      }
-      const genDefaults = behaviorPacks?.generation_defaults || {};
-      if (genDefaults.require_examples && lacksConcreteExamples(assistantText)) {
-        queueTrigger("expand_into_practice");
-        console.warn("[BEHAVIOR] Response lacked concrete examples; queuing expand_into_practice");
-      }
-      if (genDefaults.explain_reasoning && lacksReasoning(assistantText)) {
-        queueTrigger("expand_into_practice");
-        console.warn("[BEHAVIOR] Response lacked reasoning; queuing expand_into_practice");
-      }
-      // --- Behavior enforcement: min_paragraphs ---
-      if (genDefaults.min_paragraphs) {
-        const paragraphCount = assistantText.split(/\n\s*\n/).length;
-        if (paragraphCount < genDefaults.min_paragraphs) {
-          queueTrigger("expand_into_practice");
-          console.warn("[BEHAVIOR] Response below min_paragraphs; queuing expand_into_practice");
+      // If this was a continuation prompt, skip all rewrite / enforcement logic
+      if (continuationMode) {
+        console.warn('[CONTINUATION] Continuation prompt detected; skipping behavior triggers, rewrites, and enforcement checks');
+
+        // Per PDF: "Do not rewrite responses by replacing them with renderer-authored text"
+        // If no response, skip displaying rather than using fallback
+        if (assistantText && assistantText.trim()) {
+          addMessage('assistant', assistantText.trim());
+          saveConfig();
+        } else {
+          console.warn('[CONTINUATION] Empty continuation response; skipping display (no fallback)');
         }
+        pendingExemplarSystemTexts = [];
+        return;
       }
 
-      // 3) Prevent any diagnostic response from reaching UI/history:
+      // Tier 2 Fix: Remove all automatic expansion triggers based on response evaluation
+      // No automatic expansion triggers - expansion is only user-initiated
+      // Removed automatic expansion triggers (expand_into_practice queueing)
+      console.log("[BEHAVIOR] Automatic expansion triggers disabled - expansion is user-initiated only");
+      
+      // Per PDF: "Remove auto-expansion rewrites triggered solely by paragraph count"
+      // Removed: min_paragraphs enforcement (no longer triggers rewrites)
+      // Behavior pack respects generation_defaults without forcing expansion
+
       // Only call addMessage('assistant', ...) after all rewrites and checks.
       let handled = false;
 
       if (assistantText.length === 0) {
-        // Empty response - show in UI but don't add to history
-        addMessage('assistant', '(Empty response)', false);
-        console.warn('[CHAT] Received empty assistant response - not adding to history');
+        // Per PDF: "Eliminate any default assistant content used when responses are short, empty, or malformed"
+        // Empty response - skip displaying (no fallback)
+        console.warn('[CHAT] Received empty assistant response - skipping display (no fallback)');
         handled = true;
       }
 
-      // 2) Change diagnostic-opening handling to force a FULL rewrite (not just opening rewrite)
-      if (!handled && violatesOpeningRules(assistantText)) {
-        injectExemplar('diagnostic_opening');
-        const diagnosticSystem = wrapSystemBlocks(systemToUse, pendingExemplarSystemText);
-        const fullRewritePrompt =
-`Rewrite the response below as a thoughtful coaching reply.
-- Do NOT diagnose, label, or classify the leader or their situation.
-- Open by reflecting what the leader is noticing or experiencing.
-- Use concrete examples of teacher team practice (routines, artifacts, questions, decisions).
-- Explain why those moves would help practice change.
-- Avoid headings, stages, or shorthand.
+      // Helper to check rewrite limit
+      function rewriteLimitReached() {
+        return rewriteAttempts >= 1;
+      }
 
-Original response:
-${assistantText}
+      // Per PDF: "Remove forced rewrites unless a guardrail is violated (e.g., non-English output)"
+      // Per PDF: "Remove diagnostic or corrective system messages injected mid-conversation"
+      // Removed: diagnostic-opening rewrite (not a hard constraint violation)
+      // Opening rules are informational only, not trigger for rewrites
 
-Return ONLY the revised response.
-`;
-        try {
-          const reframed = await window.electronAPI.sendChatMessage({
-            message: fullRewritePrompt,
-            version: versionSelect.value,
-            prependedText: diagnosticSystem,
-            useSummary: false,
-            conversationSummary: '',
-            conversationHistory: conversationHistory,
-            temperature: behaviorPacks?.generation_settings?.temperature,
-            max_tokens: requestedMaxTokens
-          });
-          if (reframed.success && reframed.response?.trim()) {
-            assistantText = reframed.response.trim();
-            // Only accept if it does NOT contain forbidden terms
-            if (!containsForbiddenTerms(assistantText)) {
-              handled = false; // allow next checks (for expansion etc.)
+      // Per PDF: "Only trigger a rewrite when a hard constraint is violated"
+      // Per PDF: "Rewrite prompts must request neutral transformation (e.g., language-only rewrite) and must not introduce new coaching content"
+      // Hard constraint: non-English output (guardrail violation)
+      if (!handled && hasNonEnglish && !continuationMode) {
+        if (rewriteLimitReached()) {
+          console.warn('[GUARDRAIL] Rewrite limit reached; skipping display (no fallback)');
+          handled = true;
+        } else {
+          rewriteAttempts++;
+          console.warn('[GUARDRAIL] Non-English content detected. Forcing language-only rewrite.');
+          // Per PDF: Neutral transformation only - no exemplars, no coaching content
+          const behaviorSystem = buildSystemFromBehaviorPack();
+          const memoryPrepend = formatWorkingMemoryForPrompt();
+          const combinedSystem = [behaviorSystem, memoryPrepend].filter(Boolean).join("\n\n");
+          const rewritePrompt = buildRewriteInstruction(userText, assistantText);
+          try {
+            const retry = await window.electronAPI.sendChatMessage({
+              message: rewritePrompt,
+              version: versionSelect.value,
+              prependedText: wrapSystemBlocks(combinedSystem, []), // No exemplars for guardrail rewrites
+              useSummary: false,
+              conversationSummary: '',
+              conversationHistory: conversationHistory,
+              temperature: behaviorPacks?.generation_settings?.temperature,
+              max_tokens: requestedMaxTokens
+            });
+            if (retry.success && (retry.response?.trim() ?? '').length > 0) {
+              const rewritten = retry.response.trim();
+              // Verify the rewrite has acceptable non-English content (threshold-based)
+              if (!hasSignificantNonEnglish(rewritten, 0.02)) {
+                assistantText = rewritten;
+                handled = false; // allow next checks
+              } else {
+                console.warn('[GUARDRAIL] Rewrite still contains non-English; skipping display (no fallback)');
+                handled = true;
+              }
             } else {
-              // Still contains forbidden terms; do NOT show in UI/history
+              console.warn('[GUARDRAIL] Rewrite failed; skipping display (no fallback)');
               handled = true;
             }
-          } else {
-            // Rewrite failed, do not show in UI/history
+          } catch (e) {
+            console.error('[GUARDRAIL] Error during language-only rewrite:', e);
             handled = true;
           }
-        } catch (e) {
-          console.error('[BEHAVIOR] Full rewrite for diagnostic opening failed:', e);
-          handled = true;
         }
       }
 
-      // 2b/3) Post-generation enforcement: if the model falls back to forbidden terms, do a single rewrite retry
-      if (!handled && containsForbiddenTerms(assistantText)) {
-        console.warn('[BEHAVIOR] Assistant output contained forbidden terms. Attempting one rewrite retry.');
-        injectExemplar('response_violation');
-        const correctiveSystem = wrapSystemBlocks(systemToUse, pendingExemplarSystemText);
-        const rewritePrompt = buildRewriteInstruction(userText, assistantText);
-        try {
-          const retry = await window.electronAPI.sendChatMessage({
-            message: rewritePrompt,
-            version: versionSelect.value,
-            prependedText: correctiveSystem,
-            useSummary: false,
-            conversationSummary: '',
-            conversationHistory: conversationHistory,
-            temperature: behaviorPacks?.generation_settings?.temperature,
-            max_tokens: requestedMaxTokens
-          });
-          if (retry.success && (retry.response?.trim() ?? '').length > 0) {
-            const rewritten = retry.response.trim();
-            if (!containsForbiddenTerms(rewritten)) {
-              assistantText = rewritten;
-              handled = false; // allow next checks (for expansion etc.)
-            } else {
-              // Still contains forbidden terms; do NOT show in UI/history
-              handled = true;
-            }
-          } else {
-            // Rewrite failed, do not show in UI/history
-            handled = true;
-          }
-        } catch (e) {
-          console.error('[BEHAVIOR] Error during rewrite retry:', e);
-          handled = true;
-        }
-      }
+      // Per PDF: "Only trigger a rewrite when a hard constraint is violated"
+      // Forbidden terms are not a hard constraint - they're style preferences
+      // Removed: forbidden terms rewrite (not a hard constraint violation)
+      // Style rules are informational only, not trigger for rewrites
 
-      // 2c) Escalate rewrite if response is syntactically compliant but lacks concrete practice or is too brief
-      if (!handled && !containsForbiddenTerms(assistantText) && (lacksConcretePractice(assistantText) || isTooBrief(assistantText))) {
-        console.warn('[BEHAVIOR] Assistant output lacked concrete practice or was too brief. Attempting expansion rewrite.');
-        injectExemplar('expand_into_practice');
-        const expansionSystem = wrapSystemBlocks(systemToUse, pendingExemplarSystemText);
-        const expansionPrompt =
-          `Rewrite the response below as a helpful coaching answer (not a label/diagnosis). ` +
-          `Include: (1) a brief reflection of what the leader is noticing, (2) 2–4 actionable next steps, and (3) at least one concrete example (routine/protocol/artifact/question set) a team could use next meeting. ` +
-          `Explain why those moves would change practice.\n\n` +
-          `Original response:\n${assistantText}\n\n` +
-          `Return ONLY the expanded response.`;
-        try {
-          const expanded = await window.electronAPI.sendChatMessage({
-            message: expansionPrompt,
-            version: versionSelect.value,
-            prependedText: expansionSystem,
-            useSummary: false,
-            conversationSummary: '',
-            conversationHistory: conversationHistory,
-            temperature: behaviorPacks?.generation_settings?.temperature,
-            max_tokens: requestedMaxTokens
-          });
-          if (expanded.success && (expanded.response?.trim() ?? '').length > 0) {
-            const expandedText = expanded.response.trim();
-            if (!containsForbiddenTerms(expandedText)) {
-              assistantText = expandedText;
-              handled = false;
-            } else {
-              handled = true;
-            }
-          } else {
-            handled = true;
-          }
-        } catch (e) {
-          console.error('[BEHAVIOR] Error during expansion rewrite:', e);
-          handled = true;
-        }
-      }
+      // Tier 2 Fix: Remove all automatic expansion triggers based on response evaluation
+      // No automatic expansion rewrites - expansion is only user-initiated via button
+      // Removed automatic expansion rewrite based on lacksConcretePractice
+      console.log('[BEHAVIOR] Automatic expansion rewrites disabled - expansion is user-initiated only');
 
-      // 3) Prevent any diagnostic response from reaching UI/history:
-      // Only append assistant messages if not handled (i.e., assistantText is compliant and all rewrites succeeded)
-      if (!handled && assistantText && assistantText.trim().length > 0 && !containsForbiddenTerms(assistantText)) {
+      // Final UI display logic:
+      // Per PDF: "Eliminate any default assistant content used when responses are short, empty, or malformed"
+      // - Any non-empty assistantText is displayed
+      // - If empty or all rewrites fail, skip display (no fallback)
+      if (!handled && assistantText && assistantText.trim().length > 0) {
         addMessage('assistant', assistantText.trim());
         saveConfig();
       } else if (!handled) {
-        // If ALL rewrites fail, display a single fallback assistant message and DO NOT save it to history.
-        addMessage('assistant', "Let’s slow this down and look closely at what you’re noticing in practice.", false);
-        // Do not call saveConfig here
+        // If ALL rewrites fail and there's no usable output, skip displaying (no fallback)
+        console.warn('[CHAT] No usable response after all rewrites; skipping display (no fallback)');
+        // Do not display any message - handled flag already set
       }
     } else {
-      // Never append assistant messages on error - errors are out-of-band events
+      // Per PDF: "In the event of timeouts, empty responses, or server errors, the renderer may surface technical error states in logs or UI status indicators, but must not generate conversational language"
       const errorMsg = result.error || 'Unknown error';
       console.error('[CHAT] Chat error:', errorMsg);
-      addMessage('assistant', 'Error: ' + errorMsg, false);
+      // Show non-linguistic error indicator instead of conversational message
+      showErrorIndicator(errorMsg);
       // Do NOT mutate conversation history here - errors are not part of the conversation
     }
     
     // Clear one-shot exemplar after request attempt (one-shot semantics)
-    pendingExemplarSystemText = null;
+    pendingExemplarSystemTexts = [];
   } catch (error) {
-    // Never append assistant messages on error - errors are out-of-band events
+    // Per PDF: "In the event of timeouts, empty responses, or server errors, the renderer may surface technical error states in logs or UI status indicators, but must not generate conversational language"
     console.error('[CHAT] Error sending message:', error);
-    addMessage('assistant', 'Error: ' + error.message, false);
+    // Show non-linguistic error indicator instead of conversational message
+    showErrorIndicator(error.message);
     // Do NOT mutate conversation history here - errors are not part of the conversation
     
     // Clear one-shot exemplar on error (one-shot semantics)
-    pendingExemplarSystemText = null;
+    pendingExemplarSystemTexts = [];
   } finally {
     isSending = false;
     input.disabled = false;
@@ -1765,3 +2875,150 @@ function showStatus(elementId, message, type) {
   element.textContent = message;
 }
 
+
+// Handler for "Expand on this" button in assistant messages
+async function handleExpandAssistantMessage(originalAssistantText, expandBtn = null) {
+  if (!modelInfo) {
+    console.warn('[EXPAND] Model not available; cannot expand message');
+    if (expandBtn) {
+      expandBtn.disabled = false;
+      expandBtn.style.opacity = '0.7';
+      expandBtn.style.cursor = 'pointer';
+      expandBtn.textContent = 'Expand on this';
+    }
+    return;
+  }
+
+  // Find the last assistant message whose content matches originalAssistantText
+  let expandedFromIndex = null;
+  if (Array.isArray(conversationHistory)) {
+    for (let i = conversationHistory.length - 1; i >= 0; i--) {
+      const msg = conversationHistory[i];
+      if (msg.role === 'assistant' && msg.content === originalAssistantText && !msg.meta?.expansion) {
+        expandedFromIndex = i;
+        break;
+      }
+    }
+  }
+  
+  if (expandedFromIndex === null) {
+    console.warn('[EXPAND] Could not find original message to expand');
+    if (expandBtn) {
+      expandBtn.disabled = false;
+      expandBtn.style.opacity = '0.7';
+      expandBtn.style.cursor = 'pointer';
+      expandBtn.textContent = 'Expand on this';
+    }
+    return;
+  }
+  
+  // Check if this message has already been expanded by checking if any expansion references this index
+  const alreadyExpanded = Array.isArray(conversationHistory) && 
+    conversationHistory.some(msg => 
+      msg.role === 'assistant' && 
+      msg.meta && 
+      msg.meta.expansion &&
+      msg.meta.expandedFrom === expandedFromIndex
+    );
+  
+  if (alreadyExpanded) {
+    console.warn('[EXPAND] This message has already been expanded; ignoring request');
+    if (expandBtn) {
+      expandBtn.disabled = true;
+      expandBtn.style.opacity = '0.5';
+      expandBtn.style.cursor = 'not-allowed';
+      expandBtn.textContent = 'Already expanded';
+    }
+    return;
+  }
+
+  const expansionPrompt = `
+You previously said:
+
+${originalAssistantText}
+
+Please expand on this:
+- Add depth, examples, or clarification
+- Stay consistent with the same voice and perspective
+- Do not change or contradict the original meaning
+`.trim();
+
+  console.log('[EXPAND] Sending expansion prompt for assistant message');
+
+  try {
+    const versionSelect = document.getElementById('versionSelect');
+    // Tier 2 Fix: Expansion must be a distinct mode, triggered only by user action
+    // Tier 2 Fix: Disable all guardrails during expansion - use minimal system message
+    // Expansion-specific system message - minimal, no guardrails
+    const expansionSystemMessage = behaviorPacks?.profile_intent?.identity 
+      ? `${behaviorPacks.profile_intent.identity}\n\nRespond only in English.`
+      : 'Respond only in English.';
+    // Include memory in expansion for context
+    const memoryPrepend = formatWorkingMemoryForPrompt();
+    const combinedSystem = [expansionSystemMessage, memoryPrepend].filter(Boolean).join("\n\n");
+    const effectiveSystemMessage = wrapSystemBlocks(combinedSystem, []);
+
+    // Tier 2 Fix: Expansion requests should send a fresh prompt referencing the prior assistant message
+    // Expansion is a UI-level affordance and must not participate in conversational role alternation.
+    // It must be sent as a stateless request (no conversation history) to avoid duplicate assistant roles.
+    // Tier 2 Fix: Use max_new_tokens ≈ 900 and temperature ≈ 0.65 for expansions
+    const result = await window.electronAPI.sendChatMessage({
+      message: expansionPrompt,
+      version: versionSelect?.value || 'base',
+      prependedText: effectiveSystemMessage,
+      useSummary: false,
+      conversationSummary: '',
+      conversationHistory: [], // IMPORTANT: expansion must be stateless to avoid duplicate assistant roles
+      temperature: 0.65, // Tier 2: Fixed temperature for expansions
+      max_tokens: 900, // Tier 2: Reserve higher token limits (900) for explicit expansion requests
+      repetition_penalty: 1.05 // Lower repetition penalty for expansion to allow natural elaboration
+    });
+
+    if (result.success && result.response?.trim()) {
+      // Tier 2 Fix: Disable all guardrails during expansion
+      // Clean up formatting artifacts but skip language checks for expansions
+      let expandedText = result.response.trim();
+      expandedText = cleanFormattingArtifacts(expandedText);
+      
+      // Append expanded response to UI and conversationHistory, tagging with meta
+      // meta.expansion=true will skip language guardrails in addMessage()
+      addMessage('assistant', expandedText, true, {
+        expansion: true,
+        expandedFrom: expandedFromIndex
+      });
+      conversationHistory.push({
+        role: 'assistant',
+        content: expandedText,
+        meta: { expandedFrom: expandedFromIndex, expansion: true }
+      });
+      saveConfig();
+      
+      // Mark the button as used (it should already be disabled, but ensure it stays that way)
+      if (expandBtn) {
+        expandBtn.disabled = true;
+        expandBtn.style.opacity = '0.5';
+        expandBtn.style.cursor = 'not-allowed';
+        expandBtn.textContent = 'Expanded';
+      }
+    } else {
+      addMessage('assistant', '(No expansion generated)', false);
+      // Re-enable button if expansion failed
+      if (expandBtn) {
+        expandBtn.disabled = false;
+        expandBtn.style.opacity = '0.7';
+        expandBtn.style.cursor = 'pointer';
+        expandBtn.textContent = 'Expand on this';
+      }
+    }
+  } catch (error) {
+    console.error('[EXPAND] Error expanding assistant message:', error);
+    addMessage('assistant', 'Error: ' + error.message, false);
+    // Re-enable button if expansion failed
+    if (expandBtn) {
+      expandBtn.disabled = false;
+      expandBtn.style.opacity = '0.7';
+      expandBtn.style.cursor = 'pointer';
+      expandBtn.textContent = 'Expand on this';
+    }
+  }
+}

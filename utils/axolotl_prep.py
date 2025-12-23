@@ -290,10 +290,10 @@ class AxolotlDataPrep:
         Returns:
             Configuration dictionary
         """
-        # Determine model and tokenizer types based on the base model
+        # Determine model type based on the base model
         # Default to Llama types, but override for specific model families
+        # Note: tokenizer_type is removed - Axolotl will auto-detect it
         model_type = "LlamaForCausalLM"
-        tokenizer_type = "LlamaTokenizer"
         use_model_type = True  # Flag to control whether to include model_type in config
         
         base_model_lower = base_model.lower()
@@ -302,25 +302,23 @@ class AxolotlDataPrep:
             if "gemma-3" in base_model_lower or "gemma3" in base_model_lower:
                 # Don't set model_type for Gemma 3 - let transformers auto-detect
                 use_model_type = False
-                tokenizer_type = "GemmaTokenizer"
             else:
                 # Gemma 1/2 use GemmaForCausalLM
                 model_type = "GemmaForCausalLM"
-                tokenizer_type = "GemmaTokenizer"
         elif "mistral" in base_model_lower or "mixtral" in base_model_lower:
             model_type = "MistralForCausalLM"
-            tokenizer_type = "MistralTokenizer"
         elif "phi" in base_model_lower:
             model_type = "PhiForCausalLM"
-            tokenizer_type = "PhiTokenizer"
         elif "qwen" in base_model_lower:
             model_type = "Qwen2ForCausalLM"
-            tokenizer_type = "Qwen2Tokenizer"
+        
+        # Axolotl validation requires at least TWO of: micro_batch_size, gradient_accumulation_steps, batch_size
+        # We set both micro_batch_size and gradient_accumulation_steps to satisfy this requirement
         
         config = {
             "base_model": base_model,
             "base_model_config": base_model,
-            "tokenizer_type": tokenizer_type,
+            "trust_remote_code": True,
             "load_in_8bit": False,
             "load_in_4bit": True,  # Enable 4-bit quantization to reduce memory usage
             # Note: Setting adapter to a path loads an existing adapter, but for new LoRA training,
@@ -368,8 +366,10 @@ class AxolotlDataPrep:
             "wandb_name": "",
             "wandb_log_model": "",
             
-            "gradient_accumulation_steps": gradient_accumulation_steps,
+            # Axolotl validation requires at least TWO of: micro_batch_size, gradient_accumulation_steps, batch_size
+            # We set both micro_batch_size and gradient_accumulation_steps to satisfy this requirement
             "micro_batch_size": batch_size,
+            "gradient_accumulation_steps": gradient_accumulation_steps,
             "num_epochs": num_epochs,
             "optimizer": "adamw_torch",
             "lr_scheduler": "cosine",
