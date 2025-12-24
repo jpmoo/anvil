@@ -197,211 +197,303 @@ async function createGzipArchive(sourceDir, outputFile) {
   });
 }
 
-// Helper function to upload gzipped adapter and extract it remotely
-async function uploadAdapterWithRsync(localPath, remotePath, host, sshPort, username, sshKeyPath, onProgress) {
-  const tempArchivePath = path.join(os.tmpdir(), `adapter_${Date.now()}_${Math.random().toString(36).substring(7)}.tar.gz`);
-  const remoteArchivePath = `${remotePath}.tar.gz`;
-  let archiveCreated = false;
-  
-  try {
-    // Step 1: Create gzip archive locally
-    console.log(`[UPLOAD] ========================================`);
-    console.log(`[UPLOAD] Step 1: Creating gzip archive`);
-    console.log(`[UPLOAD] ========================================`);
-    await createGzipArchive(localPath, tempArchivePath);
-    archiveCreated = true;
+// Helper function to create a combined GZIP archive containing merged_base_model and adapter
+async function createCombinedGzipArchive(mergedBaseDir, adapterDir, outputFile, versionName) {
+  return new Promise((resolve, reject) => {
+    console.log(`[GZIP] Creating combined gzip archive for ${versionName}...`);
+    console.log(`[GZIP] Merged base model directory: ${mergedBaseDir}`);
+    console.log(`[GZIP] Adapter directory: ${adapterDir}`);
+    console.log(`[GZIP] Output file: ${outputFile}`);
     
-    const archiveStats = fs.statSync(tempArchivePath);
-    const archiveSizeMB = (archiveStats.size / (1024 * 1024)).toFixed(2);
-    console.log(`[UPLOAD] Archive size: ${archiveSizeMB} MB`);
+    // Create a temporary directory structure to combine both
+    const tempDir = path.join(os.tmpdir(), `combined_${Date.now()}_${Math.random().toString(36).substring(7)}`);
+    const tempMergedDir = path.join(tempDir, 'merged_base_model');
+    const tempAdapterDir = path.join(tempDir, 'adapter');
     
-    // Step 2: Upload the gzip file using rsync
-    console.log(`[UPLOAD] ========================================`);
-    console.log(`[UPLOAD] Step 2: Uploading gzip archive with rsync`);
-    console.log(`[UPLOAD] ========================================`);
-    console.log(`[UPLOAD] Local archive: ${tempArchivePath}`);
-    console.log(`[UPLOAD] Remote archive: ${username}@${host}:${remoteArchivePath}`);
-    
-    await new Promise((resolve, reject) => {
-      const sshCommand = `ssh -p ${sshPort} -i "${sshKeyPath}" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR`;
-      const rsyncArgs = [
-        '-avz',
-        '--progress',
-        '--partial',
-        '--partial-dir=.rsync-partial',
-        '-e', sshCommand,
-        tempArchivePath,
-        `${username}@${host}:${remoteArchivePath}`
+    try {
+      // Create temp directory structure
+      fs.mkdirSync(tempDir, { recursive: true });
+      fs.mkdirSync(tempMergedDir, { recursive: true });
+      fs.mkdirSync(tempAdapterDir, { recursive: true });
+      
+      // Copy merged_base_model to temp directory
+      console.log(`[GZIP] Copying merged_base_model to temp directory...`);
+      const copyDir = (src, dest) => {
+        const entries = fs.readdirSync(src, { withFileTypes: true });
+        for (const entry of entries) {
+          const srcPath = path.join(src, entry.name);
+          const destPath = path.join(dest, entry.name);
+          if (entry.isDirectory()) {
+            fs.mkdirSync(destPath, { recursive: true });
+            copyDir(srcPath, destPath);
+          } else {
+            fs.copyFileSync(srcPath, destPath);
+          }
+        }
+      };
+      
+      copyDir(mergedBaseDir, tempMergedDir);
+      console.log(`[GZIP] ✓ Merged base model copied`);
+      
+      // Copy adapter to temp directory
+      console.log(`[GZIP] Copying adapter to temp directory...`);
+      copyDir(adapterDir, tempAdapterDir);
+      console.log(`[GZIP] ✓ Adapter copied`);
+      
+      // Create tar.gz archive of the combined directory
+      const tarArgs = [
+        '-czf',
+        outputFile,
+        '-C',
+        path.dirname(tempDir),
+        '--exclude=node_modules',
+        '--exclude=.git',
+        path.basename(tempDir)
       ];
       
-      console.log(`[UPLOAD] Running: rsync ${rsyncArgs.join(' ')}`);
+      console.log(`[GZIP] Running: tar ${tarArgs.join(' ')}`);
       
-      const rsyncProcess = spawn('rsync', rsyncArgs, {
+      const tarProcess = spawn('tar', tarArgs, {
         stdio: ['ignore', 'pipe', 'pipe']
       });
       
       let stdout = '';
       let stderr = '';
-      let lastProgressUpdate = Date.now();
       
-      rsyncProcess.stdout.on('data', (data) => {
-        const output = data.toString();
-        stdout += output;
-        
-        // Parse rsync progress output
-        // Format: "filename\n  1,234,567  50%  123.45kB/s    0:00:10"
-        const lines = output.split('\n');
-        for (const line of lines) {
-          if (line.trim()) {
-            // Check if it's a progress line (contains %)
-            if (line.includes('%')) {
-              const now = Date.now();
-              // Log progress every 2 seconds
-              if (now - lastProgressUpdate > 2000) {
-                const progressInfo = line.trim();
-                console.log(`[UPLOAD] [Progress] ${progressInfo}`);
-                if (onProgress) {
-                  onProgress(progressInfo);
-                }
-                lastProgressUpdate = now;
-              }
-            } else if (!line.startsWith(' ') && line.trim()) {
-              // File name line
-              console.log(`[UPLOAD] ${line.trim()}`);
-            }
-          }
-        }
+      tarProcess.stdout.on('data', (data) => {
+        stdout += data.toString();
       });
       
-      rsyncProcess.stderr.on('data', (data) => {
+      tarProcess.stderr.on('data', (data) => {
         const output = data.toString();
         stderr += output;
-        // rsync sends some info to stderr (like connection info)
-        if (!output.includes('Warning: Permanently added')) {
-          console.log(`[UPLOAD] ${output.trim()}`);
-        }
+        console.log(`[GZIP] ${output.trim()}`);
       });
       
-      rsyncProcess.on('close', (code) => {
+      tarProcess.on('close', (code) => {
+        // Clean up temp directory
+        try {
+          fs.rmSync(tempDir, { recursive: true, force: true });
+        } catch (cleanupError) {
+          console.warn(`[GZIP] Warning: Failed to clean up temp directory: ${cleanupError.message}`);
+        }
+        
         if (code === 0) {
-          console.log(`[UPLOAD] ✓ Upload completed successfully`);
-          resolve({ stdout, stderr, code });
+          const stats = fs.statSync(outputFile);
+          const sizeMB = (stats.size / (1024 * 1024)).toFixed(2);
+          console.log(`[GZIP] ✓ Combined archive created successfully: ${sizeMB} MB`);
+          resolve(outputFile);
         } else {
-          const error = new Error(`rsync failed with exit code ${code}`);
+          const error = new Error(`tar failed with exit code ${code}`);
           error.code = code;
           error.stdout = stdout;
           error.stderr = stderr;
-          console.error(`[UPLOAD] ✗ Upload failed: ${error.message}`);
+          console.error(`[GZIP] ✗ Combined archive creation failed: ${error.message}`);
           if (stderr) {
-            console.error(`[UPLOAD] stderr: ${stderr}`);
+            console.error(`[GZIP] stderr: ${stderr}`);
           }
           reject(error);
         }
       });
       
-      rsyncProcess.on('error', (error) => {
-        console.error(`[UPLOAD] ✗ Failed to start rsync: ${error.message}`);
+      tarProcess.on('error', (error) => {
+        // Clean up temp directory on error
+        try {
+          fs.rmSync(tempDir, { recursive: true, force: true });
+        } catch (cleanupError) {
+          console.warn(`[GZIP] Warning: Failed to clean up temp directory: ${cleanupError.message}`);
+        }
+        console.error(`[GZIP] ✗ Failed to start tar: ${error.message}`);
         reject(error);
       });
+    } catch (error) {
+      // Clean up temp directory on error
+      try {
+        fs.rmSync(tempDir, { recursive: true, force: true });
+      } catch (cleanupError) {
+        console.warn(`[GZIP] Warning: Failed to clean up temp directory: ${cleanupError.message}`);
+      }
+      reject(error);
+    }
+  });
+}
+
+// Helper function to upload files/directories directly using rsync (no archiving)
+async function uploadAdapterWithRsync(localPath, remotePath, host, sshPort, username, sshKeyPath, onProgress) {
+  // Ensure localPath exists
+  if (!fs.existsSync(localPath)) {
+    throw new Error(`Local path does not exist: ${localPath}`);
+  }
+  
+  const isFile = fs.statSync(localPath).isFile();
+  const isDirectory = fs.statSync(localPath).isDirectory();
+  
+  console.log(`[UPLOAD] ========================================`);
+  console.log(`[UPLOAD] Uploading ${isFile ? 'file' : 'directory'} with rsync`);
+  console.log(`[UPLOAD] ========================================`);
+  console.log(`[UPLOAD] Local path: ${localPath}`);
+  console.log(`[UPLOAD] Remote path: ${username}@${host}:${remotePath}`);
+  
+  // Calculate size for logging
+  let totalSize = 0;
+  let fileCount = 0;
+  if (isFile) {
+    totalSize = fs.statSync(localPath).size;
+    fileCount = 1;
+  } else {
+    const getAllFiles = (dir) => {
+      const files = [];
+      try {
+        const entries = fs.readdirSync(dir, { withFileTypes: true });
+        for (const entry of entries) {
+          const fullPath = path.join(dir, entry.name);
+          if (entry.isDirectory()) {
+            files.push(...getAllFiles(fullPath));
+          } else if (!entry.name.startsWith('.')) {
+            files.push(fullPath);
+          }
+        }
+      } catch (error) {
+        console.error(`[UPLOAD] Error reading directory ${dir}:`, error.message);
+      }
+      return files;
+    };
+    const files = getAllFiles(localPath);
+    fileCount = files.length;
+    for (const file of files) {
+      try {
+        totalSize += fs.statSync(file).size;
+      } catch (e) {}
+    }
+  }
+  const totalSizeMB = (totalSize / (1024 * 1024)).toFixed(2);
+  console.log(`[UPLOAD] Size: ${fileCount} file(s), ${totalSizeMB} MB`);
+  
+  // Create SSH connection to ensure remote directory exists
+  const ssh = new NodeSSH();
+  const connectOptions = {
+    host: host,
+    port: sshPort,
+    username: username,
+    readyTimeout: 10000,
+  };
+  
+  if (sshKeyPath) {
+    try {
+      connectOptions.privateKey = fs.readFileSync(sshKeyPath, 'utf8');
+    } catch (error) {
+      console.warn(`[UPLOAD] Could not read SSH key: ${error.message}`);
+    }
+  }
+  
+  const preparedOptions = prepareSSHConnectionOptions(connectOptions);
+  await ssh.connect(preparedOptions);
+  
+  try {
+    // Create parent directory if it doesn't exist
+    const parentDir = path.dirname(remotePath).replace(/\\/g, '/');
+    console.log(`[UPLOAD] Creating parent directory: ${parentDir}`);
+    const mkdirResult = await ssh.execCommand(`mkdir -p "${parentDir}"`);
+    if (mkdirResult.code !== 0) {
+      throw new Error(`Failed to create parent directory: ${mkdirResult.stderr}`);
+    }
+    console.log(`[UPLOAD] ✓ Parent directory created`);
+  } finally {
+    ssh.dispose();
+  }
+  
+  // Upload using rsync with compression (-z flag)
+  await new Promise((resolve, reject) => {
+    const sshCommand = `ssh -p ${sshPort} -i "${sshKeyPath}" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR`;
+    
+    // For directories, ensure trailing slash to copy contents into remote directory
+    // For files, no trailing slash
+    const localRsyncPath = isDirectory ? `${localPath}/` : localPath;
+    
+    const rsyncArgs = [
+      '-avz', // -a: archive mode, -v: verbose, -z: compress during transfer
+      '--progress',
+      '--partial',
+      '--partial-dir=.rsync-partial',
+      '-e', sshCommand,
+      localRsyncPath,
+      `${username}@${host}:${remotePath}`
+    ];
+    
+    console.log(`[UPLOAD] Running: rsync ${rsyncArgs.join(' ')}`);
+    
+    const rsyncProcess = spawn('rsync', rsyncArgs, {
+      stdio: ['ignore', 'pipe', 'pipe']
     });
     
-    // Step 3: Extract the archive on remote server
-    console.log(`[UPLOAD] ========================================`);
-    console.log(`[UPLOAD] Step 3: Extracting archive on remote server`);
-    console.log(`[UPLOAD] ========================================`);
-    console.log(`[UPLOAD] Remote archive: ${remoteArchivePath}`);
-    console.log(`[UPLOAD] Remote destination: ${remotePath}`);
+    let stdout = '';
+    let stderr = '';
+    let lastProgressUpdate = Date.now();
     
-    // Create SSH connection for extraction
-    const ssh = new NodeSSH();
-    const connectOptions = {
-      host: host,
-      port: sshPort,
-      username: username,
-      readyTimeout: 10000,
-    };
-    
-    if (sshKeyPath) {
-      try {
-        connectOptions.privateKey = fs.readFileSync(sshKeyPath, 'utf8');
-      } catch (error) {
-        console.warn(`[UPLOAD] Could not read SSH key: ${error.message}`);
+    rsyncProcess.stdout.on('data', (data) => {
+      const output = data.toString();
+      stdout += output;
+      
+      // Parse rsync progress output
+      // Format: "filename\n  1,234,567  50%  123.45kB/s    0:00:10"
+      const lines = output.split('\n');
+      for (const line of lines) {
+        if (line.trim()) {
+          // Check if it's a progress line (contains %)
+          if (line.includes('%')) {
+            const now = Date.now();
+            // Log progress every 1 second for better visibility
+            if (now - lastProgressUpdate > 1000) {
+              const progressInfo = line.trim();
+              console.log(`[UPLOAD] [Progress] ${progressInfo}`);
+              if (onProgress) {
+                onProgress(progressInfo);
+              }
+              lastProgressUpdate = now;
+            }
+          } else if (!line.startsWith(' ') && line.trim()) {
+            // File name line
+            console.log(`[UPLOAD] Uploading: ${line.trim()}`);
+          }
+        }
       }
-    }
+    });
     
-    const preparedOptions = prepareSSHConnectionOptions(connectOptions);
-    await ssh.connect(preparedOptions);
-    console.log(`[UPLOAD] ✓ SSH connection established for extraction`);
-    
-    try {
-      // Create parent directory if it doesn't exist
-      const parentDir = path.dirname(remotePath).replace(/\\/g, '/');
-      console.log(`[UPLOAD] Creating parent directory: ${parentDir}`);
-      const mkdirResult = await ssh.execCommand(`mkdir -p "${parentDir}"`);
-      if (mkdirResult.code !== 0) {
-        throw new Error(`Failed to create parent directory: ${mkdirResult.stderr}`);
+    rsyncProcess.stderr.on('data', (data) => {
+      const output = data.toString();
+      stderr += output;
+      // rsync sends some info to stderr (like connection info)
+      if (!output.includes('Warning: Permanently added')) {
+        console.log(`[UPLOAD] ${output.trim()}`);
       }
-      console.log(`[UPLOAD] ✓ Parent directory created`);
-      
-      // Remove existing destination if it exists
-      console.log(`[UPLOAD] Removing existing destination (if any): ${remotePath}`);
-      await ssh.execCommand(`rm -rf "${remotePath}"`);
-      console.log(`[UPLOAD] ✓ Cleaned up existing destination`);
-      
-      // Extract the archive
-      console.log(`[UPLOAD] Extracting archive...`);
-      const extractCmd = `cd "${parentDir}" && tar -xzf "${remoteArchivePath}"`;
-      console.log(`[UPLOAD] Running: ${extractCmd}`);
-      const extractResult = await ssh.execCommand(extractCmd);
-      
-      if (extractResult.code !== 0) {
-        throw new Error(`Extraction failed: ${extractResult.stderr || 'Unknown error'}`);
-      }
-      console.log(`[UPLOAD] ✓ Archive extracted successfully`);
-      
-      // Verify extraction
-      console.log(`[UPLOAD] Verifying extracted files...`);
-      const verifyCmd = `test -d "${remotePath}" && echo "EXISTS" || echo "NOT_FOUND"`;
-      const verifyResult = await ssh.execCommand(verifyCmd);
-      if (!verifyResult.stdout.includes('EXISTS')) {
-        throw new Error(`Extraction verification failed: directory not found at ${remotePath}`);
-      }
-      console.log(`[UPLOAD] ✓ Extraction verified: ${remotePath} exists`);
-      
-      // Clean up remote archive
-      console.log(`[UPLOAD] Cleaning up remote archive...`);
-      await ssh.execCommand(`rm -f "${remoteArchivePath}"`);
-      console.log(`[UPLOAD] ✓ Remote archive cleaned up`);
-      
-    } finally {
-      ssh.dispose();
-    }
+    });
     
-    // Step 4: Clean up local archive
-    console.log(`[UPLOAD] ========================================`);
-    console.log(`[UPLOAD] Step 4: Cleaning up local archive`);
-    console.log(`[UPLOAD] ========================================`);
-    if (fs.existsSync(tempArchivePath)) {
-      fs.unlinkSync(tempArchivePath);
-      console.log(`[UPLOAD] ✓ Local archive cleaned up`);
-    }
-    
-    console.log(`[UPLOAD] ========================================`);
-    console.log(`[UPLOAD] ✓ All steps completed successfully`);
-    console.log(`[UPLOAD] ========================================`);
-    
-  } catch (error) {
-    // Clean up on error
-    if (archiveCreated && fs.existsSync(tempArchivePath)) {
-      try {
-        fs.unlinkSync(tempArchivePath);
-        console.log(`[UPLOAD] Cleaned up local archive after error`);
-      } catch (cleanupError) {
-        console.warn(`[UPLOAD] Could not clean up local archive: ${cleanupError.message}`);
+    rsyncProcess.on('close', (code) => {
+      if (code === 0) {
+        console.log(`[UPLOAD] ✓ Upload completed successfully`);
+        resolve({ stdout, stderr, code });
+      } else {
+        const error = new Error(`rsync failed with exit code ${code}`);
+        error.code = code;
+        error.stdout = stdout;
+        error.stderr = stderr;
+        console.error(`[UPLOAD] ✗ Upload failed: ${error.message}`);
+        if (stderr) {
+          console.error(`[UPLOAD] stderr: ${stderr}`);
+        }
+        reject(error);
       }
-    }
-    throw error;
-  }
+    });
+    
+    rsyncProcess.on('error', (error) => {
+      console.error(`[UPLOAD] ✗ Failed to start rsync: ${error.message}`);
+      reject(error);
+    });
+  });
+  
+  console.log(`[UPLOAD] ========================================`);
+  console.log(`[UPLOAD] ✓ Upload completed successfully`);
+  console.log(`[UPLOAD] ========================================`);
 }
 
 // Establish SSH tunnel for port forwarding
@@ -690,11 +782,20 @@ ipcMain.handle('get-profile-versions', async (event, profileName) => {
         }
         
         if (foundPath && hasEssentialFiles) {
+          // Check for merged base model (exists for V2+)
+          const mergedBasePath = path.join(versionDir, 'merged_base_model');
+          const hasMergedBase = fs.existsSync(mergedBasePath) && fs.readdirSync(mergedBasePath).length > 0;
+          
           versions.push({
             version: versionNum,
             path: foundPath,
+            mergedBasePath: hasMergedBase ? mergedBasePath : null,
             exists: true
           });
+          
+          if (hasMergedBase) {
+            console.log(`[APP] ✓ Version ${versionNum} has merged base model at: ${mergedBasePath}`);
+          }
         } else {
           console.log(`[APP] Version ${versionNum} directory exists but no valid adapter weights found in any expected location`);
         }
@@ -1223,7 +1324,7 @@ ipcMain.handle('configure-caddy-auth', async (event, { host, port, username = 'r
 });
 
 // Initialize Inference Environment - comprehensive setup
-ipcMain.handle('initialize-inference-environment', async (event, { host, port, username = 'root', profileName, baseModel, versions, inferenceUrl, vllmUrl, externalPort, internalPort }) => {
+ipcMain.handle('initialize-inference-environment', async (event, { host, port, username = 'root', profileName, baseModel, versions, inferenceUrl, vllmUrl, externalPort, internalPort, useBaseModel }) => {
   // Determine ports: use provided values or defaults
   const internalPortValue = internalPort || 8080; // Default internal port for server
   const externalPortValue = externalPort || null; // External port for API calls
@@ -1705,266 +1806,224 @@ except Exception as e:
       }
       console.log(`[INIT] ✓ Created directory: ${remoteModelDir}`);
       
-      // Upload each version
-      for (const version of versions) {
-        if (!version.exists) {
-          console.log(`[INIT] ⚠ Skipping V${version.version} - not found locally`);
-          continue;
-        }
-        
+      // Process all selected versions (sorted by version number)
+      const sortedVersions = versions.filter(v => v && v.exists).sort((a, b) => a.version - b.version);
+      
+      for (const version of sortedVersions) {
         const versionName = `V${version.version}`;
         const remoteVersionDir = `${remoteModelDir}/${versionName}`;
         const remoteAdapterPath = `${remoteVersionDir}/adapter`;
         
+        console.log(`\n[INIT] ========================================`);
+        console.log(`[INIT] Processing ${versionName}`);
         console.log(`[INIT] ========================================`);
-        console.log(`[INIT] Starting upload for ${versionName}`);
-        console.log(`[INIT] Local path: ${version.path}`);
-        console.log(`[INIT] Remote path: ${remoteAdapterPath}`);
-        console.log(`[INIT] SSH connection: ${ssh.isConnected ? 'connected' : 'DISCONNECTED'}`);
-        console.log(`[INIT] ========================================`);
-        results.steps.push(`Uploading ${versionName} adapter...`);
+        results.steps.push(`Processing ${versionName}...`);
         
-        try {
-          // Verify local path exists
-          if (!fs.existsSync(version.path)) {
-            throw new Error(`Local adapter path does not exist: ${version.path}`);
-          }
-          console.log(`[INIT] ✓ Local path verified: ${version.path}`);
-          
-          // Verify essential adapter files exist before upload
-          const essentialFiles = [
-            'adapter_config.json',
-            'adapter_model.safetensors',
-            'adapter_model.bin'
-          ];
-          
-          const foundEssentialFiles = essentialFiles.filter(fileName => {
-            const filePath = path.join(version.path, fileName);
-            return fs.existsSync(filePath);
-          });
-          
-          if (foundEssentialFiles.length === 0) {
-            throw new Error(`No essential adapter files found in ${version.path}. Expected at least one of: ${essentialFiles.join(', ')}`);
-          }
-          
-          console.log(`[INIT] ✓ Found essential files: ${foundEssentialFiles.join(', ')}`);
-          
-          // Verify SSH connection before proceeding
-          if (!ssh.isConnected) {
-            throw new Error('SSH connection lost before upload. Please reconnect.');
-          }
-          
-          // Create remote directory
-          console.log(`[INIT] Creating remote directory: ${remoteVersionDir}`);
-          const mkdirResult = await ssh.execCommand(`mkdir -p ${remoteVersionDir}`);
-          if (mkdirResult.code !== 0) {
-            throw new Error(`Failed to create remote directory: ${mkdirResult.stderr || 'Unknown error'}`);
-          }
-          console.log(`[INIT] ✓ Remote directory created`);
-          
-          // Calculate total size and file count before upload
-          const getAllFiles = (dir) => {
-            const files = [];
-            try {
-              const entries = fs.readdirSync(dir, { withFileTypes: true });
-              for (const entry of entries) {
-                const fullPath = path.join(dir, entry.name);
-                if (entry.isDirectory()) {
-                  files.push(...getAllFiles(fullPath));
-                } else if (!entry.name.startsWith('.') && entry.name !== 'node_modules') {
-                  files.push(fullPath);
-                }
-              }
-            } catch (error) {
-              console.error(`[INIT] Error reading directory ${dir}:`, error.message);
-            }
-            return files;
-          };
-          
-          const allFiles = getAllFiles(version.path);
-          
-          if (allFiles.length === 0) {
-            throw new Error(`No files found in adapter directory: ${version.path}`);
-          }
-          let totalSize = 0;
-          const localFileSizes = new Map(); // Map of relative path -> size
-          
-          for (const file of allFiles) {
-            try {
-              const stats = fs.statSync(file);
-              totalSize += stats.size;
-              const relativePath = path.relative(version.path, file).replace(/\\/g, '/');
-              localFileSizes.set(relativePath, stats.size);
-            } catch (e) {
-              // Ignore errors
-            }
-          }
-          
-          const totalSizeMB = (totalSize / (1024 * 1024)).toFixed(2);
-          console.log(`[INIT] ${versionName} adapter: ${allFiles.length} file(s), ${totalSizeMB} MB total`);
-          
-          // Check if files already exist on server with matching sizes
-          console.log(`[INIT] [CHECK] Checking if ${versionName} adapter already exists on server...`);
-          let allFilesMatch = true;
-          let filesToUpload = [];
-          
-          for (const localFile of allFiles) {
-            const relativePath = path.relative(version.path, localFile).replace(/\\/g, '/');
-            const remoteFile = path.join(remoteAdapterPath, relativePath).replace(/\\/g, '/');
-            const localSize = localFileSizes.get(relativePath);
-            
-            try {
-              // Check if file exists and get its size
-              const sizeCheckCmd = `stat -c %s "${remoteFile}" 2>/dev/null || echo "NOT_FOUND"`;
-              const sizeCheckResult = await ssh.execCommand(sizeCheckCmd);
-              
-              if (sizeCheckResult.stdout.trim() === 'NOT_FOUND' || sizeCheckResult.code !== 0) {
-                console.log(`[INIT] [CHECK] File not found on server: ${relativePath}`);
-                allFilesMatch = false;
-                filesToUpload.push(localFile);
-              } else {
-                const remoteSize = parseInt(sizeCheckResult.stdout.trim());
-                if (isNaN(remoteSize) || remoteSize !== localSize) {
-                  console.log(`[INIT] [CHECK] Size mismatch for ${relativePath}: local=${localSize}, remote=${remoteSize}`);
-                  allFilesMatch = false;
-                  filesToUpload.push(localFile);
-                } else {
-                  console.log(`[INIT] [CHECK] ✓ File matches: ${relativePath} (${localSize} bytes)`);
-                }
-              }
-            } catch (checkError) {
-              console.log(`[INIT] [CHECK] Error checking file ${relativePath}: ${checkError.message}`);
-              allFilesMatch = false;
-              filesToUpload.push(localFile);
-            }
-          }
-          
-          if (allFilesMatch && filesToUpload.length === 0) {
-            console.log(`[INIT] ✓ ${versionName} adapter already exists on server with matching file sizes - skipping upload`);
-            console.log(`[INIT] [CHECK] Summary: All ${allFiles.length} files match, no upload needed`);
-            results.steps.push(`✓ ${versionName} adapter already exists - skipped upload`);
-            continue; // Skip to next version
-          }
-          
-          // Log summary of file check results
-          const existingCount = allFiles.length - filesToUpload.length;
-          console.log(`[INIT] [CHECK] Summary: ${existingCount}/${allFiles.length} files already exist, ${filesToUpload.length} files need upload`);
-          
-          const filesToUploadCount = filesToUpload.length;
-          const filesToUploadSize = filesToUpload.reduce((sum, file) => {
-            try {
-              const stats = fs.statSync(file);
-              return sum + stats.size;
-            } catch (e) {
-              return sum;
-            }
-          }, 0);
-          const filesToUploadSizeMB = (filesToUploadSize / (1024 * 1024)).toFixed(2);
-          
-          if (filesToUploadCount < allFiles.length) {
-            console.log(`[INIT] ${versionName} adapter: ${filesToUploadCount}/${allFiles.length} files need upload (${filesToUploadSizeMB} MB)`);
-            results.steps.push(`Uploading ${versionName} adapter (${filesToUploadCount}/${allFiles.length} files, ${filesToUploadSizeMB} MB)...`);
-          } else {
-          console.log(`[INIT] Starting upload of ${versionName} adapter...`);
-          results.steps.push(`Uploading ${versionName} adapter (${allFiles.length} files, ${totalSizeMB} MB)...`);
-          }
-          
-          // Upload using rsync (handles incremental transfers, progress, and checksums automatically)
-          const uploadSshKeyPath = findSSHKey();
-          if (!uploadSshKeyPath) {
-            throw new Error('SSH key not found - cannot use rsync');
-          }
-          
-          const uploadSshPort = port || 22;
-          let uploadSuccess = false;
-          let uploadAttempts = 0;
-          const maxUploadAttempts = 3;
-          
-          while (!uploadSuccess && uploadAttempts < maxUploadAttempts) {
-            uploadAttempts++;
-            
-            if (uploadAttempts > 1) {
-              console.log(`[INIT] Retrying ${versionName} upload with rsync (attempt ${uploadAttempts}/${maxUploadAttempts})...`);
-              results.steps.push(`Retrying ${versionName} upload (attempt ${uploadAttempts}/${maxUploadAttempts})...`);
-              await new Promise(resolve => setTimeout(resolve, 3000)); // Wait before retry
-            }
-            
-            try {
-              // Progress callback for rsync
-              let lastProgressStep = '';
-              const progressCallback = (progressLine) => {
-                // Log progress to console
-                console.log(`[INIT] [${versionName} Upload Progress] ${progressLine}`);
-                
-                // Update progress step
-                const progressStep = `Uploading ${versionName} adapter... ${progressLine}`;
-                if (progressStep !== lastProgressStep) {
-                  const lastStepIndex = results.steps.length - 1;
-                  if (lastStepIndex >= 0 && results.steps[lastStepIndex].includes('Uploading') && results.steps[lastStepIndex].includes(versionName)) {
-                    results.steps[lastStepIndex] = progressStep;
-                  } else {
-                    results.steps.push(progressStep);
-                  }
-                  lastProgressStep = progressStep;
-                }
-              };
-              
-              // Use rsync to upload (rsync handles incremental transfers automatically)
-              await uploadAdapterWithRsync(
-                version.path,
-                remoteAdapterPath,
-                host,
-                uploadSshPort,
-                username,
-                uploadSshKeyPath,
-                progressCallback
-              );
-              
-              uploadSuccess = true;
-              console.log(`[INIT] ✓ ${versionName} adapter uploaded successfully with rsync`);
-              results.steps.push(`✓ ${versionName} adapter uploaded (${allFiles.length} files, ${totalSizeMB} MB)`);
-              
-            } catch (uploadError) {
-              const errorMsg = uploadError.message || String(uploadError);
-              const errorName = uploadError.name || 'UnknownError';
-              
-              console.error(`[INIT] ========================================`);
-              console.error(`[INIT] rsync upload failed (attempt ${uploadAttempts}/${maxUploadAttempts})`);
-              console.error(`[INIT] Error name: ${errorName}`);
-              console.error(`[INIT] Error message: ${errorMsg}`);
-              console.error(`[INIT] ========================================`);
-              
-              // Check if it's a connection error that we can retry
-              const errorMsgLower = errorMsg.toLowerCase();
-              const isConnectionError = errorMsgLower.includes('connection') || 
-                                       errorMsgLower.includes('timeout') ||
-                                       errorMsgLower.includes('refused') ||
-                                       errorMsgLower.includes('network') ||
-                                       errorMsgLower.includes('host') ||
-                                       errorMsgLower.includes('no route');
-              
-              if (isConnectionError && uploadAttempts < maxUploadAttempts) {
-                console.log(`[INIT] Connection error detected, will retry after delay...`);
-                results.steps.push(`⚠ Connection error on attempt ${uploadAttempts}, retrying...`);
-                continue;
-              } else {
-                // Not a retryable error or max attempts reached
-                const finalErrorMsg = `Failed to upload ${versionName} adapter after ${uploadAttempts} attempt(s): ${errorName} - ${errorMsg}`;
-                console.error(`[INIT] ✗ ${finalErrorMsg}`);
-                results.errors.push(finalErrorMsg);
-                results.steps.push(`✗ ${finalErrorMsg}`);
-                throw new Error(finalErrorMsg);
-              }
-            }
-          }
-          
-        } catch (uploadError) {
-          const errorMsg = `Failed to upload ${versionName} adapter: ${uploadError.message}`;
+        // Verify local paths exist
+        if (!fs.existsSync(version.path)) {
+          const errorMsg = `Local adapter path does not exist for ${versionName}: ${version.path}`;
           console.error(`[INIT] ✗ ${errorMsg}`);
           results.errors.push(errorMsg);
           results.steps.push(`✗ ${errorMsg}`);
-          ssh.dispose();
-          return results;
+          continue;
+        }
+        
+        const hasMergedBase = version.mergedBasePath && fs.existsSync(version.mergedBasePath);
+        
+        if (version.version === 1) {
+          // V1: Upload just adapter weights
+          console.log(`[INIT] ${versionName} is V1 - uploading adapter only`);
+          results.steps.push(`Preparing ${versionName} adapter for upload...`);
+          
+          try {
+            const uploadSshKeyPath = findSSHKey();
+            const uploadSshPort = port || 22;
+            
+            // Calculate adapter size for logging
+            const getAllFiles = (dir) => {
+              const files = [];
+              try {
+                const entries = fs.readdirSync(dir, { withFileTypes: true });
+                for (const entry of entries) {
+                  const fullPath = path.join(dir, entry.name);
+                  if (entry.isDirectory()) {
+                    files.push(...getAllFiles(fullPath));
+                  } else if (!entry.name.startsWith('.')) {
+                    files.push(fullPath);
+                  }
+                }
+              } catch (error) {
+                console.error(`[INIT] Error reading directory ${dir}:`, error.message);
+              }
+              return files;
+            };
+            
+            const adapterFiles = getAllFiles(version.path);
+            let adapterSize = 0;
+            for (const file of adapterFiles) {
+              try {
+                adapterSize += fs.statSync(file).size;
+              } catch (e) {}
+            }
+            const adapterSizeMB = (adapterSize / (1024 * 1024)).toFixed(2);
+            
+            console.log(`[INIT] ${versionName} adapter: ${adapterFiles.length} files, ${adapterSizeMB} MB`);
+            results.steps.push(`Uploading ${versionName} adapter (${adapterFiles.length} files, ${adapterSizeMB} MB)...`);
+            
+            await uploadAdapterWithRsync(
+              version.path,
+              remoteAdapterPath,
+              host,
+              uploadSshPort,
+              username,
+              uploadSshKeyPath,
+              (progressLine) => {
+                console.log(`[INIT] [${versionName} Upload Progress] ${progressLine}`);
+                const lastStepIndex = results.steps.length - 1;
+                if (lastStepIndex >= 0 && results.steps[lastStepIndex].includes(versionName)) {
+                  results.steps[lastStepIndex] = `Uploading ${versionName} adapter (${adapterSizeMB} MB)... ${progressLine}`;
+                } else {
+                  results.steps.push(`Uploading ${versionName} adapter... ${progressLine}`);
+                }
+              }
+            );
+            
+            console.log(`[INIT] ✓ ${versionName} adapter uploaded successfully`);
+            results.steps.push(`✓ ${versionName} adapter uploaded`);
+          } catch (uploadError) {
+            const errorMsg = `Failed to upload ${versionName} adapter: ${uploadError.message}`;
+            console.error(`[INIT] ✗ ${errorMsg}`);
+            results.errors.push(errorMsg);
+            results.steps.push(`✗ ${errorMsg}`);
+          }
+        } else if (hasMergedBase) {
+          // V2+: Upload merged_base_model and adapter separately using rsync
+          console.log(`[INIT] ${versionName} is V${version.version} with merged base - uploading merged base model and adapter separately`);
+          results.steps.push(`Uploading ${versionName} (merged base + adapter)...`);
+          
+          try {
+            const uploadSshKeyPath = findSSHKey();
+            const uploadSshPort = port || 22;
+            
+            // Upload merged base model first
+            const remoteMergedBasePath = `${remoteVersionDir}/merged_base_model`;
+            console.log(`[INIT] Uploading merged base model from: ${version.mergedBasePath}`);
+            console.log(`[INIT] Remote merged base model path: ${remoteMergedBasePath}`);
+            results.steps.push(`Uploading merged base model for ${versionName}...`);
+            
+            await uploadAdapterWithRsync(
+              version.mergedBasePath,
+              remoteMergedBasePath,
+              host,
+              uploadSshPort,
+              username,
+              uploadSshKeyPath,
+              (progressLine) => {
+                console.log(`[INIT] [${versionName} Merged Base Upload Progress] ${progressLine}`);
+                const lastStepIndex = results.steps.length - 1;
+                if (lastStepIndex >= 0 && results.steps[lastStepIndex].includes('merged base model')) {
+                  results.steps[lastStepIndex] = `Uploading merged base model for ${versionName}... ${progressLine}`;
+                }
+              }
+            );
+            
+            console.log(`[INIT] ✓ Merged base model uploaded for ${versionName}`);
+            results.steps.push(`✓ Merged base model uploaded for ${versionName}`);
+            
+            // Upload adapter
+            console.log(`[INIT] Uploading adapter for ${versionName}...`);
+            results.steps.push(`Uploading adapter for ${versionName}...`);
+            
+            await uploadAdapterWithRsync(
+              version.path,
+              remoteAdapterPath,
+              host,
+              uploadSshPort,
+              username,
+              uploadSshKeyPath,
+              (progressLine) => {
+                console.log(`[INIT] [${versionName} Adapter Upload Progress] ${progressLine}`);
+                const lastStepIndex = results.steps.length - 1;
+                if (lastStepIndex >= 0 && results.steps[lastStepIndex].includes('adapter')) {
+                  results.steps[lastStepIndex] = `Uploading adapter for ${versionName}... ${progressLine}`;
+                }
+              }
+            );
+            
+            console.log(`[INIT] ✓ ${versionName} (merged base + adapter) uploaded successfully`);
+            results.steps.push(`✓ ${versionName} (merged base + adapter) uploaded`);
+          } catch (uploadError) {
+            const errorMsg = `Failed to upload ${versionName}: ${uploadError.message}`;
+            console.error(`[INIT] ✗ ${errorMsg}`);
+            results.errors.push(errorMsg);
+            results.steps.push(`✗ ${errorMsg}`);
+          }
+        } else {
+          // V2+ but no merged base model - upload adapter only
+          console.log(`[INIT] ${versionName} is V${version.version} but no merged base model found - uploading adapter only`);
+          results.steps.push(`Preparing ${versionName} adapter for upload...`);
+          
+          try {
+            const uploadSshKeyPath = findSSHKey();
+            const uploadSshPort = port || 22;
+            
+            // Calculate adapter size for logging
+            const getAllFiles = (dir) => {
+              const files = [];
+              try {
+                const entries = fs.readdirSync(dir, { withFileTypes: true });
+                for (const entry of entries) {
+                  const fullPath = path.join(dir, entry.name);
+                  if (entry.isDirectory()) {
+                    files.push(...getAllFiles(fullPath));
+                  } else if (!entry.name.startsWith('.')) {
+                    files.push(fullPath);
+                  }
+                }
+              } catch (error) {
+                console.error(`[INIT] Error reading directory ${dir}:`, error.message);
+              }
+              return files;
+            };
+            
+            const adapterFiles = getAllFiles(version.path);
+            let adapterSize = 0;
+            for (const file of adapterFiles) {
+              try {
+                adapterSize += fs.statSync(file).size;
+              } catch (e) {}
+            }
+            const adapterSizeMB = (adapterSize / (1024 * 1024)).toFixed(2);
+            
+            console.log(`[INIT] ${versionName} adapter: ${adapterFiles.length} files, ${adapterSizeMB} MB`);
+            results.steps.push(`Uploading ${versionName} adapter (${adapterFiles.length} files, ${adapterSizeMB} MB)...`);
+            
+            await uploadAdapterWithRsync(
+              version.path,
+              remoteAdapterPath,
+              host,
+              uploadSshPort,
+              username,
+              uploadSshKeyPath,
+              (progressLine) => {
+                console.log(`[INIT] [${versionName} Upload Progress] ${progressLine}`);
+                const lastStepIndex = results.steps.length - 1;
+                if (lastStepIndex >= 0 && results.steps[lastStepIndex].includes(versionName)) {
+                  results.steps[lastStepIndex] = `Uploading ${versionName} adapter (${adapterSizeMB} MB)... ${progressLine}`;
+                } else {
+                  results.steps.push(`Uploading ${versionName} adapter... ${progressLine}`);
+                }
+              }
+            );
+            
+            console.log(`[INIT] ✓ ${versionName} adapter uploaded successfully`);
+            results.steps.push(`✓ ${versionName} adapter uploaded`);
+          } catch (uploadError) {
+            const errorMsg = `Failed to upload ${versionName} adapter: ${uploadError.message}`;
+            console.error(`[INIT] ✗ ${errorMsg}`);
+            results.errors.push(errorMsg);
+            results.steps.push(`✗ ${errorMsg}`);
+          }
         }
       }
       
@@ -2391,10 +2450,19 @@ except Exception as e:
     // Store model info for chat interface (only if profileName is provided)
     if (profileName) {
       const remoteModelDir = `/workspace/models/${profileName}`;
+      // Store only the highest version info (automatically selected)
+      const sortedVersions = versions && versions.length > 0 ? versions.filter(v => v.exists).sort((a, b) => b.version - a.version) : [];
+      const highestVersion = sortedVersions.length > 0 ? sortedVersions[0] : null;
+      
       storedModelInfo = {
         profileName: profileName,
         baseModel: actualBaseModel, // Use the actual base model (expanded from short name)
         modelDir: remoteModelDir,
+        highestVersion: highestVersion ? {
+          version: highestVersion.version,
+          adapterPath: `${remoteModelDir}/V${highestVersion.version}/adapter`,
+          mergedBasePath: highestVersion.mergedBasePath ? `${remoteModelDir}/V${highestVersion.version}/merged_base_model` : null
+        } : null,
         versions: versions ? versions.map(v => ({
           version: v.version,
           adapterPath: `${remoteModelDir}/V${v.version}/adapter`

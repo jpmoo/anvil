@@ -264,7 +264,7 @@ class AxolotlDataPrep:
                               lora_alpha: int = 16,
                               lora_dropout: float = 0.05,
                               learning_rate: float = 2e-4,
-                              num_epochs: int = 10,
+                              num_epochs: Optional[int] = None,
                               batch_size: int = 4,
                               gradient_accumulation_steps: int = 4,
                               max_steps: Optional[int] = None,
@@ -370,7 +370,6 @@ class AxolotlDataPrep:
             # We set both micro_batch_size and gradient_accumulation_steps to satisfy this requirement
             "micro_batch_size": batch_size,
             "gradient_accumulation_steps": gradient_accumulation_steps,
-            "num_epochs": num_epochs,
             "optimizer": "adamw_torch",
             "lr_scheduler": "cosine",
             "learning_rate": learning_rate,
@@ -397,28 +396,27 @@ class AxolotlDataPrep:
             "dataloader_num_workers": 4
         }
         
+        # Only set num_epochs if explicitly provided (None means auto-calculate)
+        if num_epochs is not None:
+            config["num_epochs"] = num_epochs
+            # CRITICAL: Remove max_steps if present, as it would override num_epochs
+            # Axolotl uses max_steps if both are set, so we must remove it to ensure epochs are respected
+            if "max_steps" in config:
+                del config["max_steps"]
+        
         # Only add model_type if we want to explicitly set it
         # For Gemma 3, we let Axolotl/transformers auto-detect the correct model type
         if use_model_type:
             config["model_type"] = model_type
         
-        # Load previous adapter if provided (for incremental training V2+)
-        # When previous_adapter_path is set, Axolotl will:
-        # 1. Load the adapter from that path
-        # 2. Continue training from those weights (incremental/cumulative training)
-        # 3. Save new adapters separately (due to merge_lora: false)
-        # The merge_lora: false setting does NOT interfere with loading - it only prevents merging during save
-        if previous_adapter_path:
-            config["adapter"] = previous_adapter_path
-            # Also set lora_model_dir to the previous adapter path for explicit incremental training
-            # This ensures Axolotl knows to load and continue from this adapter
-            config["lora_model_dir"] = previous_adapter_path
-        else:
-            # For new LoRA training: Set adapter: "lora" to explicitly enable LoRA mode
-            # Axolotl requires adapter: "lora" to enable LoRA, not just lora_* parameters
-            # We do NOT set lora_model_dir to output_dir (that causes path loading errors)
-            # The lora_out_dir parameter ensures adapters are saved to output_dir/adapter/
-            config["adapter"] = "lora"
+        # Handle adapter configuration
+        # NEW APPROACH: For incremental training, we merge the previous adapter into the base model
+        # before training starts, rather than stacking adapters. This means:
+        # 1. Previous adapter will be merged into base model (done pre-training)
+        # 2. Config will use merged model as base_model
+        # 3. Fresh LoRA training starts on the merged model
+        # So we always set adapter: "lora" here - the merge happens before training starts
+        config["adapter"] = "lora"
         
         if output_path:
             import yaml

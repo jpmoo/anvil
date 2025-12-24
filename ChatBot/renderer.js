@@ -62,7 +62,11 @@ function normalizeBehaviorPack(pack) {
 
 // === Behavior-pack–driven style helpers ===
 
-// Infer conversation phase based on assistant turn count
+// Track the highest phase reached (persists across turns and page reloads)
+let highestPhaseReached = 'reflection';
+
+// Infer conversation phase based on assistant turn count, but only progress forward
+// Flow: reflection → sensemaking → structuring → stay there
 function inferConversationPhase(conversationHistory, behaviorPack) {
   if (!behaviorPack?.conversation_phase) {
     return "reflection";
@@ -72,9 +76,35 @@ function inferConversationPhase(conversationHistory, behaviorPack) {
     m => m.role === "assistant"
   ).length;
 
-  if (assistantTurns === 0) return "reflection";
-  if (assistantTurns === 1) return "sensemaking";
-  return "structuring";
+  // Determine target phase based on turn count
+  let targetPhase = "reflection";
+  if (assistantTurns === 0) {
+    targetPhase = "reflection";
+  } else if (assistantTurns === 1) {
+    targetPhase = "sensemaking";
+  } else {
+    targetPhase = "structuring";
+  }
+
+  // Only progress forward - never go backwards
+  // Once we reach structuring, stay there
+  const phaseOrder = { 'reflection': 1, 'sensemaking': 2, 'structuring': 3 };
+  const targetOrder = phaseOrder[targetPhase] || 1;
+  const currentOrder = phaseOrder[highestPhaseReached] || 1;
+
+  if (targetOrder > currentOrder) {
+    // Progress forward
+    const oldPhase = highestPhaseReached;
+    highestPhaseReached = targetPhase;
+    console.log(`[PHASE] Progressed to ${targetPhase} (from ${oldPhase})`);
+    // Save the updated phase
+    saveConfig();
+  } else if (targetOrder < currentOrder) {
+    // Don't go backwards - use the highest phase reached
+    console.log(`[PHASE] Staying at ${highestPhaseReached} (target was ${targetPhase}, but we don't go backwards)`);
+  }
+
+  return highestPhaseReached;
 }
 
 // Build a system message from the loaded behavior pack, if present
@@ -211,33 +241,73 @@ function formatWorkingMemoryForPrompt() {
 // Fix 1 & 2: Compress conversation history - remove full assistant responses
 // Replace with semantic summaries via Shared Understanding block (injected in system prompt)
 // Preserve meaning, not phrasing. Keep only user messages to avoid lexical reuse.
-function compressConversationHistory(history) {
+function compressConversationHistory(history, currentUserMessage = '') {
   if (!Array.isArray(history) || history.length === 0) {
     return [];
+  }
+  
+  // Check if current user message contains pronouns or indexicals
+  // Pronouns: he, she, it, they, him, her, them, his, hers, its, their, this, that, these, those
+  // Indexicals: this, that, these, those, here, there, now, then
+  const pronounIndexicalPattern = /\b(he|she|it|they|him|her|them|his|hers|its|their|this|that|these|those|here|there|now|then)\b/gi;
+  const hasPronounsOrIndexicals = currentUserMessage && pronounIndexicalPattern.test(currentUserMessage);
+  
+  if (hasPronounsOrIndexicals) {
+    console.log(`[COMPRESS] Current user message contains pronouns/indexicals, preserving at least one assistant turn for context`);
   }
   
   // Remove all assistant messages - their semantic content is already captured in:
   // 1. Shared Understanding block (established facts/patterns)
   // 2. Working memory summary (rolling context)
   // This prevents Mistral from reusing exact phrases from prior assistant responses
-  const compressed = history.filter(msg => msg.role === 'user');
+  // EXCEPTION: If current message has pronouns/indexicals, preserve the most recent assistant message
+  let compressed = [];
+  let preservedAssistant = null;
   
-  // CRITICAL: Remove ALL trailing user messages, since we're about to add a new user message
+  if (hasPronounsOrIndexicals) {
+    // Find the most recent assistant message to preserve for context
+    for (let i = history.length - 1; i >= 0; i--) {
+      if (history[i].role === 'assistant') {
+        preservedAssistant = history[i];
+        console.log(`[COMPRESS] Preserving assistant message at index ${i} for pronoun/indexical context`);
+        break;
+      }
+    }
+  }
+  
+  // Filter to user messages
+  compressed = history.filter(msg => msg.role === 'user');
+  
+  // CRITICAL: Remove only the LAST trailing user message, since we're about to add a new user message
   // This prevents consecutive user messages which would violate the message sequence validation
   // The last user message will be added fresh as part of the current request
-  // Since we filtered to only user messages, all messages are user messages, so we remove all trailing ones
+  // We keep all other user messages for context - only remove the very last one
   const originalCompressedLength = compressed.length;
   let removedUserCount = 0;
-  while (compressed.length > 0 && compressed[compressed.length - 1].role === 'user') {
+  if (compressed.length > 0 && compressed[compressed.length - 1].role === 'user') {
     compressed.pop();
-    removedUserCount++;
-  }
-  if (removedUserCount > 0) {
-    console.log(`[COMPRESS] Removed ${removedUserCount} trailing user message(s) from compressed history to prevent duplicate user role`);
+    removedUserCount = 1;
+    console.log(`[COMPRESS] Removed last user message from compressed history to prevent duplicate user role`);
   }
   
-  const assistantCount = history.length - originalCompressedLength;
-  console.log(`[COMPRESS] Compressed history: ${history.length} messages -> ${compressed.length} messages (removed ${assistantCount} assistant messages + ${removedUserCount} trailing user message(s))`);
+  // If we preserved an assistant message, insert it appropriately to maintain alternating pattern
+  // The pattern should be: assistant -> user -> assistant -> user...
+  // So if we have user messages, insert assistant before the first user message
+  if (preservedAssistant) {
+    if (compressed.length > 0) {
+      // Insert before first user message to maintain: assistant -> user -> user -> ... pattern
+      // But we need to ensure it doesn't create consecutive assistants, so check the last message before insertion
+      compressed.unshift(preservedAssistant);
+      console.log(`[COMPRESS] Inserted preserved assistant message before user messages for pronoun/indexical context`);
+    } else {
+      // No user messages, just add the assistant
+      compressed.push(preservedAssistant);
+    }
+  }
+  
+  const assistantCount = history.length - originalCompressedLength - (preservedAssistant ? 1 : 0);
+  const preservedCount = preservedAssistant ? 1 : 0;
+  console.log(`[COMPRESS] Compressed history: ${history.length} messages -> ${compressed.length} messages (removed ${assistantCount} assistant messages + ${removedUserCount} last user message${preservedCount > 0 ? `, preserved ${preservedCount} assistant message for context` : ''})`);
   
   return compressed;
 }
@@ -284,7 +354,7 @@ function getStyleRules() {
 
 function violatesOpeningRules(text) {
   // Disabled for Mistral: opening behavior is enforced via training + behavior pack
-  return false;
+      return false;
 }
 
 function escapeRegExp(str) {
@@ -349,7 +419,7 @@ async function kickoffConversationIfEmpty() {
 
     const result = await window.electronAPI.sendChatMessage({
       message: kickoffPrompt,
-      version: document.getElementById('versionSelect')?.value || 'base',
+      version: window._autoSelectedVersion || 'base',
       prependedText: wrapSystemBlocks(combinedSystem, pendingExemplarSystemTexts),
       useSummary: false,
       conversationSummary: '',
@@ -750,8 +820,9 @@ async function saveConfig() {
       conversationSummary: conversationSummary || '', // Save summary for backward compatibility
       conversationWorkingMemory: conversationWorkingMemory || { summary: '', key_threads: [] }, // Save working memory
       sharedUnderstanding: sharedUnderstanding || [], // Save shared understanding
+      highestPhaseReached: highestPhaseReached || 'reflection', // Save the highest phase reached
       selectedProfile: profileSelect ? profileSelect.value : '', // Save selected profile
-      selectedVersion: versionSelect ? versionSelect.value : 'base' // Save selected version (default to 'base')
+      selectedVersion: window._autoSelectedVersion || 'base' // Auto-selected highest version (default to 'base')
       // Token is not saved - it's retrieved automatically during setup
     };
     
@@ -845,6 +916,15 @@ async function loadConfig() {
             addMessage(msg.role, msg.content, false); // Add to UI but don't add to history again
           });
         }
+      }
+      
+      // Load highest phase reached
+      if (config.highestPhaseReached !== undefined) {
+        highestPhaseReached = config.highestPhaseReached;
+        console.log('[CONFIG] Loaded highest phase reached:', highestPhaseReached);
+      } else {
+        // Reset to reflection if not found (new conversation or old config)
+        highestPhaseReached = 'reflection';
       }
       
       // Load conversation summary (backward compatibility)
@@ -975,11 +1055,12 @@ window.addEventListener('DOMContentLoaded', async () => {
   if (clearChatBtn) {
     clearChatBtn.addEventListener('click', async () => {
       conversationHistory = [];
+      highestPhaseReached = 'reflection'; // Reset phase when clearing conversation
       const chatMessages = document.getElementById('chatMessages');
       if (chatMessages) {
         chatMessages.innerHTML = '';
       }
-      console.log('[CHAT] Conversation history cleared');
+      console.log('[CHAT] Conversation history cleared, phase reset to reflection');
 
       // Save config to persist the cleared history
       saveConfig();
@@ -1142,7 +1223,7 @@ async function handleProfileChange(event) {
     selectedProfile = null;
     profileVersions = [];
     document.getElementById('profileInfo').textContent = '';
-    document.getElementById('versionsSection').style.display = 'none';
+    document.getElementById('modelSelectionSection').style.display = 'none';
     updateButtonStates();
     return;
   }
@@ -1179,24 +1260,47 @@ async function handleProfileChange(event) {
 }
 
 function displayVersions() {
-  const versionsList = document.getElementById('versionsList');
-  const versionsSection = document.getElementById('versionsSection');
+  const modelSelect = document.getElementById('modelSelect');
+  const modelSelectionSection = document.getElementById('modelSelectionSection');
   
-  console.log('[VERSIONS] Displaying versions, count:', profileVersions.length);
+  console.log('[VERSIONS] Displaying models, version count:', profileVersions.length);
   
-  if (profileVersions.length === 0) {
-    versionsList.innerHTML = '<div class="version-item">No versions found for this profile</div>';
-    versionsSection.style.display = 'block';
-    console.log('[VERSIONS] No versions found - Prepare button will be disabled');
+  if (!modelSelect) {
+    console.error('[VERSIONS] Model select element not found');
     return;
   }
   
-  versionsList.innerHTML = profileVersions.map(v => 
-    `<div class="version-item">✓ Version ${v.version} (adapter found)</div>`
-  ).join('');
+  // Clear existing options
+  modelSelect.innerHTML = '';
   
-  versionsSection.style.display = 'block';
-  console.log('[VERSIONS] Displayed', profileVersions.length, 'version(s)');
+  // Add base model option
+  const baseOption = document.createElement('option');
+  baseOption.value = 'base';
+  baseOption.textContent = 'Base Model (from Hugging Face)';
+  modelSelect.appendChild(baseOption);
+  
+  // Add version options (sorted by version number, highest first)
+  const sortedVersions = [...profileVersions].sort((a, b) => b.version - a.version);
+  sortedVersions.forEach(v => {
+    const hasMerged = v.mergedBasePath ? ' (merged base + adapter)' : ' (adapter only)';
+    const versionOption = document.createElement('option');
+    versionOption.value = `v${v.version}`;
+    versionOption.textContent = `Version ${v.version}${hasMerged}`;
+    versionOption.setAttribute('data-version', v.version);
+    modelSelect.appendChild(versionOption);
+  });
+  
+  // Default to highest version if available, otherwise base
+  if (sortedVersions.length > 0) {
+    modelSelect.value = `v${sortedVersions[0].version}`;
+    console.log('[VERSIONS] Default selected: highest version', sortedVersions[0].version);
+  } else {
+    modelSelect.value = 'base';
+    console.log('[VERSIONS] Default selected: base model (no versions available)');
+  }
+  
+  modelSelectionSection.style.display = 'block';
+  console.log('[VERSIONS] Displayed', sortedVersions.length, 'version(s) + base model option');
 }
 
 // Update Inference Server URL from external port and SSH host
@@ -1315,11 +1419,36 @@ async function initializeInferenceEnvironment() {
   let profileName = null;
   let baseModel = null;
   let versions = [];
+  let useBaseModel = false;
   
   if (selectedProfile) {
     profileName = selectedProfile.name;
     baseModel = selectedProfile.baseModel;
-    versions = profileVersions || [];
+    
+    // Get selected model from dropdown
+    const modelSelect = document.getElementById('modelSelect');
+    if (modelSelect && modelSelect.value) {
+      const selectedValue = modelSelect.value;
+      
+      if (selectedValue === 'base') {
+        // Base model selected
+        useBaseModel = true;
+        versions = [];
+        console.log('[INIT] Selected: Base model only');
+      } else if (selectedValue.startsWith('v')) {
+        // Version selected
+        const versionNum = parseInt(selectedValue.substring(1));
+        const selectedVersion = profileVersions.find(v => v.version === versionNum);
+        if (selectedVersion) {
+          versions = [selectedVersion];
+          useBaseModel = false; // Don't download base model if using a version
+          console.log('[INIT] Selected: Version', versionNum);
+        }
+      }
+    }
+    
+    console.log('[INIT] Use base model:', useBaseModel);
+    console.log('[INIT] Selected versions:', versions.map(v => `V${v.version}`).join(', '));
   }
   
   // Get internal port (for FastAPI server inside container)
@@ -1335,6 +1464,7 @@ async function initializeInferenceEnvironment() {
       username: 'root',
       profileName: profileName,
       baseModel: baseModel,
+      useBaseModel: useBaseModel,
       versions: versions,
       inferenceUrl: undefined, // No longer needed - using SSH tunnel
       vllmUrl: undefined, // No longer needed - using SSH tunnel
@@ -1793,31 +1923,32 @@ async function showChatInterface() {
     }
     console.log('[CHAT] Model info:', JSON.stringify(modelInfo, null, 2));
 
-    // Populate version selector
+    // Hide version selector - we always use highest version automatically
     const versionSelect = document.getElementById('versionSelect');
-    versionSelect.innerHTML = '<option value="base">Base Model</option>';
-    
-    if (modelInfo.versions && modelInfo.versions.length > 0) {
-      modelInfo.versions.forEach(v => {
-        const option = document.createElement('option');
-        option.value = `V${v.version}`;
-        option.textContent = `Version ${v.version}`;
-        versionSelect.appendChild(option);
-      });
-    }
-    
-    // Restore saved version selection if available
-    if (window._pendingVersionSelection) {
-      const savedVersion = window._pendingVersionSelection;
-      console.log('[CONFIG] Restoring saved version selection:', savedVersion);
-      if (versionSelect.querySelector(`option[value="${savedVersion}"]`)) {
-        versionSelect.value = savedVersion;
-      } else {
-        console.warn('[CONFIG] Saved version not found, using default "base"');
-        versionSelect.value = 'base';
+    if (versionSelect) {
+      versionSelect.style.display = 'none';
+      const versionLabel = versionSelect.previousElementSibling;
+      if (versionLabel && versionLabel.tagName === 'LABEL') {
+        versionLabel.style.display = 'none';
       }
-      delete window._pendingVersionSelection;
     }
+    
+    // Automatically determine which version to use
+    let selectedVersion = 'base'; // Default to base model
+    if (modelInfo.highestVersion) {
+      selectedVersion = `V${modelInfo.highestVersion.version}`;
+      console.log(`[CHAT] Automatically using highest version: ${selectedVersion} (merged base model + adapter)`);
+    } else if (modelInfo.versions && modelInfo.versions.length > 0) {
+      // Fallback: use highest version from versions array if highestVersion not set
+      const sortedVersions = modelInfo.versions.sort((a, b) => b.version - a.version);
+      selectedVersion = `V${sortedVersions[0].version}`;
+      console.log(`[CHAT] Using highest version from versions array: ${selectedVersion}`);
+      } else {
+      console.log(`[CHAT] No versions available, using base model`);
+    }
+    
+    // Store selected version for use in chat requests
+    window._autoSelectedVersion = selectedVersion;
 
     // Show chat interface
     document.getElementById('chatInterface').style.display = 'block';
@@ -2628,22 +2759,115 @@ async function sendMessage() {
     let requestBody;
 
     // Fix 1 & 2: Compress conversation history - remove full assistant responses, use semantic summaries instead
-    let compressedHistory = compressConversationHistory(conversationHistory);
+    // Pass current user message to check for pronouns/indexicals
+    let compressedHistory = compressConversationHistory(conversationHistory, userText);
     
     // Safety check: Ensure compressed history never ends with a user message
     // This is a final safeguard to prevent consecutive user messages
-    while (compressedHistory.length > 0 && compressedHistory[compressedHistory.length - 1].role === 'user') {
+    // Only remove the last one if it exists (compressConversationHistory already removed the last one, but double-check)
+    if (compressedHistory.length > 0 && compressedHistory[compressedHistory.length - 1].role === 'user') {
       compressedHistory.pop();
-      console.log(`[COMPRESS] Safety check: Removed trailing user message from compressed history`);
+      console.log(`[COMPRESS] Safety check: Removed last user message from compressed history`);
     }
     
+    // CRITICAL: Validate message sequence before sending
+    // Build the full messages array as it will be sent (system + history + user)
+    // This simulates what main.js will build to validate the sequence
+    const testMessages = [];
+    if (effectiveSystemMessage && effectiveSystemMessage.trim()) {
+      testMessages.push({ role: 'system', content: effectiveSystemMessage.trim() });
+    }
+    testMessages.push(...compressedHistory);
+    testMessages.push({ role: 'user', content: userText });
+    
+    // Validate: messages[0].role === "system" (MUST be true)
+    // Validate: messages.slice(1).every((m, i) => i === 0 || m.role !== messages[i].role)
+    // This means: after system, no two consecutive messages should have the same role
+    // Note: messages[i] in the slice context refers to the message at index i in the sliced array
+    // We need to compare with the previous message in the slice: messages.slice(1)[i - 1]
+    // Validate according to user's specification:
+    // messages[0].role === "system" (MUST be true)
+    // messages.slice(1).every((m, i) => i === 0 || m.role !== messages[i].role)
+    // Note: In the slice context, messages[i] refers to messages[i+1] in the original array
+    // So we're checking: m.role !== messages[i+1].role, which means comparing with the message at index i+1
+    // But we want to compare with the previous message, so we use messages[i+1] where i is the slice index
+    // Actually, the condition m.role !== messages[i].role where i is the slice index means:
+    // Compare current message role with the role of the message at index i in the original array
+    // Since we sliced from index 1, messages[i] in original = messages[i+1]
+    // So we're comparing m (at slice index i, original index i+1) with messages[i+1] - which is itself!
+    // I think the user meant to compare with the previous message, so let's do that:
+    const isValid = testMessages.length > 0 && 
+                    testMessages[0].role === "system" &&
+                    testMessages.slice(1).every((m, i) => {
+                      if (i === 0) return true; // First message after system is always valid
+                      // Compare with previous message: at slice index i-1, which is original index i
+                      return m.role !== testMessages[i].role;
+                    });
+    
+    if (!isValid) {
+      console.warn('[COMPRESS] Message sequence validation failed, rebuilding compressed history...');
+      console.warn('[COMPRESS] Test messages:', testMessages.map(m => m.role));
+      
+      // Rebuild: ensure alternating pattern after system message
+      // Since compressedHistory only contains user messages (assistants were removed),
+      // we need to rebuild to ensure no consecutive user messages
+      const rebuilt = [];
+      let lastRole = 'system'; // Start after system message
+      
+      // Add messages one by one, ensuring they alternate
+      // Since we only have user messages in compressedHistory, we need to skip consecutive ones
+      for (const msg of compressedHistory) {
+        if (msg.role === 'user' && lastRole !== 'user') {
+          rebuilt.push(msg);
+          lastRole = 'user';
+        } else if (msg.role === 'assistant' && lastRole !== 'assistant') {
+          rebuilt.push(msg);
+          lastRole = 'assistant';
+        }
+        // Skip messages that would create consecutive same-role
+      }
+      
+      // Ensure it doesn't end with user (since we're adding user next)
+      if (rebuilt.length > 0 && rebuilt[rebuilt.length - 1].role === 'user') {
+        rebuilt.pop();
+      }
+      
+      compressedHistory = rebuilt;
+      console.log('[COMPRESS] Rebuilt compressed history:', compressedHistory.length, 'messages');
+      
+      // Re-validate
+      const retestMessages = [];
+      if (effectiveSystemMessage && effectiveSystemMessage.trim()) {
+        retestMessages.push({ role: 'system', content: effectiveSystemMessage.trim() });
+      }
+      retestMessages.push(...compressedHistory);
+      retestMessages.push({ role: 'user', content: userText });
+      
+      const retestValid = retestMessages.length > 0 && 
+                          retestMessages[0].role === "system" &&
+                          retestMessages.slice(1).every((m, i) => {
+                            if (i === 0) return true;
+                            // Compare with previous message: at slice index i-1, which is original index i
+                            return m.role !== retestMessages[i].role;
+                          });
+      
+      if (!retestValid) {
+        console.error('[COMPRESS] Rebuilt history still invalid! Falling back to empty history.');
+        compressedHistory = [];
+      } else {
+        console.log('[COMPRESS] Rebuilt history validated successfully');
+      }
+    } else {
+      console.log('[COMPRESS] Message sequence validation passed');
+    }
+
     if (continuationMode) {
       // Fix 5: Continuation uses working memory, not full assistant prose
       const continuationPrompt = buildContinuationInstruction();
 
       requestBody = {
         message: continuationPrompt,
-        version: versionSelect.value,
+        version: window._autoSelectedVersion || 'base',
         prependedText: effectiveSystemMessage,
         useSummary: false,
         conversationSummary: '',
@@ -2656,7 +2880,7 @@ async function sendMessage() {
     } else {
       requestBody = {
         message: userText,
-        version: versionSelect.value,
+        version: window._autoSelectedVersion || 'base',
         prependedText: effectiveSystemMessage,
         useSummary: false,
         conversationSummary: '',
@@ -2760,7 +2984,7 @@ async function sendMessage() {
           try {
             const retry = await window.electronAPI.sendChatMessage({
               message: rewritePrompt,
-              version: versionSelect.value,
+              version: window._autoSelectedVersion || 'base',
               prependedText: wrapSystemBlocks(combinedSystem, []), // No exemplars for guardrail rewrites
               useSummary: false,
               conversationSummary: '',
@@ -2964,7 +3188,7 @@ Please expand on this:
     // Tier 2 Fix: Use max_new_tokens ≈ 900 and temperature ≈ 0.65 for expansions
     const result = await window.electronAPI.sendChatMessage({
       message: expansionPrompt,
-      version: versionSelect?.value || 'base',
+      version: window._autoSelectedVersion || 'base',
       prependedText: effectiveSystemMessage,
       useSummary: false,
       conversationSummary: '',

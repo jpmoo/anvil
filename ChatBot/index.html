@@ -407,10 +407,12 @@
       </select>
       <div id="profileInfo" style="margin-top: 10px; font-size: 13px; color: #666;"></div>
       
-      <!-- Available Versions (shown when profile is selected) -->
-      <div id="versionsSection" style="display: none; margin-top: 15px;">
-        <label style="font-weight: 600; margin-bottom: 8px;">Available versions:</label>
-        <div id="versionsList" class="versions-list"></div>
+      <!-- Model Selection (shown when profile is selected) -->
+      <div id="modelSelectionSection" style="display: none; margin-top: 15px;">
+        <label for="modelSelect" style="font-weight: 600; margin-bottom: 8px; display: block;">Select model to upload:</label>
+        <select id="modelSelect" style="width: 100%; padding: 8px; font-size: 14px; box-sizing: border-box;">
+          <option value="">Loading models...</option>
+        </select>
       </div>
     </div>
 
@@ -444,13 +446,7 @@
       
       <!-- Chat Controls -->
       <div class="chat-controls">
-        <div class="control-group">
-          <label for="versionSelect">Model Version:</label>
-          <select id="versionSelect">
-            <option value="base">Base Model</option>
-          </select>
-        </div>
-        
+        <!-- Version selector removed - always uses highest version automatically -->
         <div class="control-group" style="text-align: center;">
           <button id="clearChatBtn" style="padding: 3px 10px; font-size: 11px; background: #f44336; color: white; border: none; border-radius: 4px; cursor: pointer;">End and Forget this Chat</button>
         </div>

@@ -883,7 +883,34 @@ def render():
             model_metadata = model_manager.get_model_metadata(model_name)
             current_base_model = model_metadata.get("base_model", "llama2") if model_metadata else "llama2"
             
-            st.info(f"📌 Current base model: **{current_base_model}**")
+            # Check if we have versions above V1 with merged base model
+            most_recent_version = model_manager.get_most_recent_version(model_name)
+            display_base_model = current_base_model
+            merged_base_path = None
+            
+            if most_recent_version and most_recent_version >= 2:
+                # Check for merged base model in the highest version folder
+                version_dir = model_manager.models_dir / model_name / f"V{most_recent_version}"
+                merged_base_dir = version_dir / "merged_base_model"
+                
+                if merged_base_dir.exists() and any(merged_base_dir.iterdir()):
+                    # Use merged base model path
+                    merged_base_path = str(merged_base_dir)
+                    display_base_model = f"Local merged model (V{most_recent_version})"
+                else:
+                    # Check previous versions for merged base model
+                    for v in range(most_recent_version, 1, -1):
+                        check_version_dir = model_manager.models_dir / model_name / f"V{v}"
+                        check_merged_base_dir = check_version_dir / "merged_base_model"
+                        if check_merged_base_dir.exists() and any(check_merged_base_dir.iterdir()):
+                            merged_base_path = str(check_merged_base_dir)
+                            display_base_model = f"Local merged model (V{v})"
+                            break
+            
+            if merged_base_path:
+                st.info(f"📌 Current base model: **{display_base_model}**\n\n*Merged base model path: `{merged_base_path}`*")
+            else:
+                st.info(f"📌 Current base model: **{display_base_model}**")
             
             # Allow manual override of Hugging Face model identifier
             hf_model_override = st.text_input(
@@ -897,14 +924,15 @@ def render():
             col1, col2 = st.columns(2)
             
             with col1:
-                    epochs = st.number_input(
-                    "Epochs (auto-calculated if not specified)", 
+                    epochs_input = st.number_input(
+                    "Epochs (leave empty for auto-calculation)", 
                     min_value=1,
                     max_value=50,
-                    value=10,
-                    help="Number of training epochs. Will be auto-calculated based on dataset size to target 200-500 training steps. You can override this value if needed.",
+                    value=None,
+                    help="Number of training epochs. Leave empty to auto-calculate based on dataset size (targets 150-400 training steps). Set a value to override auto-calculation.",
                     key="epochs_input"
                     )
+                    epochs = epochs_input if epochs_input is not None else None
             
             with col2:
                     learning_rate = st.number_input(
@@ -1184,10 +1212,29 @@ def render():
                             try:
                                 from datetime import datetime
                                 from utils.vast_training_manager import VastTrainingManager
+                                import subprocess
                                 training_manager = VastTrainingManager(model_name, vast_api_key)
                                 
                                 # Mark job as dismissed (do NOT stop or destroy instance)
                                 instance_id = active_job.get("instance_id")
+                                
+                                # CRITICAL: Kill all training processes before dismissing job
+                                # This ensures processes don't continue running with old config
+                                ssh_info = training_manager.get_instance_ssh_info(instance_id)
+                                ssh_host = ssh_info.get("host")
+                                ssh_port = active_job.get("ssh_port_override") or ssh_info.get("port", 22)
+                                
+                                if ssh_host:
+                                    dismiss_output = []  # Local output list for dismiss operation
+                                    dismiss_output.append(f"[DISMISS] Killing all training processes on remote instance...")
+                                    kill_all_training_processes(ssh_host, ssh_port, dismiss_output)
+                                    dismiss_output.append(f"[DISMISS] ✓ Training processes killed (if any were running)")
+                                    
+                                    # Log to terminal output if it exists in session state
+                                    terminal_output_key = f"terminal_output_{instance_id}"
+                                    if terminal_output_key in st.session_state:
+                                        for msg in dismiss_output:
+                                            st.session_state[terminal_output_key].append(msg)
                                 
                                 # CRITICAL: Preserve SSH port override before deleting job
                                 ssh_port_override = active_job.get("ssh_port_override")
@@ -1216,7 +1263,7 @@ def render():
                                     json.dump(jobs, f, indent=2)
                                 
                                 st.session_state[dismiss_confirm_key] = False
-                                st.success("✅ Job dismissed and deleted. You can now launch a new training job.")
+                                st.success("✅ Job dismissed and deleted. All training processes have been killed. You can now launch a new training job.")
                                 if instance_id:
                                     st.warning(f"⚠️ **Important:** The Vast.ai instance ({instance_id[:8]}...) is still running. You must stop or destroy it manually in Vast.ai to stop charges.")
                                 st.rerun()
@@ -2080,7 +2127,7 @@ def render():
                                                 
                                                 # Prepare package for this job
                                                 job_package = training_manager.prepare_training_package(
-                                                    epochs=active_job.get("epochs", 10),
+                                                    epochs=active_job.get("epochs", None),
                                                     learning_rate=active_job.get("learning_rate", 2e-4),
                                                     hf_model_override=active_job.get("hf_model_override"),
                                                     yaml_config_path=yaml_path,
@@ -3497,17 +3544,76 @@ def render():
                                             if adapter_path and adapter_path.exists():
                                                 terminal_output.append(f"[PRIOR WEIGHTS] Uploading and embedding previous version weights...")
                                                 
-                                                # Upload weights to instance and update config
-                                                # First, upload the adapter directory
+                                                # Upload weights to instance with GZIP compression
+                                                # Create local GZIP archive first, then upload and extract remotely
                                                 import subprocess
-                                                upload_weights_cmd = [
-                                                    "scp", "-r", "-P", str(ssh_port), 
-                                                    "-o", "StrictHostKeyChecking=no", 
-                                                    "-o", "ConnectTimeout=30",
-                                                    str(adapter_path),
-                                                    f"root@{ssh_host}:/workspace/previous_adapter"
-                                                ]
-                                                upload_result = subprocess.run(upload_weights_cmd, capture_output=True, text=True, timeout=300, input="yes\n")
+                                                import tarfile
+                                                import tempfile
+                                                import os
+                                                
+                                                terminal_output.append(f"[PRIOR WEIGHTS] Creating GZIP archive for upload...")
+                                                with tempfile.NamedTemporaryFile(suffix='.tar.gz', delete=False) as tmp_archive:
+                                                    archive_path = tmp_archive.name
+                                                
+                                                try:
+                                                    # Create GZIP archive locally
+                                                    adapter_path_obj = Path(adapter_path)
+                                                    with tarfile.open(archive_path, 'w:gz') as tar:
+                                                        tar.add(adapter_path, arcname=adapter_path_obj.name)
+                                                    
+                                                    archive_size = os.path.getsize(archive_path) / (1024 * 1024)
+                                                    terminal_output.append(f"[PRIOR WEIGHTS] ✓ Archive created ({archive_size:.2f} MB)")
+                                                    
+                                                    # Upload compressed archive
+                                                    terminal_output.append(f"[PRIOR WEIGHTS] Uploading compressed archive...")
+                                                    upload_archive_cmd = [
+                                                        "scp", "-P", str(ssh_port), 
+                                                        "-o", "StrictHostKeyChecking=no", 
+                                                        "-o", "UserKnownHostsFile=/dev/null",
+                                                        "-o", "LogLevel=ERROR",
+                                                        "-o", "ConnectTimeout=30",
+                                                        "-C",  # Enable compression
+                                                        archive_path,
+                                                        f"root@{ssh_host}:/tmp/previous_adapter.tar.gz"
+                                                    ]
+                                                    upload_result = subprocess.run(upload_archive_cmd, capture_output=True, text=True, timeout=300)
+                                                    
+                                                    if upload_result.returncode == 0:
+                                                        # Extract archive on remote
+                                                        terminal_output.append(f"[PRIOR WEIGHTS] Extracting archive on remote server...")
+                                                        extract_cmd = [
+                                                            "ssh", "-p", str(ssh_port),
+                                                            "-o", "StrictHostKeyChecking=no",
+                                                            "-o", "UserKnownHostsFile=/dev/null",
+                                                            "-o", "LogLevel=ERROR",
+                                                            "-o", "ConnectTimeout=30",
+                                                            f"root@{ssh_host}",
+                                                            "mkdir -p /workspace/previous_adapter && cd /workspace && tar -xzf /tmp/previous_adapter.tar.gz && mv previous_adapter/* /workspace/previous_adapter/ 2>/dev/null || (cd /workspace && tar -xzf /tmp/previous_adapter.tar.gz && find . -name 'adapter_config.json' -exec dirname {} \\; | head -1 | xargs -I {} mv {}/* /workspace/previous_adapter/ 2>/dev/null) && rm -f /tmp/previous_adapter.tar.gz"
+                                                        ]
+                                                        extract_result = subprocess.run(extract_cmd, capture_output=True, text=True, timeout=60)
+                                                        
+                                                        if extract_result.returncode == 0:
+                                                            terminal_output.append(f"[PRIOR WEIGHTS] ✓ Archive extracted on remote server")
+                                                        else:
+                                                            terminal_output.append(f"[WARNING] Archive uploaded but extraction may have issues: {extract_result.stderr[:200]}")
+                                                    else:
+                                                        terminal_output.append(f"[WARNING] Archive upload failed, falling back to direct upload...")
+                                                        # Fallback to direct upload with compression
+                                                        upload_weights_cmd = [
+                                                            "scp", "-r", "-P", str(ssh_port), 
+                                                            "-o", "StrictHostKeyChecking=no", 
+                                                            "-o", "UserKnownHostsFile=/dev/null",
+                                                            "-o", "LogLevel=ERROR",
+                                                            "-o", "ConnectTimeout=30",
+                                                            "-C",  # Enable compression
+                                                            str(adapter_path),
+                                                            f"root@{ssh_host}:/workspace/previous_adapter"
+                                                        ]
+                                                        upload_result = subprocess.run(upload_weights_cmd, capture_output=True, text=True, timeout=300)
+                                                finally:
+                                                    # Clean up local archive
+                                                    if os.path.exists(archive_path):
+                                                        os.unlink(archive_path)
                                                 if upload_result.returncode == 0:
                                                     terminal_output.append(f"[PRIOR WEIGHTS] ✓ Uploaded previous version weights to /workspace/previous_adapter")
                                                     if upload_result.stdout:
@@ -3516,7 +3622,7 @@ def render():
                                                     # CRITICAL: Verify adapter files were uploaded correctly and are valid
                                                     verify_adapter_cmd = [
                                                         "ssh"
-                                                    ] + get_ssh_base_options(ssh_port) + [
+        ] + get_ssh_base_options(ssh_port) + [
                                                         f"root@{ssh_host}",
                                                         f"cd /workspace && "
                                                         f"if [ -f previous_adapter/adapter_config.json ]; then "
@@ -3617,41 +3723,10 @@ def render():
                                                         terminal_output.append(f"[ERROR] Verification output: {verify_adapter_result.stdout}")
                                                         terminal_output.append(f"[ERROR] Upload may have failed - check remote directory /workspace/previous_adapter")
                                                     
-                                                    # Update config file to use the adapter
-                                                    update_config_cmd = [
-                                                        "ssh"
-        ] + get_ssh_base_options(ssh_port) + [
-                                                        f"root@{ssh_host}",
-                                                        f"cd /workspace/data && "
-                                                        f"python3 << 'PYTHON_EOF'\n"
-                                                        f"import yaml\n"
-                                                        f"import os\n"
-                                                        f"try:\n"
-                                                        f"    with open('axolotl_config.yaml', 'r') as f:\n"
-                                                        f"        config = yaml.safe_load(f) or {{}}\n"
-                                                        f"    \n"
-                                                        f"    # Set adapter path to uploaded weights\n"
-                                                        f"    config['adapter'] = '/workspace/previous_adapter'\n"
-                                                        f"    \n"
-                                                        f"    with open('axolotl_config.yaml', 'w') as f:\n"
-                                                        f"        yaml.dump(config, f, default_flow_style=False, sort_keys=False)\n"
-                                                        f"    \n"
-                                                        f"    print('SUCCESS: Updated config with adapter path: /workspace/previous_adapter')\n"
-                                                        f"except Exception as e:\n"
-                                                        f"    print(f'ERROR: Failed to update config: {{str(e)}}')\n"
-                                                        f"    import sys\n"
-                                                        f"    sys.exit(1)\n"
-                                                        f"PYTHON_EOF"
-                                                    ]
-                                                    update_result = subprocess.run(update_config_cmd, capture_output=True, text=True, timeout=30)
-                                                    if update_result.returncode == 0:
-                                                        terminal_output.append(f"[SUCCESS] Embedded version {latest_version} weights in config")
-                                                        if update_result.stdout:
-                                                            for line in update_result.stdout.strip().split("\n"):
-                                                                if line.strip():
-                                                                    terminal_output.append(f"[SSH]   {line}")
-                                                    else:
-                                                        terminal_output.append(f"[WARNING] Failed to update config with adapter path: {update_result.stderr[:200]}")
+                                                    # Note: We no longer update config with adapter path here
+                                                    # The adapter will be merged into the base model pre-training (in Phase 3)
+                                                    # The merge script will update the config to use the merged model as base
+                                                    terminal_output.append(f"[INFO] Previous adapter uploaded - will be merged into base model before training starts")
                                                 else:
                                                     terminal_output.append(f"[WARNING] Failed to upload previous version weights: {upload_result.stderr[:200]}")
                                                     terminal_output.append(f"[INFO] Will train from base model instead")
@@ -3951,6 +4026,64 @@ def render():
                                             else:
                                                 terminal_output.append(f"[WARNING] Final config check failed: {final_config_check_result.stderr[:200]}")
                                             
+                                            # CRITICAL: Verify num_epochs in config matches expected value before starting training
+                                            # This ensures training respects the epochs setting
+                                            # Get epochs from active_job (stored when job was created)
+                                            expected_epochs = active_job.get("epochs")
+                                            if expected_epochs is not None:
+                                                terminal_output.append(f"[SSH] Verifying num_epochs in config matches expected value ({expected_epochs})...")
+                                                verify_epochs_cmd = [
+                                                    "ssh"
+                                            ] + get_ssh_base_options(ssh_port) + [
+                                                    f"root@{ssh_host}",
+                                                    f"cd /workspace/data && "
+                                                    f"python3 << 'PYTHON_EOF'\n"
+                                                    f"import yaml\n"
+                                                    f"import sys\n"
+                                                    f"try:\n"
+                                                    f"    with open('axolotl_config.yaml', 'r') as f:\n"
+                                                    f"        config = yaml.safe_load(f) or {{}}\n"
+                                                    f"    \n"
+                                                    f"    expected_epochs = {expected_epochs}\n"
+                                                    f"    actual_epochs = config.get('num_epochs')\n"
+                                                    f"    max_steps = config.get('max_steps')\n"
+                                                    f"    \n"
+                                                    f"    if max_steps is not None:\n"
+                                                    f"        print(f'ERROR: max_steps={{max_steps}} is set and will override num_epochs!')\n"
+                                                    f"        sys.exit(1)\n"
+                                                    f"    \n"
+                                                    f"    if actual_epochs != expected_epochs:\n"
+                                                    f"        print(f'ERROR: num_epochs mismatch! Expected {{expected_epochs}}, but config has {{actual_epochs}}')\n"
+                                                    f"        sys.exit(1)\n"
+                                                    f"    \n"
+                                                    f"    print(f'✓ Verified: num_epochs={{actual_epochs}} matches expected value')\n"
+                                                    f"except Exception as e:\n"
+                                                    f"    print(f'ERROR: {{e}}', file=sys.stderr)\n"
+                                                    f"    sys.exit(1)\n"
+                                                    f"PYTHON_EOF"
+                                                ]
+                                                verify_epochs_result = subprocess.run(verify_epochs_cmd, capture_output=True, text=True, timeout=30)
+                                                if verify_epochs_result.returncode != 0:
+                                                    terminal_output.append(f"[ERROR] Epochs verification FAILED!")
+                                                    if verify_epochs_result.stdout:
+                                                        for line in verify_epochs_result.stdout.strip().split("\n"):
+                                                            if line.strip():
+                                                                terminal_output.append(f"[SSH]   {line}")
+                                                    if verify_epochs_result.stderr:
+                                                        for line in verify_epochs_result.stderr.strip().split("\n"):
+                                                            if line.strip():
+                                                                terminal_output.append(f"[SSH]   stderr: {line}")
+                                                    terminal_output.append(f"[ERROR] Cannot start training - num_epochs mismatch or max_steps is set!")
+                                                    st.error("❌ Config verification failed: num_epochs doesn't match expected value or max_steps is overriding it. Please check the config.")
+                                                    st.session_state[terminal_output_key] = terminal_output
+                                                    st.stop()
+                                                else:
+                                                    terminal_output.append(f"[SUCCESS] Epochs verification passed: num_epochs={expected_epochs} is correctly set in config")
+                                                    if verify_epochs_result.stdout:
+                                                        for line in verify_epochs_result.stdout.strip().split("\n"):
+                                                            if line.strip() and "ERROR" not in line:
+                                                                terminal_output.append(f"[SSH]   {line}")
+                                            
                                             # CRITICAL: Ensure sample_packing is disabled before starting training
                                             # This prevents multipack sampler IndexError issues
                                             terminal_output.append(f"[SSH] Ensuring sample_packing is disabled...")
@@ -3993,9 +4126,231 @@ def render():
                                             
                                             st.session_state[terminal_output_key] = terminal_output
                                             
+                                            # Check if we need to merge previous adapter into base model
+                                            # This replaces adapter stacking with merging: load base, load adapter, merge, unload, train fresh
+                                            terminal_output.append(f"[MERGE] Checking for previous adapter to merge...")
+                                            check_adapter_cmd = [
+                                                "ssh"
+                                            ] + get_ssh_base_options(ssh_port) + [
+                                                f"root@{ssh_host}",
+                                                "test -d /workspace/data/previous_adapter && test -f /workspace/data/previous_adapter/adapter_config.json && echo 'adapter_found' || echo 'no_adapter'"
+                                            ]
+                                            check_adapter_result = subprocess.run(check_adapter_cmd, capture_output=True, text=True, timeout=10)
+                                            adapter_exists = "adapter_found" in check_adapter_result.stdout
+                                            
+                                            if adapter_exists:
+                                                terminal_output.append(f"[MERGE] Previous adapter found - merging into base model...")
+                                                terminal_output.append(f"[MERGE] Step 1: Loading base model and previous adapter")
+                                                terminal_output.append(f"[MERGE] Step 2: Merging adapter into base weights")
+                                                terminal_output.append(f"[MERGE] Step 3: Saving merged model")
+                                                terminal_output.append(f"[MERGE] Step 4: Updating config to use merged model as base")
+                                                
+                                                # Merge adapter into base model
+                                                # Build HF token export section for merge script
+                                                merge_token_exports = ""
+                                                if hf_token and isinstance(hf_token, str) and hf_token.strip():
+                                                    hf_token_clean = hf_token.strip().replace('\n', '').replace('\r', '').replace(';', '').replace('`', '')
+                                                    if hf_token_clean:
+                                                        hf_token_escaped = hf_token_clean.replace("'", "'\"'\"'")
+                                                        merge_token_exports = f"export HF_TOKEN='{hf_token_escaped}'\nexport HUGGING_FACE_HUB_TOKEN='{hf_token_escaped}'\n"
+                                                
+                                                merge_script = f"""bash << 'MERGE_EOF'
+set -e
+{merge_token_exports}python3 << 'PYTHON_MERGE'
+import yaml
+import os
+import sys
+from pathlib import Path
+import torch
+from transformers import AutoModelForCausalLM, AutoTokenizer
+from peft import PeftModel
+
+try:
+    # Read config to get base model
+    with open('/workspace/data/axolotl_config.yaml', 'r') as f:
+        config = yaml.safe_load(f) or {{}}
+    
+    base_model_name = config.get('base_model') or config.get('base_model_config')
+    if not base_model_name:
+        print('ERROR: No base_model found in config')
+        sys.exit(1)
+    
+    adapter_path = '/workspace/data/previous_adapter'
+    merged_model_path = '/workspace/data/merged_base_model'
+    
+    print(f'Base model: {{base_model_name}}')
+    print(f'Adapter path: {{adapter_path}}')
+    print(f'Merged model will be saved to: {{merged_model_path}}')
+    
+    # Step 1: Load base model
+    print('Loading base model...')
+    base_model = AutoModelForCausalLM.from_pretrained(
+        base_model_name,
+        torch_dtype=torch.float16,
+        device_map='auto',
+        trust_remote_code=True
+    )
+    tokenizer = AutoTokenizer.from_pretrained(base_model_name, trust_remote_code=True)
+    
+    # Step 2: Load previous adapter
+    print('Loading previous adapter...')
+    model = PeftModel.from_pretrained(base_model, adapter_path)
+    
+    # Step 3: Merge adapter into base weights
+    print('Merging adapter into base weights...')
+    model = model.merge_and_unload()
+    
+    # Step 4: Save merged model
+    print('Saving merged model...')
+    os.makedirs(merged_model_path, exist_ok=True)
+    model.save_pretrained(merged_model_path)
+    tokenizer.save_pretrained(merged_model_path)
+    
+    print(f'SUCCESS: Merged model saved to {{merged_model_path}}')
+    
+    # Step 5: Update config to use merged model as base
+    print('Updating config to use merged model...')
+    old_base_model = config.get('base_model') or config.get('base_model_config', 'NOT_SET')
+    config['base_model'] = merged_model_path
+    config['base_model_config'] = merged_model_path
+    
+    # Remove adapter settings - we're starting fresh LoRA training
+    if 'adapter' in config:
+        old_adapter = config['adapter']
+        del config['adapter']
+        print(f'Removed old adapter setting: {{old_adapter}}')
+    if 'lora_model_dir' in config:
+        old_lora_dir = config['lora_model_dir']
+        del config['lora_model_dir']
+        print(f'Removed old lora_model_dir setting: {{old_lora_dir}}')
+    
+    # Set adapter to "lora" for fresh training
+    config['adapter'] = 'lora'
+    
+    with open('/workspace/data/axolotl_config.yaml', 'w') as f:
+        yaml.dump(config, f, default_flow_style=False, sort_keys=False)
+    
+    print('SUCCESS: Config updated - merged model set as base, fresh LoRA training configured')
+    print(f'CONFIRMED: Training will use merged model: {{merged_model_path}}')
+    print(f'CONFIRMED: Previous base model was: {{old_base_model}}')
+    print(f'CONFIRMED: Fresh LoRA adapter training configured (adapter: lora)')
+    
+except Exception as e:
+    print(f'ERROR: Merge failed: {{str(e)}}')
+    import traceback
+    print(traceback.format_exc())
+    sys.exit(1)
+PYTHON_MERGE
+MERGE_EOF"""
+                                                
+                                                merge_cmd = [
+                                                    "ssh"
+                                                ] + get_ssh_base_options(ssh_port) + [
+                                                    f"root@{ssh_host}",
+                                                    f"cd /workspace/data && {merge_script}"
+                                                ]
+                                                
+                                                merge_result = subprocess.run(merge_cmd, capture_output=True, text=True, timeout=600)  # 10 min timeout for merge
+                                                
+                                                if merge_result.returncode != 0:
+                                                    terminal_output.append(f"[ERROR] Adapter merge FAILED!")
+                                                    if merge_result.stdout:
+                                                        for line in merge_result.stdout.strip().split("\n"):
+                                                            if line.strip():
+                                                                terminal_output.append(f"[MERGE]   {line}")
+                                                    if merge_result.stderr:
+                                                        stderr_filtered = filter_malloc_warnings(merge_result.stderr)
+                                                        for line in stderr_filtered.strip().split("\n"):
+                                                            if line.strip():
+                                                                terminal_output.append(f"[MERGE]   stderr: {line}")
+                                                    st.error("❌ Failed to merge previous adapter into base model. Please check the logs.")
+                                                    st.session_state[terminal_output_key] = terminal_output
+                                                    st.stop()
+                                                else:
+                                                    terminal_output.append(f"[SUCCESS] Adapter merged successfully!")
+                                                    if merge_result.stdout:
+                                                        for line in merge_result.stdout.strip().split("\n"):
+                                                            if line.strip():
+                                                                terminal_output.append(f"[MERGE]   {line}")
+                                                    
+                                                    # Verify that config now uses merged model
+                                                    terminal_output.append(f"[VERIFY] Verifying merged model is set as base in config...")
+                                                    verify_merge_cmd = [
+                                                        "ssh"
+                                                    ] + get_ssh_base_options(ssh_port) + [
+                                                        f"root@{ssh_host}",
+                                                        f"cd /workspace/data && "
+                                                        f"python3 << 'PYTHON_EOF'\n"
+                                                        f"import yaml\n"
+                                                        f"import os\n"
+                                                        f"try:\n"
+                                                        f"    with open('axolotl_config.yaml', 'r') as f:\n"
+                                                        f"        config = yaml.safe_load(f) or {{}}\n"
+                                                        f"    \n"
+                                                        f"    base_model = config.get('base_model') or config.get('base_model_config', 'NOT_SET')\n"
+                                                        f"    adapter = config.get('adapter', 'NOT_SET')\n"
+                                                        f"    merged_path = '/workspace/data/merged_base_model'\n"
+                                                        f"    \n"
+                                                        f"    print(f'Base model in config: {{base_model}}')\n"
+                                                        f"    print(f'Adapter setting: {{adapter}}')\n"
+                                                        f"    \n"
+                                                        f"    if base_model == merged_path:\n"
+                                                        f"        print(f'✓ CONFIRMED: Training will use merged model at {{merged_path}}')\n"
+                                                        f"        if os.path.exists(merged_path):\n"
+                                                        f"            print(f'✓ CONFIRMED: Merged model directory exists')\n"
+                                                        f"            config_files = [f for f in os.listdir(merged_path) if f.endswith('.json') or f.endswith('.safetensors') or f.endswith('.bin')]\n"
+                                                        f"            print(f'✓ CONFIRMED: Merged model contains {{len(config_files)}} weight/config files')\n"
+                                                        f"        else:\n"
+                                                        f"            print(f'ERROR: Merged model directory does not exist!')\n"
+                                                        f"            import sys\n"
+                                                        f"            sys.exit(1)\n"
+                                                        f"    else:\n"
+                                                        f"        print(f'ERROR: Config base_model is {{base_model}}, expected {{merged_path}}')\n"
+                                                        f"        import sys\n"
+                                                        f"        sys.exit(1)\n"
+                                                        f"    \n"
+                                                        f"    if adapter != 'lora':\n"
+                                                        f"        print(f'WARNING: Adapter setting is {{adapter}}, expected \"lora\"')\n"
+                                                        f"    else:\n"
+                                                        f"        print(f'✓ CONFIRMED: Fresh LoRA training configured (adapter: lora)')\n"
+                                                        f"except Exception as e:\n"
+                                                        f"    print(f'ERROR: Verification failed: {{str(e)}}')\n"
+                                                        f"    import sys\n"
+                                                        f"    sys.exit(1)\n"
+                                                        f"PYTHON_EOF"
+                                                    ]
+                                                    verify_merge_result = subprocess.run(verify_merge_cmd, capture_output=True, text=True, timeout=30)
+                                                    if verify_merge_result.returncode == 0:
+                                                        terminal_output.append(f"[VERIFY] ✓ Verification passed - merged model confirmed in config")
+                                                        if verify_merge_result.stdout:
+                                                            for line in verify_merge_result.stdout.strip().split("\n"):
+                                                                if line.strip():
+                                                                    terminal_output.append(f"[VERIFY]   {line}")
+                                                    else:
+                                                        terminal_output.append(f"[ERROR] Verification FAILED - merged model not properly configured!")
+                                                        if verify_merge_result.stdout:
+                                                            for line in verify_merge_result.stdout.strip().split("\n"):
+                                                                if line.strip():
+                                                                    terminal_output.append(f"[VERIFY]   {line}")
+                                                        if verify_merge_result.stderr:
+                                                            for line in verify_merge_result.stderr.strip().split("\n"):
+                                                                if line.strip():
+                                                                    terminal_output.append(f"[VERIFY]   stderr: {line}")
+                                                        st.error("❌ Failed to verify merged model configuration. Please check the logs.")
+                                                        st.session_state[terminal_output_key] = terminal_output
+                                                        st.stop()
+                                            else:
+                                                terminal_output.append(f"[INFO] No previous adapter found - starting fresh training")
+                                            
                                             # Use the same method as Redo Phase 3 - simpler and more reliable
                                             # Use a here-document to pass the command more reliably through SSH
                                             # This avoids issues with quote escaping and command length
+                                            
+                                            # Log what model will be used for training
+                                            if adapter_exists:
+                                                terminal_output.append(f"[TRAIN] Starting training on MERGED model (previous adapter merged into base)")
+                                            else:
+                                                terminal_output.append(f"[TRAIN] Starting training on BASE model (no previous adapter)")
                                             
                                             terminal_output.append(f"[SSH] Starting training...")
                                             terminal_output.append(f"[DEBUG] Using SSH port: {ssh_port} for training command")
@@ -7302,14 +7657,22 @@ REMOTE_SCRIPT"""
                                             "    # Extract key parameters\n"
                                             "    micro_batch_size = config.get('micro_batch_size', 1)\n"
                                             "    gradient_accumulation_steps = config.get('gradient_accumulation_steps', 1)\n"
-                                            "    num_epochs = config.get('num_epochs', 10)\n"
+                                            "    num_epochs = config.get('num_epochs', None)\n"
                                             "    effective_batch_size = micro_batch_size * gradient_accumulation_steps\n"
                                             "    \n"
                                             "    print(f'CURRENT_CONFIG:')\n"
                                             "    print(f'micro_batch_size={micro_batch_size}')\n"
                                             "    print(f'gradient_accumulation_steps={gradient_accumulation_steps}')\n"
                                             "    print(f'effective_batch_size={effective_batch_size}')\n"
-                                            "    print(f'num_epochs={num_epochs}')\n"
+                                            "    if num_epochs is None:\n"
+                                            "        print(f'num_epochs=None')\n"
+                                            "    else:\n"
+                                            "        print(f'num_epochs={num_epochs}')\n"
+                                            "    max_steps = config.get('max_steps', None)\n"
+                                            "    if max_steps is None:\n"
+                                            "        print(f'max_steps=None')\n"
+                                            "    else:\n"
+                                            "        print(f'max_steps={max_steps}')\n"
                                             "except Exception as e:\n"
                                             "    print(f'ERROR: {e}', file=sys.stderr)\n"
                                             "    sys.exit(1)\n"
@@ -7321,7 +7684,8 @@ REMOTE_SCRIPT"""
                                             # Parse config output
                                             current_micro_batch = 1
                                             current_grad_accum = 1
-                                            current_epochs = 10
+                                            current_epochs = None
+                                            current_max_steps = None
                                             
                                             for line in config_read_result.stdout.split('\n'):
                                                 if 'micro_batch_size=' in line:
@@ -7329,13 +7693,36 @@ REMOTE_SCRIPT"""
                                                 elif 'gradient_accumulation_steps=' in line:
                                                     current_grad_accum = int(line.split('=')[1])
                                                 elif 'num_epochs=' in line:
-                                                    current_epochs = int(line.split('=')[1])
+                                                    epoch_val = line.split('=')[1].strip()
+                                                    if epoch_val == 'None':
+                                                        current_epochs = None
+                                                    else:
+                                                        current_epochs = int(epoch_val)
+                                                elif 'max_steps=' in line:
+                                                    steps_val = line.split('=')[1].strip()
+                                                    if steps_val == 'None':
+                                                        current_max_steps = None
+                                                    else:
+                                                        current_max_steps = int(steps_val)
                                             
                                             terminal_output.append(f"[INFO] Current config:")
                                             terminal_output.append(f"  • micro_batch_size: {current_micro_batch}")
                                             terminal_output.append(f"  • gradient_accumulation_steps: {current_grad_accum}")
                                             terminal_output.append(f"  • effective_batch_size: {current_micro_batch * current_grad_accum}")
-                                            terminal_output.append(f"  • num_epochs: {current_epochs}")
+                                            if current_epochs is None:
+                                                terminal_output.append(f"  • num_epochs: auto-calculated")
+                                            else:
+                                                terminal_output.append(f"  • num_epochs: {current_epochs}")
+                                            if current_max_steps is not None:
+                                                terminal_output.append(f"  ⚠️ WARNING: max_steps={current_max_steps} is set (this will override num_epochs!)")
+                                            else:
+                                                terminal_output.append(f"  • max_steps: not set (epochs will be used)")
+                                            
+                                            # Check if training log shows epoch count that exceeds config
+                                            # This helps detect if training started with different config
+                                            if current_epochs is not None:
+                                                terminal_output.append(f"  ℹ️ NOTE: If training shows epoch > {current_epochs} in logs, it may have started before config was updated.")
+                                                terminal_output.append(f"     Training reads config at startup and won't re-read it. Restart training to apply new epoch limit.")
                                             
                                             # Check GPU memory to suggest optimal batch size
                                             check_memory_cmd = [
@@ -7617,7 +8004,7 @@ REMOTE_SCRIPT"""
                                                     dataset_path="/workspace/data/training_data.jsonl",
                                                     output_dir="/workspace/output/training",
                                                     output_path=config_path,
-                                                    num_epochs=old_config.get("num_epochs", 10),
+                                                    num_epochs=old_config.get("num_epochs", None),
                                                     learning_rate=old_config.get("learning_rate", 2e-4),
                                                     lora_r=old_config.get("lora_r", 8),
                                                     lora_alpha=old_config.get("lora_alpha", 16),
@@ -8460,7 +8847,14 @@ REMOTE_SCRIPT"""
                     if not weights_downloaded:
                         # Step 1: Download weights
                         st.markdown("#### 📥 Step 1: Download Weights")
-                        st.info("Download the trained weights from the instance before finalizing.")
+                        # Check if this is V2 or higher to show merged model messaging
+                        from utils.model_manager import ModelManager
+                        temp_model_manager = ModelManager()
+                        version_num = temp_model_manager.get_next_version_number(model_name) - 1  # Current version (already created)
+                        if version_num >= 2:
+                            st.info(f"Download the trained adapter weights and merged base model (V{version_num}) from the instance before finalizing.")
+                        else:
+                            st.info("Download the trained adapter weights from the instance before finalizing.")
                         
                         if st.button("📥 Download Weights", key="download_weights", type="primary"):
                             try:
@@ -8538,45 +8932,46 @@ REMOTE_SCRIPT"""
                                     else:
                                         terminal_output.append(f"[SSH] No weight files found in standard locations")
                                     
-                                    # Step 4: Download LoRA adapter weights ONLY (not full model)
+                                    # Step 4: Download LoRA adapter weights ONLY (not full model, not checkpoints)
                                     weights_dir = version_dir / "weights"
                                     weights_dir.mkdir(parents=True, exist_ok=True)
-                                    terminal_output.append(f"[SCP] Downloading LoRA adapter weights to: {weights_dir}")
-                                    terminal_output.append(f"[INFO] Only downloading adapter files (adapter_config.json, adapter_model.safetensors, etc.)")
-                                    terminal_output.append(f"[INFO] Full model weights are NOT needed - adapter will be loaded onto base model locally")
                                     
-                                    # LoRA adapter files we need (in order of preference)
+                                    # Determine version number for messaging
+                                    version_num = model_manager.get_next_version_number(model_name) - 1  # Current version (already created)
+                                    
+                                    terminal_output.append(f"[DOWNLOAD] Downloading LoRA adapter weights with GZIP compression...")
+                                    if version_num >= 2:
+                                        terminal_output.append(f"[DOWNLOAD] Version {version_num} detected - will also download merged base model after adapter weights")
+                                    terminal_output.append(f"[INFO] Only downloading final adapter files (adapter_config.json, adapter_model.safetensors, etc.)")
+                                    terminal_output.append(f"[INFO] Excluding checkpoints - only final trained adapter will be downloaded")
+                                    terminal_output.append(f"[INFO] Using GZIP compression for faster transfer")
+                                    
+                                    # Define adapter files list for fallback individual file download (used later if needed)
                                     adapter_files = [
-                                        "adapter_config.json",  # Required - adapter configuration
-                                        "adapter_model.safetensors",  # Preferred - adapter weights in safetensors format
-                                        "adapter_model.bin",  # Fallback - adapter weights in bin format
-                                        "training_args.bin",  # Optional - training arguments
+                                        "adapter_config.json",
+                                        "adapter_model.safetensors",  # Preferred (safer format)
+                                        "adapter_model.bin"  # Fallback
                                     ]
                                     
-                                    # Step 4a: Find the adapter location (may be in checkpoint directory)
-                                    terminal_output.append(f"[SSH] Locating adapter files on remote instance...")
+                                    # Step 4a: Find the FINAL adapter location (NOT in checkpoint directory - prefer final adapter)
+                                    terminal_output.append(f"[SSH] Locating final adapter files on remote instance (excluding checkpoints)...")
                                     find_adapter_cmd = [
                                         "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null", "-o", "LogLevel=ERROR", "-o", "ConnectTimeout=30",
                                         f"root@{ssh_host}",
                                         """bash -c '
-                                        # First, try to find the latest checkpoint directory with adapter (limit depth for speed)
-                                        latest_checkpoint=$(find /workspace/output/training -maxdepth 3 -type d -name "checkpoint-*" 2>/dev/null | sort -V | tail -1)
-                                        if [ -n "$latest_checkpoint" ] && [ -f "$latest_checkpoint/adapter/adapter_config.json" ]; then
-                                            echo "adapter_path:$latest_checkpoint/adapter"
-                                        # Check if adapter is directly in output/training/adapter
-                                        elif [ -f /workspace/output/training/adapter/adapter_config.json ]; then
+                                        # Prefer final adapter location (not in checkpoint) - this is the trained adapter
+                                        if [ -f /workspace/output/training/adapter/adapter_config.json ]; then
                                             echo "adapter_path:/workspace/output/training/adapter"
-                                        # Check other common locations
+                                        # Fallback: check other common locations (but not checkpoints)
                                         elif [ -f /workspace/output/adapter/adapter_config.json ]; then
                                             echo "adapter_path:/workspace/output/adapter"
-                                        # Use find to locate adapter_config.json with limited depth (faster)
-                                        elif adapter_found=$(find /workspace/output/training -maxdepth 5 -name "adapter_config.json" -type f 2>/dev/null | head -1); then
-                                            adapter_dir=$(dirname "$adapter_found")
-                                            echo "adapter_path:$adapter_dir"
-                                        # Last resort: broader search but still limited
-                                        elif adapter_found=$(find /workspace/output -maxdepth 6 -name "adapter_config.json" -type f 2>/dev/null | head -1); then
-                                            adapter_dir=$(dirname "$adapter_found")
-                                            echo "adapter_path:$adapter_dir"
+                                        # Last resort: find latest checkpoint adapter (but we will only download final files, not checkpoint dir)
+                                        elif latest_checkpoint=$(find /workspace/output/training -maxdepth 3 -type d -name "checkpoint-*" 2>/dev/null | sort -V | tail -1); then
+                                            if [ -n "$latest_checkpoint" ] && [ -f "$latest_checkpoint/adapter/adapter_config.json" ]; then
+                                                echo "adapter_path:$latest_checkpoint/adapter"
+                                            else
+                                                echo "adapter_path:not_found"
+                                            fi
                                         else
                                             echo "adapter_path:not_found"
                                         fi
@@ -8599,122 +8994,186 @@ REMOTE_SCRIPT"""
                                         terminal_output.append(f"[SSH] ⚠ Could not locate adapter, will try default locations")
                                     
                                     downloaded_count = 0
-                                    
-                                    # First, try to download the entire adapter directory (most efficient)
-                                    terminal_output.append(f"[SCP] Attempting to download adapter directory: {adapter_dir_remote}")
-                                    # SCP will create weights_dir/adapter when downloading remote:/path/to/adapter
-                                    # This is the desired behavior - files go to weights_dir/adapter/
-                                    scp_adapter_cmd = [
-                                        "scp", "-P", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null", "-o", "LogLevel=ERROR", "-o", "ConnectTimeout=30", "-r",
-                                        f"root@{ssh_host}:{adapter_dir_remote}",
-                                        str(weights_dir)
-                                    ]
-                                    scp_result = subprocess.run(scp_adapter_cmd, capture_output=True, text=True, timeout=300)
-                                    
-                                    if scp_result.returncode == 0:
-                                        # Check if adapter directory was downloaded
-                                        adapter_dir_local = weights_dir / "adapter"
-                                        if adapter_dir_local.exists() and any(adapter_dir_local.iterdir()):
-                                            downloaded_files_list = [f.name for f in adapter_dir_local.iterdir() if f.is_file()]
-                                            downloaded_count = len(downloaded_files_list)
-                                            terminal_output.append(f"[SCP] ✓ Downloaded adapter directory ({downloaded_count} files) to: {adapter_dir_local}")
-                                            for f in downloaded_files_list[:10]:
-                                                terminal_output.append(f"[FILE]   - {f}")
-                                            
-                                            # Verify we have the essential files
-                                            has_config = (adapter_dir_local / "adapter_config.json").exists()
-                                            has_weights = (adapter_dir_local / "adapter_model.safetensors").exists() or (adapter_dir_local / "adapter_model.bin").exists()
-                                            
-                                            if has_config and has_weights:
-                                                terminal_output.append(f"[SUCCESS] ✓ Essential adapter files downloaded (config + weights)")
-                                                # Skip individual file download - we already have everything
-                                                downloaded_count = len(downloaded_files_list)
-                                            elif has_config:
-                                                terminal_output.append(f"[WARNING] ⚠ Adapter config found but weights file missing")
-                                            else:
-                                                terminal_output.append(f"[ERROR] ✗ Essential adapter files missing")
-                                        else:
-                                            # Directory doesn't exist or is empty
-                                            terminal_output.append(f"[SCP] ⚠ Adapter directory not found or empty at: {adapter_dir_remote}")
-                                    else:
-                                        # SCP command failed - try downloading individual files
-                                        terminal_output.append(f"[SCP] Directory download failed, trying individual files...")
-                                        error_output = scp_result.stderr or scp_result.stdout
-                                        error_output = filter_malloc_warnings(error_output)
-                                        if "Welcome to vast.ai" in error_output:
-                                            lines = error_output.split('\n')
-                                            actual_errors = [line for line in lines if line and 'Welcome to vast.ai' not in line and 'Have fun!' not in line]
-                                            error_output = '\n'.join(actual_errors) if actual_errors else error_output
-                                        terminal_output.append(f"[SCP] Directory download error: {error_output[:200]}")
-                                    
-                                    # If directory download didn't work OR essential files are missing, try individual files
-                                    adapter_dir_local = weights_dir / "adapter"
-                                    # Check if we already have all essential files (skip individual download if we do)
                                     has_all_essential = False
-                                    if adapter_dir_local.exists():
-                                        has_config = (adapter_dir_local / "adapter_config.json").exists()
-                                        has_weights = (adapter_dir_local / "adapter_model.safetensors").exists() or (adapter_dir_local / "adapter_model.bin").exists()
-                                        has_all_essential = has_config and has_weights
                                     
-                                    if not has_all_essential and (not adapter_dir_local.exists() or not any(adapter_dir_local.iterdir())):
-                                        adapter_dir_local.mkdir(parents=True, exist_ok=True)
+                                    # Download using GZIP compression: create tar.gz on remote with ONLY final adapter files (no checkpoints)
+                                    terminal_output.append(f"[DOWNLOAD] Creating GZIP archive on remote server (final adapter files only)...")
+                                    create_archive_cmd = [
+                                        "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null", "-o", "LogLevel=ERROR", "-o", "ConnectTimeout=30",
+                                        f"root@{ssh_host}",
+                                        f"cd {adapter_dir_remote} && tar -czf /tmp/adapter_final.tar.gz adapter_config.json adapter_model.safetensors adapter_model.bin 2>/dev/null || tar -czf /tmp/adapter_final.tar.gz adapter_config.json adapter_model.bin 2>/dev/null || echo 'ARCHIVE_FAILED'"
+                                    ]
+                                    create_archive_result = subprocess.run(create_archive_cmd, capture_output=True, text=True, timeout=60)
+                                    
+                                    if create_archive_result.returncode == 0 and "ARCHIVE_FAILED" not in create_archive_result.stdout:
+                                        terminal_output.append(f"[DOWNLOAD] ✓ GZIP archive created on remote server")
                                         
-                                        # Try downloading each essential file individually
-                                        # Only download files that don't already exist locally to avoid duplicates
-                                        for file_name in adapter_files:
-                                            # Skip if file already exists locally (avoid duplicate downloads)
-                                            local_file = adapter_dir_local / file_name
-                                            if local_file.exists():
-                                                file_size = local_file.stat().st_size
-                                                terminal_output.append(f"[SKIP] {file_name} already exists locally ({file_size / 1024 / 1024:.2f} MB) - skipping download")
-                                                continue
+                                        # Download the compressed archive
+                                        local_archive = weights_dir / "adapter_final.tar.gz"
+                                        terminal_output.append(f"[DOWNLOAD] Downloading compressed archive...")
+                                        scp_archive_cmd = [
+                                            "scp", "-P", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null", "-o", "LogLevel=ERROR", "-o", "ConnectTimeout=30", "-C",  # -C enables compression
+                                            f"root@{ssh_host}:/tmp/adapter_final.tar.gz",
+                                            str(local_archive)
+                                        ]
+                                        scp_result = subprocess.run(scp_archive_cmd, capture_output=True, text=True, timeout=600)  # 10 min timeout
+                                        
+                                        if scp_result.returncode == 0 and local_archive.exists():
+                                            terminal_output.append(f"[DOWNLOAD] ✓ Compressed archive downloaded")
                                             
-                                            # Try multiple possible locations
-                                            remote_paths = [
-                                                f"{adapter_dir_remote}/{file_name}",  # Found location
-                                                f"/workspace/output/training/adapter/{file_name}",  # Standard location
-                                                f"/workspace/output/training/{file_name}",  # Root training dir
-                                                # Also try latest checkpoint if we haven't already
-                                            ]
+                                            # Extract the archive
+                                            adapter_dir_local = weights_dir / "adapter"
+                                            adapter_dir_local.mkdir(parents=True, exist_ok=True)
+                                            terminal_output.append(f"[DOWNLOAD] Extracting archive...")
                                             
-                                            # If adapter_dir_remote doesn't contain "checkpoint", also try latest checkpoint
-                                            if "checkpoint" not in adapter_dir_remote:
-                                                find_checkpoint_cmd = [
-                                                    "ssh"
-        ] + get_ssh_base_options(ssh_port) + [
-                                                    f"root@{ssh_host}",
-                                                    "find /workspace/output/training -type d -name 'checkpoint-*' 2>/dev/null | sort -V | tail -1"
-                                                ]
-                                                checkpoint_result = subprocess.run(find_checkpoint_cmd, capture_output=True, text=True, timeout=15)
-                                                if checkpoint_result.returncode == 0 and checkpoint_result.stdout.strip():
-                                                    latest_checkpoint = checkpoint_result.stdout.strip()
-                                                    remote_paths.insert(1, f"{latest_checkpoint}/adapter/{file_name}")
-                                                    remote_paths.insert(2, f"{latest_checkpoint}/{file_name}")
-                                            
-                                            downloaded_file = False
-                                            for remote_path in remote_paths:
-                                                terminal_output.append(f"[SCP] Trying to download: {file_name} from {remote_path}")
-                                                scp_file_cmd = [
-                                                    "scp", "-P", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null", "-o", "LogLevel=ERROR", "-o", "ConnectTimeout=30",
-                                                    f"root@{ssh_host}:{remote_path}",
-                                                    str(adapter_dir_local / file_name)
-                                                ]
-                                                file_result = subprocess.run(scp_file_cmd, capture_output=True, text=True, timeout=300)
+                                            import tarfile
+                                            try:
+                                                with tarfile.open(local_archive, 'r:gz') as tar:
+                                                    tar.extractall(path=adapter_dir_local)
+                                                terminal_output.append(f"[DOWNLOAD] ✓ Archive extracted successfully")
                                                 
-                                                if file_result.returncode == 0 and (adapter_dir_local / file_name).exists():
-                                                    file_size = (adapter_dir_local / file_name).stat().st_size
-                                                    terminal_output.append(f"[SCP] ✓ Downloaded {file_name} ({file_size / 1024 / 1024:.2f} MB)")
-                                                    downloaded_count += 1
-                                                    downloaded_file = True
-                                                    break
-                                            
-                                            if not downloaded_file:
-                                                if file_name == "adapter_config.json":
-                                                    terminal_output.append(f"[ERROR] ✗ Failed to download {file_name} (REQUIRED)")
-                                                elif file_name in ["adapter_model.safetensors", "adapter_model.bin"]:
-                                                    terminal_output.append(f"[ERROR] ✗ Failed to download {file_name} (REQUIRED)")
+                                                # Clean up local archive
+                                                local_archive.unlink()
+                                                
+                                                # Verify essential files
+                                                has_config = (adapter_dir_local / "adapter_config.json").exists()
+                                                has_weights = (adapter_dir_local / "adapter_model.safetensors").exists() or (adapter_dir_local / "adapter_model.bin").exists()
+                                                
+                                                if has_config and has_weights:
+                                                    downloaded_files_list = [f.name for f in adapter_dir_local.iterdir() if f.is_file()]
+                                                    downloaded_count = len(downloaded_files_list)
+                                                    terminal_output.append(f"[SUCCESS] ✓ Essential adapter files downloaded with GZIP compression ({downloaded_count} files)")
+                                                    for f in downloaded_files_list[:10]:
+                                                        terminal_output.append(f"[FILE]   - {f}")
+                                                    has_all_essential = True
                                                 else:
-                                                    terminal_output.append(f"[WARNING] ⚠ Could not download {file_name} (optional)")
+                                                    terminal_output.append(f"[WARNING] ⚠ Archive extracted but essential files missing")
+                                            except Exception as extract_error:
+                                                terminal_output.append(f"[ERROR] Failed to extract archive: {str(extract_error)}")
+                                        
+                                        # Clean up remote archive
+                                        cleanup_cmd = [
+                                            "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null", "-o", "LogLevel=ERROR", "-o", "ConnectTimeout=30",
+                                            f"root@{ssh_host}",
+                                            "rm -f /tmp/adapter_final.tar.gz"
+                                        ]
+                                        subprocess.run(cleanup_cmd, capture_output=True, text=True, timeout=10)
+                                    
+                                    # Fallback: Direct download with compression if GZIP method failed
+                                    if not has_all_essential:
+                                        terminal_output.append(f"[DOWNLOAD] Using direct download fallback (with SCP compression flag)...")
+                                        scp_adapter_cmd = [
+                                            "scp", "-P", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null", "-o", "LogLevel=ERROR", "-o", "ConnectTimeout=30", "-C", "-r",  # -C enables compression
+                                            f"root@{ssh_host}:{adapter_dir_remote}",
+                                            str(weights_dir)
+                                        ]
+                                        scp_result = subprocess.run(scp_adapter_cmd, capture_output=True, text=True, timeout=300)
+                                        
+                                        if scp_result.returncode == 0:
+                                            # Check if adapter directory was downloaded
+                                            adapter_dir_local = weights_dir / "adapter"
+                                            if adapter_dir_local.exists() and any(adapter_dir_local.iterdir()):
+                                                downloaded_files_list = [f.name for f in adapter_dir_local.iterdir() if f.is_file()]
+                                                downloaded_count = len(downloaded_files_list)
+                                                terminal_output.append(f"[SCP] ✓ Downloaded adapter directory ({downloaded_count} files) to: {adapter_dir_local}")
+                                                for f in downloaded_files_list[:10]:
+                                                    terminal_output.append(f"[FILE]   - {f}")
+                                                
+                                                # Verify we have the essential files
+                                                has_config = (adapter_dir_local / "adapter_config.json").exists()
+                                                has_weights = (adapter_dir_local / "adapter_model.safetensors").exists() or (adapter_dir_local / "adapter_model.bin").exists()
+                                                
+                                                if has_config and has_weights:
+                                                    terminal_output.append(f"[SUCCESS] ✓ Essential adapter files downloaded (config + weights)")
+                                                    has_all_essential = True
+                                                elif has_config:
+                                                    terminal_output.append(f"[WARNING] ⚠ Adapter config found but weights file missing")
+                                                else:
+                                                    terminal_output.append(f"[ERROR] ✗ Essential adapter files missing")
+                                            else:
+                                                # Directory doesn't exist or is empty
+                                                terminal_output.append(f"[SCP] ⚠ Adapter directory not found or empty at: {adapter_dir_remote}")
+                                        else:
+                                            # SCP command failed - try downloading individual files
+                                            terminal_output.append(f"[SCP] Directory download failed, trying individual files...")
+                                            error_output = scp_result.stderr or scp_result.stdout
+                                            error_output = filter_malloc_warnings(error_output)
+                                            if "Welcome to vast.ai" in error_output:
+                                                lines = error_output.split('\n')
+                                                actual_errors = [line for line in lines if line and 'Welcome to vast.ai' not in line and 'Have fun!' not in line]
+                                                error_output = '\n'.join(actual_errors) if actual_errors else error_output
+                                            terminal_output.append(f"[SCP] Directory download error: {error_output[:200]}")
+                                            has_all_essential = False
+                                        
+                                        # If directory download didn't work OR essential files are missing, try individual files
+                                        if not has_all_essential:
+                                            adapter_dir_local = weights_dir / "adapter"
+                                            if not adapter_dir_local.exists():
+                                                adapter_dir_local.mkdir(parents=True, exist_ok=True)
+                                            
+                                            # Re-check essential files after fallback download
+                                            if adapter_dir_local.exists():
+                                                has_config = (adapter_dir_local / "adapter_config.json").exists()
+                                                has_weights = (adapter_dir_local / "adapter_model.safetensors").exists() or (adapter_dir_local / "adapter_model.bin").exists()
+                                                has_all_essential = has_config and has_weights
+                                            
+                                            if not has_all_essential:
+                                                # Try downloading each essential file individually
+                                                # Only download files that don't already exist locally to avoid duplicates
+                                                for file_name in adapter_files:
+                                                    # Skip if file already exists locally (avoid duplicate downloads)
+                                                    local_file = adapter_dir_local / file_name
+                                                    if local_file.exists():
+                                                        file_size = local_file.stat().st_size
+                                                        terminal_output.append(f"[SKIP] {file_name} already exists locally ({file_size / 1024 / 1024:.2f} MB) - skipping download")
+                                                        continue
+                                                    
+                                                    # Try multiple possible locations
+                                                    remote_paths = [
+                                                        f"{adapter_dir_remote}/{file_name}",  # Found location
+                                                        f"/workspace/output/training/adapter/{file_name}",  # Standard location
+                                                        f"/workspace/output/training/{file_name}",  # Root training dir
+                                                        # Also try latest checkpoint if we haven't already
+                                                    ]
+                                                    
+                                                    # If adapter_dir_remote doesn't contain "checkpoint", also try latest checkpoint
+                                                    if "checkpoint" not in adapter_dir_remote:
+                                                        find_checkpoint_cmd = [
+                                                            "ssh"
+                                                        ] + get_ssh_base_options(ssh_port) + [
+                                                            f"root@{ssh_host}",
+                                                            "find /workspace/output/training -type d -name 'checkpoint-*' 2>/dev/null | sort -V | tail -1"
+                                                        ]
+                                                        checkpoint_result = subprocess.run(find_checkpoint_cmd, capture_output=True, text=True, timeout=15)
+                                                        if checkpoint_result.returncode == 0 and checkpoint_result.stdout.strip():
+                                                            latest_checkpoint = checkpoint_result.stdout.strip()
+                                                            remote_paths.insert(1, f"{latest_checkpoint}/adapter/{file_name}")
+                                                            remote_paths.insert(2, f"{latest_checkpoint}/{file_name}")
+                                                    
+                                                    downloaded_file = False
+                                                    for remote_path in remote_paths:
+                                                        terminal_output.append(f"[SCP] Trying to download: {file_name} from {remote_path}")
+                                                        scp_file_cmd = [
+                                                            "scp", "-P", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null", "-o", "LogLevel=ERROR", "-o", "ConnectTimeout=30", "-C",  # -C enables compression
+                                                            f"root@{ssh_host}:{remote_path}",
+                                                            str(adapter_dir_local / file_name)
+                                                        ]
+                                                        file_result = subprocess.run(scp_file_cmd, capture_output=True, text=True, timeout=300)
+                                                        
+                                                        if file_result.returncode == 0 and (adapter_dir_local / file_name).exists():
+                                                            file_size = (adapter_dir_local / file_name).stat().st_size
+                                                            terminal_output.append(f"[SCP] ✓ Downloaded {file_name} ({file_size / 1024 / 1024:.2f} MB)")
+                                                            downloaded_count += 1
+                                                            downloaded_file = True
+                                                            break
+                                                    
+                                                    if not downloaded_file:
+                                                        if file_name == "adapter_config.json":
+                                                            terminal_output.append(f"[ERROR] ✗ Failed to download {file_name} (REQUIRED)")
+                                                        elif file_name in ["adapter_model.safetensors", "adapter_model.bin"]:
+                                                            terminal_output.append(f"[ERROR] ✗ Failed to download {file_name} (REQUIRED)")
+                                                        else:
+                                                            terminal_output.append(f"[WARNING] ⚠ Could not download {file_name} (optional)")
                                     
                                     # Final verification - ensure we have at least the essential files
                                     adapter_dir_local = weights_dir / "adapter"
@@ -8757,10 +9216,129 @@ REMOTE_SCRIPT"""
                                                 active_job["weights_downloaded"] = True
                                                 active_job["version_dir"] = str(version_dir)
                                                 active_job["weights_path"] = str(weights_dir)
+                                                
+                                                # Check if this is V2 or higher (merged base model should exist)
+                                                # version_num was already calculated earlier, reuse it
+                                                if version_num >= 2:
+                                                    terminal_output.append(f"[MERGE BASE] Version {version_num} detected - downloading merged base model...")
+                                                    terminal_output.append(f"[MERGE BASE] This merged base model includes all previous adapter training merged into the base weights")
+                                                    
+                                                    # Check if merged base model exists on remote
+                                                    check_merged_cmd = [
+                                                        "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null", "-o", "LogLevel=ERROR", "-o", "ConnectTimeout=30",
+                                                        f"root@{ssh_host}",
+                                                        "test -d /workspace/data/merged_base_model && echo 'merged_exists' || echo 'merged_missing'"
+                                                    ]
+                                                    check_merged_result = subprocess.run(check_merged_cmd, capture_output=True, text=True, timeout=30)
+                                                    
+                                                    if "merged_exists" in check_merged_result.stdout:
+                                                        # Download merged base model
+                                                        merged_base_dir = version_dir / "merged_base_model"
+                                                        merged_base_dir.mkdir(parents=True, exist_ok=True)
+                                                        
+                                                        terminal_output.append(f"[MERGE BASE] Downloading merged base model with GZIP compression...")
+                                                        terminal_output.append(f"[MERGE BASE] This is the base model with previous adapters merged in")
+                                                        
+                                                        # Download using GZIP compression: create tar.gz on remote, download, extract locally
+                                                        terminal_output.append(f"[MERGE BASE] Creating GZIP archive on remote server...")
+                                                        create_merged_archive_cmd = [
+                                                            "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null", "-o", "LogLevel=ERROR", "-o", "ConnectTimeout=30",
+                                                            f"root@{ssh_host}",
+                                                            "cd /workspace/data && tar -czf /tmp/merged_base_model.tar.gz merged_base_model 2>&1 || echo 'ARCHIVE_FAILED'"
+                                                        ]
+                                                        create_merged_archive_result = subprocess.run(create_merged_archive_cmd, capture_output=True, text=True, timeout=600)  # 10 min for large model
+                                                        
+                                                        if create_merged_archive_result.returncode == 0 and "ARCHIVE_FAILED" not in create_merged_archive_result.stdout:
+                                                            terminal_output.append(f"[MERGE BASE] ✓ GZIP archive created on remote server")
+                                                            
+                                                            # Download the compressed archive
+                                                            local_merged_archive = version_dir / "merged_base_model.tar.gz"
+                                                            terminal_output.append(f"[MERGE BASE] Downloading compressed archive (this may take several minutes)...")
+                                                            scp_merged_cmd = [
+                                                                "scp", "-P", str(ssh_port), 
+                                                                "-o", "StrictHostKeyChecking=no", 
+                                                                "-o", "UserKnownHostsFile=/dev/null", 
+                                                                "-o", "LogLevel=ERROR", 
+                                                                "-o", "ConnectTimeout=30",
+                                                                "-C",  # Enable compression
+                                                                f"root@{ssh_host}:/tmp/merged_base_model.tar.gz",
+                                                                str(local_merged_archive)
+                                                            ]
+                                                            scp_merged_result = subprocess.run(scp_merged_cmd, capture_output=True, text=True, timeout=3600)  # 60 min timeout for large compressed model
+                                                            
+                                                            if scp_merged_result.returncode == 0 and local_merged_archive.exists():
+                                                                terminal_output.append(f"[MERGE BASE] ✓ Compressed archive downloaded")
+                                                                
+                                                                # Extract the archive
+                                                                terminal_output.append(f"[MERGE BASE] Extracting archive...")
+                                                                import tarfile
+                                                                try:
+                                                                    with tarfile.open(local_merged_archive, 'r:gz') as tar:
+                                                                        tar.extractall(path=version_dir)
+                                                                    terminal_output.append(f"[MERGE BASE] ✓ Archive extracted successfully")
+                                                                    
+                                                                    # Clean up local archive
+                                                                    local_merged_archive.unlink()
+                                                                    
+                                                                    # Verify extraction
+                                                                    if merged_base_dir.exists() and any(merged_base_dir.iterdir()):
+                                                                        merged_files = [f.name for f in merged_base_dir.iterdir() if f.is_file()]
+                                                                        terminal_output.append(f"[MERGE BASE] ✓ Merged base model downloaded ({len(merged_files)} files)")
+                                                                        terminal_output.append(f"[MERGE BASE] Saved to: {merged_base_dir}")
+                                                                        active_job["merged_base_path"] = str(merged_base_dir)
+                                                                    else:
+                                                                        terminal_output.append(f"[WARNING] Merged base model directory exists but appears empty")
+                                                                except Exception as extract_error:
+                                                                    terminal_output.append(f"[ERROR] Failed to extract archive: {str(extract_error)}")
+                                                            else:
+                                                                error_output = filter_malloc_warnings(scp_merged_result.stderr or scp_merged_result.stdout)
+                                                                terminal_output.append(f"[WARNING] Failed to download compressed archive: {error_output[:200]}")
+                                                                terminal_output.append(f"[INFO] Training will still work, but ChatBot may need to use cached base model")
+                                                            
+                                                            # Clean up remote archive
+                                                            cleanup_merged_cmd = [
+                                                                "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null", "-o", "LogLevel=ERROR", "-o", "ConnectTimeout=30",
+                                                                f"root@{ssh_host}",
+                                                                "rm -f /tmp/merged_base_model.tar.gz"
+                                                            ]
+                                                            subprocess.run(cleanup_merged_cmd, capture_output=True, text=True, timeout=10)
+                                                        else:
+                                                            terminal_output.append(f"[WARNING] Failed to create archive on remote, falling back to direct download...")
+                                                            # Fallback to direct download with compression flag
+                                                            scp_merged_cmd = [
+                                                                "scp", "-r", "-P", str(ssh_port), 
+                                                                "-o", "StrictHostKeyChecking=no", 
+                                                                "-o", "UserKnownHostsFile=/dev/null", 
+                                                                "-o", "LogLevel=ERROR", 
+                                                                "-o", "ConnectTimeout=30",
+                                                                "-C",  # Enable compression
+                                                                f"root@{ssh_host}:/workspace/data/merged_base_model",
+                                                                str(merged_base_dir.parent)  # Download to version_dir, will create merged_base_model subdir
+                                                            ]
+                                                            scp_merged_result = subprocess.run(scp_merged_cmd, capture_output=True, text=True, timeout=1800)  # 30 min timeout for large model
+                                                        
+                                                        if scp_merged_result.returncode == 0:
+                                                            # Verify merged base model was downloaded
+                                                            if merged_base_dir.exists() and any(merged_base_dir.iterdir()):
+                                                                merged_files = [f.name for f in merged_base_dir.iterdir() if f.is_file()]
+                                                                terminal_output.append(f"[MERGE BASE] ✓ Merged base model downloaded ({len(merged_files)} files)")
+                                                                terminal_output.append(f"[MERGE BASE] Saved to: {merged_base_dir}")
+                                                                active_job["merged_base_path"] = str(merged_base_dir)
+                                                            else:
+                                                                terminal_output.append(f"[WARNING] Merged base model directory exists but appears empty")
+                                                        else:
+                                                            error_output = filter_malloc_warnings(scp_merged_result.stderr or scp_merged_result.stdout)
+                                                            terminal_output.append(f"[WARNING] Failed to download merged base model: {error_output[:200]}")
+                                                            terminal_output.append(f"[INFO] Training will still work, but ChatBot may need to use cached base model")
+                                                    else:
+                                                        terminal_output.append(f"[INFO] Merged base model not found on remote (this is expected for V1)")
+                                                
                                                 training_manager._save_job(active_job)
                                                 
                                                 terminal_output.append(f"[SUCCESS] LoRA adapter weights downloaded successfully!")
                                                 terminal_output.append(f"[INFO] Adapter saved to: {adapter_dir_local}")
+                                                if version_num >= 2:
+                                                    terminal_output.append(f"[INFO] Merged base model saved to: {version_dir}/merged_base_model")
                                                 terminal_output.append(f"[INFO] These adapter files will be loaded onto the base model locally")
                                                 
                                                 st.session_state[terminal_output_key] = terminal_output

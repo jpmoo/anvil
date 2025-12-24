@@ -72,7 +72,7 @@ class VastTrainingManager:
             # Fallback if training_dir is not a Path (shouldn't happen, but be safe)
             self.jobs_file = PathClass(self.training_dir) / "vast_jobs.json"
     
-    def prepare_training_package(self, epochs: int = 10, learning_rate: float = 2e-4, hf_model_override: Optional[str] = None, yaml_config_path: Optional[str] = None, file_group: Optional[List[Dict]] = None) -> Dict:
+    def prepare_training_package(self, epochs: Optional[int] = None, learning_rate: float = 2e-4, hf_model_override: Optional[str] = None, yaml_config_path: Optional[str] = None, file_group: Optional[List[Dict]] = None) -> Dict:
         """
         Prepare all training data and configuration files (without moving from queue)
         
@@ -238,21 +238,26 @@ class VastTrainingManager:
                     config_modified = True
                     self.logger.log("INFO", "Set save_merged_lora=False")
             
-            # Handle adapter setting - check for previous adapter first (V2+ incremental training)
+            # Handle adapter setting
+            # NEW APPROACH: For incremental training, we merge the previous adapter into the base model
+            # before training starts, rather than stacking adapters. The merge happens pre-training,
+            # so we always set adapter: "lora" here for fresh training on the merged model.
             current_adapter = config.get("adapter")
             
-            # If we have a previous adapter path for incremental training, use it
+            # If we have a previous adapter path, it will be merged into base model pre-training
+            # So we don't set adapter/lora_model_dir here - just ensure adapter: "lora" is set
             if previous_adapter_path:
-                # For incremental training, set adapter to the previous adapter path
-                # This will be uploaded to /workspace/data/previous_adapter on the instance
-                # The path will be updated during upload to point to the remote location
-                config["adapter"] = "/workspace/data/previous_adapter"
-                config["lora_model_dir"] = "/workspace/data/previous_adapter"
-                config_modified = True
-                self.logger.log("INFO", f"Incremental training: Configured adapter path for loading previous weights", {
-                    "remote_path": "/workspace/data/previous_adapter",
+                # Remove any existing adapter/lora_model_dir settings - merge will happen pre-training
+                if "adapter" in config and config["adapter"] != "lora":
+                    config["adapter"] = "lora"
+                    config_modified = True
+                if "lora_model_dir" in config:
+                    del config["lora_model_dir"]
+                    config_modified = True
+                self.logger.log("INFO", f"Incremental training: Previous adapter will be merged into base model pre-training", {
                     "local_path": previous_adapter_path,
-                    "version": version_info.get("highest_version")
+                    "version": version_info.get("highest_version"),
+                    "note": "Adapter will be merged before training starts, then fresh LoRA training on merged model"
                 })
             elif has_lora_params:
                 # For new LoRA training: Set adapter: "lora" to explicitly enable LoRA mode
@@ -363,40 +368,78 @@ class VastTrainingManager:
             # Auto-adjust config for small datasets to prevent empty batch errors
             total_examples = dataset_stats.get("total_examples", 0)
             if total_examples > 0:
-                # Auto-calculate epochs based on dataset size (same logic as default config)
-                # Calculate effective batch size from micro_batch_size and gradient_accumulation_steps
-                batch_size = config.get("micro_batch_size") or config.get("batch_size", 4)
-                gradient_accumulation_steps = config.get("gradient_accumulation_steps", 4)
-                effective_batch_size = batch_size * gradient_accumulation_steps
+                # Check if user has explicitly set epochs (either in YAML config or via parameter)
+                # Priority: YAML config num_epochs > UI epochs parameter > auto-calculate
+                user_set_epochs = None
+                if "num_epochs" in config:
+                    # User provided num_epochs in YAML config - always respect it
+                    user_set_epochs = config.get("num_epochs")
+                    self.logger.log("INFO", f"Using user-provided num_epochs from YAML config: {user_set_epochs}")
+                elif epochs is not None:  # User explicitly set epochs in UI (not None/empty)
+                    user_set_epochs = epochs
+                    self.logger.log("INFO", f"Using user-provided epochs from UI: {user_set_epochs}")
+                # If epochs is None and num_epochs not in config, user didn't explicitly set it - will auto-calculate
                 
-                # Calculate steps per epoch
-                sample_packing = config.get("sample_packing", True)
-                if sample_packing:
-                    sample_packing_efficiency = 0.7  # Conservative estimate
-                    effective_dataset_size = max(1, int(total_examples * sample_packing_efficiency))
+                if user_set_epochs is not None:
+                    # User explicitly set epochs - use their value, don't auto-calculate
+                    config["num_epochs"] = user_set_epochs
+                    # CRITICAL: Remove max_steps if present, as it would override num_epochs
+                    # Axolotl uses max_steps if both are set, so we must remove it to ensure epochs are respected
+                    if "max_steps" in config:
+                        removed_max_steps = config.pop("max_steps")
+                        config_modified = True
+                        self.logger.log("WARNING", f"Removed max_steps={removed_max_steps} from config (conflicts with num_epochs={user_set_epochs}). Training will use epochs instead.")
+                    # Still calculate steps for logging purposes
+                    batch_size = config.get("micro_batch_size") or config.get("batch_size", 4)
+                    gradient_accumulation_steps = config.get("gradient_accumulation_steps", 4)
+                    effective_batch_size = batch_size * gradient_accumulation_steps
+                    sample_packing = config.get("sample_packing", True)
+                    if sample_packing:
+                        sample_packing_efficiency = 0.7
+                        effective_dataset_size = max(1, int(total_examples * sample_packing_efficiency))
+                    else:
+                        effective_dataset_size = total_examples
+                    steps_per_epoch = max(1, effective_dataset_size // effective_batch_size)
+                    final_steps = steps_per_epoch * user_set_epochs
+                    self.logger.log("INFO", f"Using user-specified epochs: {user_set_epochs} (will result in ~{final_steps} total steps, ~{steps_per_epoch} steps/epoch)")
                 else:
-                    effective_dataset_size = total_examples
-                
-                steps_per_epoch = max(1, effective_dataset_size // effective_batch_size)
-                
-                # Target steps based on dataset size
-                if total_examples < 200:
-                    target_steps = 150
-                elif total_examples < 1000:
-                    target_steps = 300
-                else:
-                    target_steps = 400
-                
-                # Calculate epochs needed to reach target steps
-                calculated_epochs = max(1, int(target_steps / steps_per_epoch))
-                calculated_epochs = min(max(calculated_epochs, 1), 50)  # Cap at 50
-                
-                # Update epochs in config to use calculated value
-                current_epochs = config.get("num_epochs", epochs)
-                final_epochs = max(calculated_epochs, current_epochs)  # Use higher of calculated or existing
-                config["num_epochs"] = final_epochs
-                final_steps = steps_per_epoch * final_epochs
-                self.logger.log("INFO", f"Auto-calculated epochs for YAML config: {final_epochs} (targeting ~{target_steps} steps for {total_examples} examples, ~{steps_per_epoch} steps/epoch, will result in ~{final_steps} total steps)")
+                    # No user override - auto-calculate epochs based on dataset size
+                    # Calculate effective batch size from micro_batch_size and gradient_accumulation_steps
+                    batch_size = config.get("micro_batch_size") or config.get("batch_size", 4)
+                    gradient_accumulation_steps = config.get("gradient_accumulation_steps", 4)
+                    effective_batch_size = batch_size * gradient_accumulation_steps
+                    
+                    # Calculate steps per epoch
+                    sample_packing = config.get("sample_packing", True)
+                    if sample_packing:
+                        sample_packing_efficiency = 0.7  # Conservative estimate
+                        effective_dataset_size = max(1, int(total_examples * sample_packing_efficiency))
+                    else:
+                        effective_dataset_size = total_examples
+                    
+                    steps_per_epoch = max(1, effective_dataset_size // effective_batch_size)
+                    
+                    # Target steps based on dataset size
+                    if total_examples < 200:
+                        target_steps = 150
+                    elif total_examples < 1000:
+                        target_steps = 300
+                    else:
+                        target_steps = 400
+                    
+                    # Calculate epochs needed to reach target steps
+                    calculated_epochs = max(1, int(target_steps / steps_per_epoch))
+                    calculated_epochs = min(max(calculated_epochs, 1), 50)  # Cap at 50
+                    
+                    # Use auto-calculated value
+                    config["num_epochs"] = calculated_epochs
+                    # CRITICAL: Remove max_steps if present, as it would override num_epochs
+                    if "max_steps" in config:
+                        removed_max_steps = config.pop("max_steps")
+                        config_modified = True
+                        self.logger.log("WARNING", f"Removed max_steps={removed_max_steps} from config (conflicts with auto-calculated num_epochs={calculated_epochs}). Training will use epochs instead.")
+                    final_steps = steps_per_epoch * calculated_epochs
+                    self.logger.log("INFO", f"Auto-calculated epochs for YAML config: {calculated_epochs} (targeting ~{target_steps} steps for {total_examples} examples, ~{steps_per_epoch} steps/epoch, will result in ~{final_steps} total steps)")
                 
                 # Calculate minimum eval examples needed (at least 2 for batch creation)
                 min_eval_examples = 2
@@ -515,22 +558,18 @@ class VastTrainingManager:
                 # Cap at reasonable maximum (50 epochs) and minimum (1 epoch)
                 calculated_epochs = min(max(calculated_epochs, 1), 50)
                 
-                # Always use auto-calculated epochs for optimal training
-                # User can still override via epochs parameter if needed, but we'll use calculated by default
-                # Only use user-provided epochs if it's higher than calculated (to ensure enough steps)
-                if epochs >= calculated_epochs:
-                    # User provided higher value - use it
+                # Check if user has explicitly set epochs
+                # If user set epochs (not None), always use their value - don't override with calculated
+                if epochs is not None:
+                    # User explicitly set epochs - always respect it
                     final_epochs = epochs
                     final_steps = steps_per_epoch * final_epochs
-                    self.logger.log("INFO", f"Using {final_epochs} epochs (~{final_steps} steps) - user override")
+                    self.logger.log("INFO", f"Using user-specified epochs: {final_epochs} (will result in ~{final_steps} total steps, ~{steps_per_epoch} steps/epoch)")
                 else:
-                    # Use calculated epochs (better for training)
+                    # No user override - use auto-calculated value
                     final_epochs = calculated_epochs
                     final_steps = steps_per_epoch * final_epochs
-                    if epochs != 10:  # User provided a value but it was lower
-                        self.logger.log("INFO", f"Auto-calculated {final_epochs} epochs (~{final_steps} steps) instead of user-specified {epochs} epochs (~{steps_per_epoch * epochs} steps) to ensure adequate training")
-                    else:
-                        self.logger.log("INFO", f"Auto-calculated epochs: {final_epochs} (targeting ~{target_steps} steps for {total_examples} examples, ~{steps_per_epoch} steps/epoch, will result in ~{final_steps} total steps)")
+                    self.logger.log("INFO", f"Auto-calculated epochs: {final_epochs} (targeting ~{target_steps} steps for {total_examples} examples, ~{steps_per_epoch} steps/epoch, will result in ~{final_steps} total steps)")
                 
                 epochs = final_epochs
             
@@ -609,7 +648,7 @@ class VastTrainingManager:
                            min_gpu_ram: int = 16,
                            max_price: Optional[float] = None,
                            disk_space: int = 100,
-                           epochs: int = 10,
+                           epochs: Optional[int] = None,
                            learning_rate: float = 2e-4,
                            hf_model_override: Optional[str] = None,
                            num_gpus: Optional[int] = None,
@@ -1439,20 +1478,63 @@ class VastTrainingManager:
             if previous_adapter_path:
                 adapter_path = Path(previous_adapter_path)
                 if adapter_path.exists():
-                    # Upload entire adapter directory
+                    # Upload adapter directory with GZIP compression
                     remote_adapter_path = "/workspace/data/previous_adapter"
                     version_num = version_info.get("highest_version", "unknown")
-                    self.logger.log("INFO", f"Incremental training: Uploading previous adapter weights from V{version_num}", {
+                    self.logger.log("INFO", f"Incremental training: Uploading previous adapter weights from V{version_num} with GZIP compression", {
                         "local_path": str(adapter_path),
                         "remote_path": remote_adapter_path,
                         "version": version_num
                     })
-                    cmd = [
-                        "scp", "-r", "-P", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null", "-o", "LogLevel=ERROR",
-                        str(adapter_path),
-                        f"root@{ssh_host}:{remote_adapter_path}"
-                    ]
-                    result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+                    
+                    # Create GZIP archive locally
+                    import tarfile
+                    import tempfile
+                    import os
+                    
+                    with tempfile.NamedTemporaryFile(suffix='.tar.gz', delete=False) as tmp_archive:
+                        archive_path = tmp_archive.name
+                    
+                    try:
+                        # Create GZIP archive
+                        with tarfile.open(archive_path, 'w:gz') as tar:
+                            tar.add(str(adapter_path), arcname=adapter_path.name)
+                        
+                        archive_size = os.path.getsize(archive_path) / (1024 * 1024)
+                        self.logger.log("INFO", f"Created GZIP archive: {archive_size:.2f} MB")
+                        
+                        # Upload compressed archive
+                        cmd = [
+                            "scp", "-P", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null", "-o", "LogLevel=ERROR", "-C",  # -C enables compression
+                            archive_path,
+                            f"root@{ssh_host}:/tmp/previous_adapter.tar.gz"
+                        ]
+                        result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+                        
+                        if result.returncode == 0:
+                            # Extract archive on remote
+                            extract_cmd = [
+                                "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null", "-o", "LogLevel=ERROR",
+                                f"root@{ssh_host}",
+                                f"mkdir -p {remote_adapter_path} && cd /workspace/data && tar -xzf /tmp/previous_adapter.tar.gz && mv {adapter_path.name}/* {remote_adapter_path}/ 2>/dev/null || (cd /workspace/data && tar -xzf /tmp/previous_adapter.tar.gz && find . -name 'adapter_config.json' -exec dirname {{}} \\; | head -1 | xargs -I {{}} mv {{}}/* {remote_adapter_path}/ 2>/dev/null) && rm -f /tmp/previous_adapter.tar.gz"
+                            ]
+                            extract_result = subprocess.run(extract_cmd, capture_output=True, text=True, timeout=120)
+                            
+                            if extract_result.returncode != 0:
+                                self.logger.log("WARNING", f"Archive uploaded but extraction may have issues: {extract_result.stderr[:200]}")
+                        else:
+                            # Fallback to direct upload with compression
+                            self.logger.log("WARNING", "GZIP upload failed, falling back to direct upload with compression")
+                            cmd = [
+                                "scp", "-r", "-P", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null", "-o", "LogLevel=ERROR", "-C",  # -C enables compression
+                                str(adapter_path),
+                                f"root@{ssh_host}:{remote_adapter_path}"
+                            ]
+                            result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+                    finally:
+                        # Clean up local archive
+                        if os.path.exists(archive_path):
+                            os.unlink(archive_path)
                     if result.returncode != 0:
                         self.logger.log("ERROR", f"Incremental training: Failed to upload previous adapter weights", {
                             "error": result.stderr,
